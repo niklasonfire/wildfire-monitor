@@ -6,14 +6,27 @@
  * connection will need - handles, MTU, connection parameters, which
  * characteristics stream data on their own and which have to be polled.
  *
- * The whole thing is driven from a console on UART0 (115200 8N1) so a script
- * on the host can run a capture unattended. See cmd_ble.c for the commands.
+ * Two ways to drive it. Tethered, a console on UART0 (115200 8N1) lets a
+ * script on the host run a capture; see cmd_ble.c. Untethered - which is the
+ * only way to capture while the bike is actually moving - the two buttons and
+ * the LCD drive it and the frames go to flash; see capture.c, ui.c and the
+ * button task below.
  */
+#include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ble_explorer.h"
 #include "board.h"
+#include "capture.h"
+#include "capture_store.h"
+#include "display.h"
+#include "i2c_bus.h"
+#include "imu.h"
+#include "rtc_bm8563.h"
+#include "ui.h"
+#include "webdump.h"
 
 #include "esp_chip_info.h"
 #include "esp_console.h"
@@ -25,8 +38,10 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 
 void cmd_ble_register(void);
+void cmd_cap_register(void);
 
 static const char *TAG = "main";
 
@@ -77,6 +92,21 @@ static int cmd_hb(int argc, char **argv)
     return 0;
 }
 
+/* A scripted session sometimes has to wait for something the board does on
+ * its own - a scan filling up, a capture running - and every fresh ./wf.sh
+ * invocation would reset the board and throw that state away. */
+static int cmd_sleep(int argc, char **argv)
+{
+    int secs = (argc >= 2) ? atoi(argv[1]) : 1;
+    if (secs < 0 || secs > 600) {
+        printf("usage: sleep <0..600>\n");
+        return 1;
+    }
+    vTaskDelay(pdMS_TO_TICKS(secs * 1000));
+    printf("slept %d s\n", secs);
+    return 0;
+}
+
 static int cmd_info(int argc, char **argv)
 {
     (void)argc;
@@ -113,6 +143,7 @@ static void register_commands(void)
         {.command = "btn", .help = "Read button states (A / B / power)", .func = cmd_btn},
         {.command = "hb", .help = "Heartbeat log on/off: hb on|off", .func = cmd_hb},
         {.command = "info", .help = "Print chip, flash, MAC, BLE and heap info", .func = cmd_info},
+        {.command = "sleep", .help = "Wait, so a script can let the board work: sleep <secs>", .func = cmd_sleep},
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -132,16 +163,185 @@ static void heartbeat_task(void *arg)
     }
 }
 
+
+/* ---- readout mode -------------------------------------------------------
+ *
+ * Wi-Fi and NimBLE do not fit in this chip's RAM together, so entering readout
+ * mode is a one-way door: BLE goes down for good and the way back to capturing
+ * is a reboot. Both the B button and the "wifi on" command land here.
+ */
+bool app_readout_enter(void)
+{
+    if (web_running()) {
+        return true;
+    }
+    if (cap_state() == CAP_RECORDING || cap_state() == CAP_CONNECTING) {
+        ESP_LOGW(TAG, "refusing readout mode while a capture is running");
+        return false;
+    }
+
+    ui_message("WIFI", "starting", NULL, NULL, NULL);
+    esp_err_t err = cap_ble_shutdown();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BLE shutdown: %s", esp_err_to_name(err));
+    }
+
+    char ssid[40] = "", ip[24] = "";
+    err = web_start(ssid, sizeof(ssid), ip, sizeof(ip));
+    if (err != ESP_OK) {
+        ui_message("WIFI", "failed", esp_err_to_name(err), NULL, "A: REBOOT");
+        return false;
+    }
+
+    char line_ip[32];
+    snprintf(line_ip, sizeof(line_ip), "http://%s", ip);
+    ui_message("READOUT", ssid, "pw " WEB_PASSWORD, line_ip, "A: REBOOT");
+    ESP_LOGI(TAG, "readout mode: ssid=%s pass=%s url=http://%s", ssid,
+             WEB_PASSWORD, ip);
+    return true;
+}
+
+/* ---- buttons ------------------------------------------------------------
+ *
+ * A is the whole capture workflow - scan, start, stop - because it is the one
+ * button a rider can find with a glove on. B is the display and, held, the
+ * readout mode.
+ */
+static uint32_t s_markers;
+
+static void button_task(void *arg)
+{
+    (void)arg;
+
+    board_btn_evt_t evt;
+    while (true) {
+        if (!board_btn_wait(&evt, -1)) {
+            continue;
+        }
+
+        if (web_running()) {
+            /* Nothing to capture any more; the only useful action left is to
+             * get the firmware back into a state that can. */
+            if (evt.btn == BOARD_BTN_A_ID) {
+                esp_restart();
+            }
+            if (evt.btn == BOARD_BTN_B_ID) {
+                disp_backlight(!disp_backlight_get());
+            }
+            continue;
+        }
+
+        switch (evt.btn) {
+        case BOARD_BTN_A_ID:
+            if (evt.press != BOARD_PRESS_SHORT) {
+                break;
+            }
+            switch (cap_state()) {
+            case CAP_ARMED:
+                cap_record_start();
+                break;
+            case CAP_RECORDING:
+            case CAP_CONNECTING:
+                /* Aborting a half-built link is the same operation as stopping
+                 * a running capture: drop both links, close whatever is open. */
+                cap_record_stop();
+                break;
+            case CAP_SCANNING:
+                cap_scan_stop();
+                break;
+            case CAP_STOPPING:
+                /* The file is being closed; a button press here would only
+                 * risk truncating it. The screen says so. */
+                break;
+            default:
+                cap_scan_start();
+                break;
+            }
+            break;
+
+        case BOARD_BTN_B_ID:
+            if (evt.press == BOARD_PRESS_LONG) {
+                app_readout_enter();
+            } else if (cap_state() == CAP_RECORDING) {
+                /* While recording, B is the marker: the rider rides a defined
+                 * manoeuvre and stamps it, which is what turns a stream of
+                 * undecoded bytes into labelled sections. The backlight is not
+                 * worth the button here - a marker is. */
+                char text[32];
+                snprintf(text, sizeof(text), "marker %" PRIu32, ++s_markers);
+                cap_marker(text);
+            } else {
+                /* The backlight is the biggest single draw on this board, so
+                 * turning it off is what makes a long ride possible. */
+                disp_backlight(!disp_backlight_get());
+                ui_redraw();
+            }
+            break;
+
+        case BOARD_BTN_PWR_ID:
+            if (evt.press == BOARD_PRESS_LONG) {
+                cap_record_stop();
+                board_power_off();
+            }
+            break;
+        }
+    }
+}
+
 void app_main(void)
 {
     board_init();
     board_led_blink(2, 120, 120);
 
-    ESP_LOGI(TAG, "wildfire_monitor BLE scanner, IDF %s", esp_get_idf_version());
+    ESP_LOGI(TAG, "wildfire_monitor, IDF %s", esp_get_idf_version());
 
-    esp_err_t err = blex_init();
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    /* The screen comes up first: everything after this can report its own
+     * failure to the rider instead of only to a serial log nobody is reading. */
+    if (ui_init() != ESP_OK) {
+        ESP_LOGE(TAG, "display init failed");
+    }
+
+    /* The RTC and the IMU share the internal I2C bus, so it is created once
+     * here before either of them tries to claim the port. */
+    if (i2c_bus_init() != ESP_OK) {
+        ESP_LOGE(TAG, "internal I2C bus unavailable - no RTC, no IMU");
+    }
+
+    /* The RTC is what stamps a capture with a wall clock. It keeps time on its
+     * own backup cell, so a ride hours after the last USB session is still
+     * dated - unless it was never set, which bm8563_valid() reports. */
+    if (bm8563_init() == ESP_OK && bm8563_valid()) {
+        bm8563_sync_system_time();
+    } else {
+        ESP_LOGW(TAG, "RTC unset or absent - captures will be stamped unknown");
+    }
+
+    /* Without the IMU a capture is still valid, just harder to interpret: the
+     * frames then have no independent movement signal to be correlated with. */
+    if (imu_init() != ESP_OK) {
+        ESP_LOGW(TAG, "IMU absent - captures will carry no movement reference");
+    }
+
+    err = store_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "capture store: %s", esp_err_to_name(err));
+    }
+
+    err = blex_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BLE init failed: %s", esp_err_to_name(err));
+    }
+
+    err = cap_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "capture init failed: %s", esp_err_to_name(err));
     }
 
     esp_console_repl_t *repl = NULL;
@@ -158,8 +358,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_console_register_help_command());
     register_commands();
     cmd_ble_register();
+    cmd_cap_register();
 
     xTaskCreate(heartbeat_task, "heartbeat", 3072, NULL, 3, NULL);
+
+    board_buttons_start();
+    xTaskCreate(button_task, "buttons", 4096, NULL, 4, NULL);
+    ui_start();
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }
