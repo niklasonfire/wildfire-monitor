@@ -1,0 +1,11 @@
+# Partition table for the standalone capture build.
+#
+# 8 MB flash. The app needs ~1.3 MB today (NimBLE + Wi-Fi + LCD + FATFS), so
+# 2 MB of factory leaves room to grow; everything else is the capture store.
+# A ride writes ~780 B/s, so 5.7 MB is roughly two hours of both links.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x200000,
+storage,    data, fat,     0x210000, 0x5F0000,
