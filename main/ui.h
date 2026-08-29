@@ -22,3 +22,8 @@ void ui_message(const char *title, const char *l1, const char *l2,
 void ui_message_clear(void);
 /* Forces a full repaint, e.g. after the backlight came back on. */
 void ui_redraw(void);
+
+/* Swaps the live Fardriver screen in for whatever state screen was showing,
+ * or back out. Independent of cap_state_t on purpose: the rider wants live
+ * telemetry on a plain ride with no capture running, not only mid-recording. */
+void ui_live_toggle(void);

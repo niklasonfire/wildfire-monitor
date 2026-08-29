@@ -203,6 +203,7 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static cap_status_t   s_pub;              /* guarded by s_mux */
 static cap_link_ctx_t s_link[CAP_LINK_COUNT];
+static fardriver_live_t s_live;           /* guarded by s_mux, see cap_live_get() */
 
 static QueueHandle_t     s_queue;
 static SemaphoreHandle_t s_op_sem;        /* one GATT op in flight, on our task */
@@ -334,12 +335,140 @@ static void post_msg(uint8_t type, uint8_t link, int reason)
     }
 }
 
+/* -------------------------------------------------------- fardriver decode
+ *
+ * docs/fardriver-fields.md, CONFIRMED/SOUND fields only: type 0xb3 is left
+ * alone (its author flags it a guess) and the Daly BMS is out of scope (its
+ * A5-framed command set doesn't match the 0xd2 Modbus variant daly.h already
+ * speaks to this unit). Runs off every MCU-link notification independent of
+ * s_rec_on - see notify_sink() - so the live screen works whenever the link
+ * is up, capture running or not.
+ */
+
+#define FD_FRAME_LEN    16          /* aa <type> <12 byte payload> crc_lo crc_hi */
+#define FD_CRC_SEED     0x7f3c      /* daly.h's CRC-16 core, Fardriver's own seed */
+#define FD_TYPE_MOTION  0xb0
+#define FD_TYPE_WHEEL   0xaf
+#define FD_TYPE_TEMP    0xb5
+#define FD_TYPE_ODO     0x94
+
+static uint16_t fd_rd_u16le(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+/* blackTeaDisp's own conversion: wheel circumference and the rpm->km/h factor
+ * folded into one constant, kept exactly as it reads there rather than
+ * re-derived, since a rounding "improvement" here would stop matching the
+ * dashboard this bike was designed to be read by. */
+static float fd_speed_kmh(uint16_t rpm, uint8_t wheel_radius, uint8_t wheel_width,
+                          uint8_t wheel_ratio, uint16_t rate_ratio)
+{
+    if (rate_ratio == 0) {
+        return 0.0f;
+    }
+    return rpm * 0.00376991136f *
+           ((float)wheel_radius * 1270.0f + (float)wheel_width * (float)wheel_ratio) /
+           (float)rate_ratio;
+}
+
+/* Discards anything that doesn't validate rather than risk decoding a torn or
+ * unrelated frame: wrong length, wrong lead byte or a bad CRC all return
+ * silently, same as a type this table doesn't cover. */
+static void fardriver_decode(const uint8_t *data, uint16_t len)
+{
+    if (len != FD_FRAME_LEN || data[0] != 0xaa) {
+        return;
+    }
+    uint16_t crc = modbus_crc16(data, 14, FD_CRC_SEED);
+    if (data[14] != (uint8_t)(crc & 0xff) || data[15] != (uint8_t)(crc >> 8)) {
+        return;
+    }
+
+    uint8_t type = data[1];
+    const uint8_t *p = data + 2;   /* the 12 byte payload */
+
+    switch (type) {
+    case FD_TYPE_MOTION: {
+        uint8_t gear = (uint8_t)((p[0] & 0x0c) >> 2);
+        bool sliding = (p[0] & 0x10) != 0;
+        bool motion = (p[0] & 0x20) != 0;
+        bool brake = (p[3] & 0x80) != 0;
+        uint16_t rpm = fd_rd_u16le(&p[6]);
+
+        portENTER_CRITICAL(&s_mux);
+        s_live.gear = gear;
+        s_live.sliding_backwards = sliding;
+        s_live.motion = motion;
+        s_live.brake_switch = brake;
+        s_live.cur_rpm = rpm;
+        s_live.b0_valid = true;
+        if (s_live.af_valid) {
+            s_live.cur_speed_kmh = fd_speed_kmh(rpm, s_live.wheel_radius,
+                                                s_live.wheel_width,
+                                                s_live.wheel_ratio,
+                                                s_live.rate_ratio);
+            s_live.speed_valid = s_live.rate_ratio != 0;
+        }
+        portEXIT_CRITICAL(&s_mux);
+        break;
+    }
+    case FD_TYPE_WHEEL: {
+        uint8_t wheel_ratio = p[4];
+        uint8_t wheel_radius = p[5];
+        uint8_t avg_speed = p[6];
+        uint8_t wheel_width = p[7];
+        uint16_t rate_ratio = fd_rd_u16le(&p[8]);
+
+        portENTER_CRITICAL(&s_mux);
+        s_live.wheel_ratio = wheel_ratio;
+        s_live.wheel_radius = wheel_radius;
+        s_live.avg_speed_kmh = avg_speed;
+        s_live.wheel_width = wheel_width;
+        s_live.rate_ratio = rate_ratio;
+        s_live.af_valid = true;
+        if (s_live.b0_valid) {
+            s_live.cur_speed_kmh = fd_speed_kmh(s_live.cur_rpm, wheel_radius,
+                                                wheel_width, wheel_ratio,
+                                                rate_ratio);
+            s_live.speed_valid = rate_ratio != 0;
+        }
+        portEXIT_CRITICAL(&s_mux);
+        break;
+    }
+    case FD_TYPE_TEMP: {
+        int16_t temp = (int16_t)fd_rd_u16le(&p[0]);
+
+        portENTER_CRITICAL(&s_mux);
+        s_live.engine_temp = temp;
+        s_live.b5_valid = true;
+        portEXIT_CRITICAL(&s_mux);
+        break;
+    }
+    case FD_TYPE_ODO: {
+        uint16_t odo = fd_rd_u16le(&p[8]);
+
+        portENTER_CRITICAL(&s_mux);
+        s_live.odometer_raw = odo;
+        s_live.odo_valid = true;
+        portEXIT_CRITICAL(&s_mux);
+        break;
+    }
+    default:
+        break;      /* 0xb3 (UNCERTAIN), 0x8b (unknown) and the Daly frames */
+    }
+}
+
 /* ------------------------------------------------------ notification sink */
 
 static void notify_sink(int idx, const uint8_t *data, uint16_t len)
 {
     if (len > CAP_MAX_NOTIFY) {
         len = CAP_MAX_NOTIFY;
+    }
+
+    if (idx == CAP_LINK_MCU) {
+        fardriver_decode(data, len);
     }
 
     /* Liveness is tracked even before the file is open, so the stale watchdog
@@ -1804,6 +1933,16 @@ cap_state_t cap_state(void)
     st = s_pub.state;
     portEXIT_CRITICAL(&s_mux);
     return st;
+}
+
+void cap_live_get(fardriver_live_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mux);
+    memcpy(out, &s_live, sizeof(*out));
+    portEXIT_CRITICAL(&s_mux);
 }
 
 esp_err_t cap_ble_shutdown(void)

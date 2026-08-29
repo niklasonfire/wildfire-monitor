@@ -95,6 +95,15 @@ static const char *TAG = "ui";
 #define ERR_COLS       22           /* scale 1 fills the width exactly */
 #define ERR_LINES      4
 
+/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V5, same
+ * as every other per-state screen - see the F_V slot comment above. */
+#define ROW_LIVE_SPEED  70
+#define ROW_LIVE_RPM    100
+#define ROW_LIVE_BRAKE  120
+#define ROW_LIVE_MOTION 138
+#define ROW_LIVE_TEMP   158
+#define ROW_LIVE_ODO    178
+
 #define MSG_TITLE_Y    16
 #define MSG_SEP_Y      44
 #define MSG_LINE_Y     58
@@ -159,6 +168,9 @@ static ui_msg_t          s_msg;
 static uint32_t          s_msg_gen;      /* bumped on every message change */
 /* True at boot so the first tick paints the chrome over the splash. */
 static bool              s_invalidate = true;
+/* Which state-screen slot to draw: the status screen for cap_state_t, or the
+ * live Fardriver screen. Toggled by PWR-short; see ui_live_toggle(). */
+static bool              s_live_screen;
 
 static TaskHandle_t s_task;
 static bool         s_started;
@@ -604,6 +616,60 @@ static void draw_error(const cap_status_t *st)
     draw_hint("A: RETRY");
 }
 
+/* ---- live screen ---------------------------------------------------------
+ *
+ * Reads cap_live_get() instead of cap_status(): the Fardriver keeps pushing
+ * frames whenever the MCU link is subscribed, capture running or not, so this
+ * screen is not one of the cap_state_t cases in draw_state() and can be up at
+ * the same time as any of them. It shares F_TITLE/F_V0..F_V5 with those
+ * screens rather than getting its own slots, same reuse as every state below. */
+static const char *gear_name(uint8_t gear)
+{
+    switch (gear) {
+    case 0:  return "ECO";
+    case 1:  return "STANDARD";
+    case 2:  return "SPORT";
+    default: return "?";
+    }
+}
+
+static void draw_live(const fardriver_live_t *lv)
+{
+    if (lv->b0_valid) {
+        draw_title(gear_name(lv->gear), DISP_GREEN);
+    } else {
+        draw_title("--", COL_DIM);
+    }
+
+    if (lv->speed_valid) {
+        FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_VALUE, "%.0f KM/H", lv->cur_speed_kmh);
+    } else {
+        FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_DIM, "%s", "-- KM/H");
+    }
+    if (lv->b0_valid) {
+        FIELD(F_V1, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
+        FIELD(F_V2, 2, ROW_LIVE_BRAKE, 2, lv->brake_switch ? DISP_RED : COL_DIM,
+              "BRAKE %s", lv->brake_switch ? "ON" : "off");
+        FIELD(F_V3, 2, ROW_LIVE_MOTION, 2, lv->motion ? DISP_GREEN : COL_DIM,
+              "MOVING %s", lv->motion ? "yes" : "no");
+    } else {
+        FIELD(F_V1, 2, ROW_LIVE_RPM, 2, COL_DIM, "%s", "-- RPM");
+        FIELD(F_V2, 2, ROW_LIVE_BRAKE, 2, COL_DIM, "%s", "BRAKE --");
+        FIELD(F_V3, 2, ROW_LIVE_MOTION, 2, COL_DIM, "%s", "MOVING --");
+    }
+    if (lv->b5_valid) {
+        FIELD(F_V4, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
+    } else {
+        FIELD(F_V4, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
+    }
+    if (lv->odo_valid) {
+        FIELD(F_V5, 2, ROW_LIVE_ODO, 2, COL_DIM, "ODO %u", lv->odometer_raw);
+    } else {
+        FIELD(F_V5, 2, ROW_LIVE_ODO, 2, COL_DIM, "%s", "ODO --");
+    }
+    draw_hint("PWR: BACK");
+}
+
 /* ---- message screen ----------------------------------------------------- */
 
 static void draw_message(const ui_msg_t *m)
@@ -667,13 +733,16 @@ static void ui_task(void *arg)
         ui_msg_t msg;
         uint32_t gen;
         bool invalidate;
+        bool live;
 
-        /* The only lock this task takes, and the only holder on the other
-         * side is ui_message() doing a memcpy, so it cannot stall a tick. */
+        /* The only lock this task takes, and the only holders on the other
+         * side are ui_message() and ui_live_toggle() doing a memcpy or a flag
+         * flip, so neither can stall a tick. */
         ui_lock();
         msg = s_msg;
         gen = s_msg_gen;
         invalidate = s_invalidate;
+        live = s_live_screen;
         s_invalidate = false;
         ui_unlock();
 
@@ -720,7 +789,13 @@ static void ui_task(void *arg)
             }
             s_last_state = (int)st.state;
             draw_bar();
-            draw_state(&st, full);
+            if (live) {
+                fardriver_live_t lv;
+                cap_live_get(&lv);
+                draw_live(&lv);
+            } else {
+                draw_state(&st, full);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
         s_tick++;
@@ -802,5 +877,15 @@ void ui_redraw(void)
 {
     ui_lock();
     s_invalidate = true;
+    ui_unlock();
+}
+
+void ui_live_toggle(void)
+{
+    ui_lock();
+    s_live_screen = !s_live_screen;
+    s_invalidate = true;      /* the field slots belong to whichever screen
+                                * was showing; force the wipe-and-redraw a
+                                * state change would otherwise have done. */
     ui_unlock();
 }

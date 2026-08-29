@@ -205,7 +205,8 @@ bool app_readout_enter(void)
  *
  * A is the whole capture workflow - scan, start, stop - because it is the one
  * button a rider can find with a glove on. B is the display and, held, the
- * readout mode.
+ * readout mode. PWR short is otherwise idle time on a button already under
+ * the thumb for power-off, so it toggles the live telemetry screen.
  */
 static uint32_t s_markers;
 
@@ -282,6 +283,12 @@ static void button_task(void *arg)
             if (evt.press == BOARD_PRESS_LONG) {
                 cap_record_stop();
                 board_power_off();
+            } else {
+                /* Short PWR was otherwise unbound, and it is the one button
+                 * free for a screen the capture workflow doesn't own: live
+                 * Fardriver telemetry, toggled over whatever A's state screen
+                 * is currently showing. */
+                ui_live_toggle();
             }
             break;
         }

@@ -57,6 +57,38 @@ typedef struct {
     char              err[48];      /* last error, empty when fine */
 } cap_status_t;
 
+/* The Fardriver's CONFIRMED/SOUND fields (docs/fardriver-fields.md), decoded
+ * from every MCU-link frame regardless of s_rec_on - the live screen has to
+ * work while just riding, not only mid-capture. Grouped by the frame type
+ * that carries them, each with its own "seen at least once" flag: the three
+ * types arrive at very different rates (0xb0 at the link's full ~35.5 Hz,
+ * 0xaf/0xb5/0x94 far slower), so one flag per group is what lets the UI show
+ * "--" for, say, engine_temp while gear and speed are already live. */
+typedef struct {
+    bool     b0_valid;             /* type 0xb0 seen at least once */
+    uint8_t  gear;                 /* 0/1/2 = eco/standard/sport */
+    bool     sliding_backwards;
+    bool     motion;
+    bool     brake_switch;
+    uint16_t cur_rpm;
+
+    bool     af_valid;             /* type 0xaf seen at least once */
+    uint8_t  wheel_ratio;
+    uint8_t  wheel_radius;
+    uint8_t  avg_speed_kmh;
+    uint8_t  wheel_width;
+    uint16_t rate_ratio;
+
+    bool     speed_valid;          /* b0_valid && af_valid && rate_ratio != 0 */
+    float    cur_speed_kmh;
+
+    bool     b5_valid;             /* type 0xb5 seen at least once */
+    int16_t  engine_temp;
+
+    bool     odo_valid;            /* type 0x94 seen at least once */
+    uint16_t odometer_raw;
+} fardriver_live_t;
+
 /* Brings up the capture task. Does not start scanning. */
 esp_err_t cap_init(void);
 
@@ -76,6 +108,9 @@ esp_err_t   cap_marker(const char *text);
 void        cap_status(cap_status_t *out);
 cap_state_t cap_state(void);
 const char *cap_state_str(cap_state_t s);
+
+/* Snapshot of the decoded Fardriver fields above; see fardriver_live_t. */
+void cap_live_get(fardriver_live_t *out);
 
 /* Stops everything and takes NimBLE and the BT controller down so the Wi-Fi
  * readout mode has the RAM. The only way back to capturing is a reboot. */
