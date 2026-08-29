@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "ble_explorer.h"
+#include "daly.h"
 
 #include "esp_console.h"
 #include "esp_timer.h"
@@ -444,8 +445,8 @@ static int cmd_readall(int argc, char **argv)
      * they are worth reading even though nothing subscribes to them. */
     for (int d = 0; d < blex_dsc_count(); d++) {
         const blex_dsc_t *ds = blex_dsc(d);
-        if (ble_uuid_cmp(&ds->uuid.u, BLE_UUID16_DECLARE(0x2901)) != 0 &&
-            ble_uuid_cmp(&ds->uuid.u, BLE_UUID16_DECLARE(0x2904)) != 0) {
+        if (!blex_uuid_is16(&ds->uuid.u, 0x2901) &&
+            !blex_uuid_is16(&ds->uuid.u, 0x2904)) {
             continue;
         }
         char what[48];
@@ -641,20 +642,6 @@ static int cmd_rec(int argc, char **argv)
 
 /* ------------------------------------------------------------ Daly helpers */
 
-/* Modbus CRC-16, the one both the Daly BMS and the Fardriver controller use,
- * differing only in the initial value. */
-static uint16_t crc16(const uint8_t *data, size_t len, uint16_t init)
-{
-    uint16_t crc = init;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++) {
-            crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
-        }
-    }
-    return crc;
-}
-
 static int cmd_crc(int argc, char **argv)
 {
     if (argc < 2) {
@@ -667,27 +654,17 @@ static int cmd_crc(int argc, char **argv)
         return 1;
     }
     uint16_t init = (argc >= 3) ? (uint16_t)strtol(argv[2], NULL, 0) : 0xFFFF;
-    uint16_t crc = crc16(s_buf, len, init);
+    uint16_t crc = modbus_crc16(s_buf, len, init);
     printf("CRC init=0x%04x value=0x%04x le=%02x%02x be=%02x%02x\n", init, crc,
            crc & 0xff, crc >> 8, crc >> 8, crc & 0xff);
     return 0;
 }
 
-/* Builds the 8-byte Daly request frame:
- *   [start, function, addr_hi, addr_lo, count_hi, count_lo, crc_lo, crc_hi] */
 static int daly_send(uint16_t handle, uint8_t start, uint8_t function,
                      uint16_t address, uint16_t count)
 {
-    uint8_t frame[8];
-    frame[0] = start;
-    frame[1] = function;
-    frame[2] = (uint8_t)(address >> 8);
-    frame[3] = (uint8_t)(address & 0xff);
-    frame[4] = (uint8_t)(count >> 8);
-    frame[5] = (uint8_t)(count & 0xff);
-    uint16_t crc = crc16(frame, 6, 0xFFFF);
-    frame[6] = (uint8_t)(crc & 0xff);
-    frame[7] = (uint8_t)(crc >> 8);
+    uint8_t frame[DALY_REQ_LEN];
+    daly_build_request(frame, start, function, address, count);
 
     int rc = blex_write(handle, frame, sizeof(frame), false, NULL);
     printf("DALY_TX handle=0x%04x rc=%d frame=", handle, rc);
@@ -702,8 +679,20 @@ static uint16_t handle_of_uuid16(uint16_t uuid16)
 {
     for (int c = 0; c < blex_chr_count(); c++) {
         const blex_chr_t *ch = blex_chr(c);
-        if (ble_uuid_cmp(&ch->uuid.u, BLE_UUID16_DECLARE(uuid16)) == 0) {
+        if (blex_uuid_is16(&ch->uuid.u, uuid16)) {
             return ch->val_handle;
+        }
+    }
+    return 0;
+}
+
+/* The same for the CCCD of that characteristic, 0 when it has none. */
+static uint16_t cccd_of_uuid16(uint16_t uuid16)
+{
+    for (int c = 0; c < blex_chr_count(); c++) {
+        const blex_chr_t *ch = blex_chr(c);
+        if (blex_uuid_is16(&ch->uuid.u, uuid16)) {
+            return ch->cccd_handle;
         }
     }
     return 0;
@@ -727,6 +716,29 @@ static int cmd_daly(int argc, char **argv)
          * which one the BMS answered: variant D2 replies starting with 0xd2,
          * variant 0x81 replies starting with 0x51. */
         printf("DALY_PROBE ctrl_handle=0x%04x\n", ctrl);
+
+        /* Both of these are what makes the probe self-contained rather than a
+         * trap. The answer to a request arrives as a notification on 0xfff1,
+         * so without the subscription the probe reports frames=0 however
+         * correctly the BMS replied; and without the MTU exchange the 129 byte
+         * answer is truncated at 20 bytes by the peer and the remainder is
+         * lost rather than fragmented across further notifications. */
+        uint16_t mtu = 0;
+        int rc = blex_exchange_mtu(&mtu);
+        printf("DALY_PROBE mtu_rc=%d negotiated=%u effective=%u\n", rc, mtu,
+               blex_mtu());
+        uint16_t cccd = cccd_of_uuid16(0xFFF1);
+        if (cccd == 0) {
+            printf("ERR characteristic 0xfff1 (daly notify) has no CCCD\n");
+            return 1;
+        }
+        rc = blex_subscribe(cccd, 1);
+        printf("DALY_PROBE sub cccd=0x%04x rc=%d\n", cccd, rc);
+        if (rc != 0) {
+            printf("ERR subscribe failed, the answers would go nowhere\n");
+            return 1;
+        }
+
         blex_nstat_reset();
         blex_rec_start();
 
