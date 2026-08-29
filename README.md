@@ -66,13 +66,18 @@ the whole protocol.
 Running the same CRC across all 16 bytes leaves a residue of 0, which is the
 cheapest way to validate a frame.
 
-Of the 55 types, only eight carry data that moves: `0x80`, `0x87`, `0x8e`,
-`0x95`, `0x9c`, `0xa3`, `0xaa`, `0xb0` - every seventh type, all sharing the
-payload prefix `0118 0000 0000 0000`. The rest are a static parameter dump and
-were byte-identical for the whole capture. Within a live frame only payload
-bytes 8..9 and 10..11 (frame bytes `10..11` and `12..13`) change; parked they
-idle at -1/-2 and 0/0xffff, so **assigning meaning to them needs a capture
-taken while riding**, not at a standstill:
+Of the 55 types, only eight carry data that moves while parked: `0x80`,
+`0x87`, `0x8e`, `0x95`, `0x9c`, `0xa3`, `0xaa`, `0xb0` - every seventh type,
+all sharing the payload prefix `0118 0000 0000 0000`. Within these, only
+payload bytes 8..9 and 10..11 (frame bytes `10..11` and `12..13`) change;
+parked they idle at -1/-2 and 0/0xffff and remain unassigned. The other 47
+types looked byte-identical for the whole parked capture, but "parked" is the
+catch: type `0xb0`'s payload bytes 6..7 carry `cur_rpm`, which reads 0 while
+stationary and so is indistinguishable from a genuinely static type in a
+parked capture alone. See `docs/fardriver-fields.md` for the decoded field
+table (gear, rpm, brake, temps, odometer), sourced from a public firmware
+project for the same bike, and for what's still open. Confirming anything
+new still needs a capture taken **while riding**, not at a standstill:
 
 ```bash
 ./wf.sh 'connect name Yuan' 'discover' 'sub all' --listen 120 --capture ride.log
