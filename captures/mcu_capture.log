@@ -1,0 +1,240 @@
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 271414342, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:1
+load:0x3fff0040,len:6272
+load:0x40078000,len:15784
+load:0x40080400,len:3988
+entry 0x40080644
+I (28) boot: ESP-IDF v6.1 2nd stage bootloader
+I (28) boot: compile time Aug 29 2026 11:24:00
+I (28) boot: Multicore bootloader
+I (29) boot: chip revision: v3.0
+I (32) boot.esp32: SPI Speed      : 80MHz
+I (36) boot.esp32: SPI Mode       : DIO
+I (39) boot.esp32: SPI Flash Size : 8MB
+I (43) boot: Enabling RNG early entropy source...
+I (47) boot: Partition Table:
+I (50) boot: ## Label            Usage          Type ST Offset   Length
+I (56) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (63) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (69) boot:  2 factory          factory app      00 00 00010000 00177000
+I (76) boot: End of partition table
+I (79) esp_image: segment 0: paddr=00010020 vaddr=3f400020 size=14858h ( 84056) map
+I (112) esp_image: segment 1: paddr=00024880 vaddr=3ffbdb60 size=05028h ( 20520) load
+I (119) esp_image: segment 2: paddr=000298b0 vaddr=40080000 size=06768h ( 26472) load
+I (128) esp_image: segment 3: paddr=00030020 vaddr=400d0020 size=4ba50h (309840) map
+I (220) esp_image: segment 4: paddr=0007ba78 vaddr=40086768 size=1067ch ( 67196) load
+I (244) esp_image: segment 5: paddr=0008c0fc vaddr=50000000 size=00028h (    40) load
+I (256) boot: Loaded app from partition at offset 0x10000
+I (256) boot: Disabling RNG early entropy source...
+I (266) cpu_start: Multicore app
+I (274) cpu_start: GPIO 3 and 1 are used as console UART I/O pins
+I (275) cpu_start: Pro cpu start user code
+I (275) cpu_start: cpu freq: 160000000 Hz
+I (277) app_init: Application information:
+I (280) app_init: Project name:     wildfire_monitor
+I (285) app_init: App version:      1
+I (288) app_init: Compile time:     Aug 29 2026 11:24:12
+I (293) app_init: ELF file SHA256:  a660f3c5e...
+I (298) app_init: ESP-IDF:          v6.1
+I (301) efuse_init: Min chip rev:     v0.0
+I (305) efuse_init: Max chip rev:     v3.99 
+I (309) efuse_init: Chip rev:         v3.0
+I (313) heap_init: Initializing. RAM available for dynamic allocation:
+I (319) heap_init: At 3FFAFF10 len 000000F0 (0 KiB): DRAM
+I (324) heap_init: At 3FFB6388 len 00001C78 (7 KiB): DRAM
+I (330) heap_init: At 3FFB9A20 len 00004108 (16 KiB): DRAM
+I (335) heap_init: At 3FFC7B88 len 00018478 (97 KiB): DRAM
+I (340) heap_init: At 3FFE0440 len 00003AE0 (14 KiB): D/IRAM
+I (345) heap_init: At 3FFE4350 len 0001BCB0 (111 KiB): D/IRAM
+I (351) heap_init: At 40096DE4 len 0000921C (36 KiB): IRAM
+I (357) spi_flash: detected chip: generic
+I (360) spi_flash: flash io: dio
+I (364) coexist: coex firmware version: a830d28
+I (368) main_task: Started on CPU0
+I (370) main_task: Calling app_main()
+I (854) main: wildfire_monitor BLE scanner, IDF v6.1
+I (869) BTDM_INIT: BT controller compile version [4a0f94d]
+I (869) BTDM_INIT: Using main XTAL as clock source
+I (870) BTDM_INIT: Bluetooth MAC: 64:b7:08:84:b0:66
+I (874) phy_init: phy_version 4863,a3a4459,Oct 28 2025,14:30:06
+BLE_READY own_addr=64:b7:08:84:b0:66 type=0
+[5n
+Type 'help' to get the list of commands.
+Use UP/DOWN arrows to navigate through command history.
+Press TAB when typing command name to auto-complete.
+
+Your terminal application does not support escape sequences.
+
+Line editing and history features are disabled.
+
+On Windows, try using Windows Terminal or Putty instead.
+wf>  I (1790) main_task: Returned from app_main()
+
+wf>  
+=== $ scan 8
+scan 8
+SCAN_START secs=8 mode=active dedup=0
+I (3042) NimBLE: GAP procedure initiated: discovery; 
+I (3043) NimBLE: own_addr_type=0 filter_policy=0 passive=0 limited=0 filter_duplicates=0 
+I (3056) NimBLE: duration=8000ms
+I (3057) NimBLE: 
+
+REDACTED devices=30 reason=third-party-scan see docs/adr/0001-captures-hold-raw-device-output-only.md
+DEV idx=10 addr=40:18:03:01:20:e9 type=random name="CH10250DD0097" rssi=-90/-81/-73 adv=10 rsp=10 itvl_us=500728/842174/1019384 evt=adv_ind|scan_rsp adv_raw=0201060cff0203164018030120e9444c rsp_raw=0e0943483130323530444430303937
+DEV idx=19 addr=c0:01:e1:ae:00:3d type=random name="YuanQuFOC274" rssi=-69/-64/-61 adv=31 rsp=30 itvl_us=201129/246311/410685 evt=adv_ind|scan_rsp adv_raw=0201060303e0ff0d095975616e5175464f43323734 rsp_raw=0d095975616e5175464f43323734
+SCAN_END devices=32
+wf>  
+=== $ connect name Yuan
+connect name Yuan
+CONNECTING addr=c0:01:e1:ae:00:3d type=random
+I (11639) NimBLE: GAP procedure initiated: connect; 
+I (11640) NimBLE: peer_addr_type=1 peer_addr=
+I (11641) NimBLE: c0:01:e1:ae:00:3d
+I (11653) NimBLE:  scan_itvl=96 scan_window=80 itvl_min=24 itvl_max=80 latency=0 supervision_timeout=600 min_ce_len=0 max_ce_len=0 own_addr_type=0
+I (11666) NimBLE: 
+
+CONNECTED took_ms=656
+CONN state=connected handle=0 peer=c0:01:e1:ae:00:3d peer_type=random own=64:b7:08:84:b0:66 itvl=80 (100.00 ms) latency=0 timeout=600 (6000 ms) mtu=23 rssi=-55 encrypted=0 authenticated=0 bonded=0 key_size=0
+CONN peer_param_requests=0 itvl_min=0 itvl_max=0 latency=0 timeout=0
+wf>  
+=== $ probe 30
+probe 30
+PROBE_START record_secs=30
+CONN state=connected handle=0 peer=c0:01:e1:ae:00:3d peer_type=random own=64:b7:08:84:b0:66 itvl=80 (100.00 ms) latency=0 timeout=600 (6000 ms) mtu=23 rssi=-55 encrypted=0 authenticated=0 bonded=0 key_size=0
+CONN peer_param_requests=0 itvl_min=0 itvl_max=0 latency=0 timeout=0
+I (12347) NimBLE: GATT procedure initiated: exchange mtu
+
+MTU conn=0 cid=4 value=247
+MTU_EXCHANGE rc=0 negotiated=247 effective=247
+I (12498) NimBLE: GATT procedure initiated: discover all services
+
+I (12696) NimBLE: GATT procedure initiated: discover all characteristics; 
+I (12698) NimBLE: start_handle=1 end_handle=4
+
+I (12996) NimBLE: GAP procedure initiated: 
+I (12997) NimBLE: connection parameter update; conn_handle=0 itvl_min=6 itvl_max=16 latency=0 supervision_timeout=100 min_ce_len=0 max_ce_len=0
+I (13010) NimBLE: 
+
+I (13096) NimBLE: GATT procedure initiated: discover all descriptors; 
+I (13098) NimBLE: chr_val_handle=3 end_handle=4
+
+I (13295) NimBLE: GATT procedure initiated: discover all characteristics; 
+I (13297) NimBLE: start_handle=5 end_handle=13
+
+CONN_UPDATE status=0
+I (13716) NimBLE: GATT procedure initiated: discover all characteristics; 
+I (13717) NimBLE: start_handle=14 end_handle=17
+
+I (13795) NimBLE: GATT procedure initiated: discover all descriptors; 
+I (13796) NimBLE: chr_val_handle=16 end_handle=17
+
+I (13835) NimBLE: GATT procedure initiated: discover all characteristics; 
+I (13837) NimBLE: start_handle=18 end_handle=65535
+
+I (13915) NimBLE: GATT procedure initiated: discover all descriptors; 
+I (13916) NimBLE: chr_val_handle=36 end_handle=65535
+
+SVC idx=0 start=0x0001 end=0x0004 uuid=0x1801 (gatt)
+CHR idx=0 svc=0 def=0x0002 val=0x0003 end=0x0004 cccd=0x0004 props=-----I-(0x20) uuid=0x2a05 (service_changed)
+DSC idx=0 chr=0 handle=0x0004 uuid=0x2902 (cccd)
+SVC idx=1 start=0x0005 end=0x000d uuid=0x1800 (gap)
+CHR idx=1 svc=1 def=0x0006 val=0x0007 end=0x0007 cccd=0x0000 props=-R-----(0x02) uuid=0x2a00 (device_name)
+CHR idx=2 svc=1 def=0x0008 val=0x0009 end=0x0009 cccd=0x0000 props=-R-----(0x02) uuid=0x2a01 (appearance)
+CHR idx=3 svc=1 def=0x000a val=0x000b end=0x000b cccd=0x0000 props=-R-----(0x02) uuid=0x2a04 (ppcp)
+CHR idx=4 svc=1 def=0x000c val=0x000d end=0x000d cccd=0x0000 props=-R-----(0x02) uuid=0x2aa6
+SVC idx=2 start=0x000e end=0x0011 uuid=0xffe0 (fardriver_service)
+CHR idx=5 svc=2 def=0x000f val=0x0010 end=0x0011 cccd=0x0011 props=-Rw-N--(0x16) uuid=0xffec (fardriver_data)
+DSC idx=1 chr=5 handle=0x0011 uuid=0x2902 (cccd)
+SVC idx=3 start=0x0012 end=0xffff uuid=0x180a (device_information)
+CHR idx=6 svc=3 def=0x0013 val=0x0014 end=0x0014 cccd=0x0000 props=-R-----(0x02) uuid=0x2a29 (manufacturer_name)
+CHR idx=7 svc=3 def=0x0015 val=0x0016 end=0x0016 cccd=0x0000 props=-R-----(0x02) uuid=0x2a24 (model_number)
+CHR idx=8 svc=3 def=0x0017 val=0x0018 end=0x0018 cccd=0x0000 props=-R-----(0x02) uuid=0x2a25 (serial_number)
+CHR idx=9 svc=3 def=0x0019 val=0x001a end=0x001a cccd=0x0000 props=-R-----(0x02) uuid=0x2a27 (hardware_revision)
+CHR idx=10 svc=3 def=0x001b val=0x001c end=0x001c cccd=0x0000 props=-R-----(0x02) uuid=0x2a26 (firmware_revision)
+CHR idx=11 svc=3 def=0x001d val=0x001e end=0x001e cccd=0x0000 props=-R-----(0x02) uuid=0x2a28 (software_revision)
+CHR idx=12 svc=3 def=0x001f val=0x0020 end=0x0020 cccd=0x0000 props=-R-----(0x02) uuid=0x2a23 (system_id)
+CHR idx=13 svc=3 def=0x0021 val=0x0022 end=0x0022 cccd=0x0000 props=-R-----(0x02) uuid=0x2a2a
+CHR idx=14 svc=3 def=0x0023 val=0x0024 end=0xffff cccd=0x0000 props=-R-----(0x02) uuid=0x2a50
+GATT_END svcs=4 chrs=15 dscs=2
+I (14116) NimBLE: GATT procedure initiated: read; 
+I (14128) NimBLE: att_handle=7
+
+RD handle=0x0007 chr=1 uuid=0x2a00/device_name rc=0 att=0x0000 len=13 data=5975616e5175464f4332373400 ascii="YuanQuFOC274."
+I (14158) NimBLE: GATT procedure initiated: read; 
+I (14171) NimBLE: att_handle=9
+
+RD handle=0x0009 chr=2 uuid=0x2a01/appearance rc=0 att=0x0000 len=2 data=0000 ascii=".."
+I (14197) NimBLE: GATT procedure initiated: read; 
+I (14198) NimBLE: att_handle=11
+
+RD handle=0x000b chr=3 uuid=0x2a04/ppcp rc=0 att=0x0000 len=8 data=0000000000000000 ascii="........"
+I (14237) NimBLE: GATT procedure initiated: read; 
+I (14238) NimBLE: att_handle=13
+
+RD handle=0x000d chr=4 uuid=0x2aa6 rc=0 att=0x0000 len=1 data=00 ascii="."
+I (14277) NimBLE: GATT procedure initiated: read; 
+I (14277) NimBLE: att_handle=16
+
+RD handle=0x0010 chr=5 uuid=0xffec/fardriver_data rc=0 att=0x0000 len=2 data=2202 ascii=""."
+I (14317) NimBLE: GATT procedure initiated: read; 
+I (14318) NimBLE: att_handle=20
+
+RD handle=0x0014 chr=6 uuid=0x2a29/manufacturer_name rc=0 att=0x0000 len=0 data= ascii=""
+I (14357) NimBLE: GATT procedure initiated: read; 
+I (14358) NimBLE: att_handle=22
+
+RD handle=0x0016 chr=7 uuid=0x2a24/model_number rc=0 att=0x0000 len=0 data= ascii=""
+I (14397) NimBLE: GATT procedure initiated: read; 
+I (14398) NimBLE: att_handle=24
+
+RD handle=0x0018 chr=8 uuid=0x2a25/serial_number rc=0 att=0x0000 len=0 data= ascii=""
+I (14437) NimBLE: GATT procedure initiated: read; 
+I (14438) NimBLE: att_handle=26
+
+RD handle=0x001a chr=9 uuid=0x2a27/hardware_revision rc=0 att=0x0000 len=0 data= ascii=""
+I (14477) NimBLE: GATT procedure initiated: read; 
+I (14478) NimBLE: att_handle=28
+
+RD handle=0x001c chr=10 uuid=0x2a26/firmware_revision rc=0 att=0x0000 len=0 data= ascii=""
+I (14517) NimBLE: GATT procedure initiated: read; 
+I (14518) NimBLE: att_handle=30
+
+RD handle=0x001e chr=11 uuid=0x2a28/software_revision rc=0 att=0x0000 len=0 data= ascii=""
+I (14557) NimBLE: GATT procedure initiated: read; 
+I (14558) NimBLE: att_handle=32
+
+RD handle=0x0020 chr=12 uuid=0x2a23/system_id rc=0 att=0x0000 len=8 data=0001020000030405 ascii="........"
+I (14597) NimBLE: GATT procedure initiated: read; 
+I (14598) NimBLE: att_handle=34
+
+RD handle=0x0022 chr=13 uuid=0x2a2a rc=0 att=0x0000 len=14 data=fe006578706572696d656e74616c ascii="..experimental"
+I (14638) NimBLE: GATT procedure initiated: read; 
+I (14651) NimBLE: att_handle=36
+
+RD handle=0x0024 chr=14 uuid=0x2a50 rc=0 att=0x0000 len=7 data=015d0000000001 ascii=".]....."
+READALL_END
+I (14678) NimBLE: GATT procedure initiated: write; 
+I (14678) NimBLE: att_handle=4 len=2
+
+SUB chr=0 val_handle=0x0003 cccd=0x0004 value=0x0002 rc=0
+I (14716) NimBLE: GATT procedure initiated: write; 
+I (14717) NimBLE: att_handle=17 len=2
+
+SUB chr=5 val_handle=0x0010 cccd=0x0011 value=0x0001 rc=0
+SUBALL_END subscribed=2
+PROBE_RECORDING secs=30
+NSTAT h=0x0010 count=1065 bytes=17040 len=16..16 span_ms=30000 rate_mHz=35465 byte0={aa} byte1={80,81,82,83,84,85,86,87,88,89,8a,8b,8c,8d,8e,8f,90,91,92,93,94,95,96,97,98,99,9a,9b,9c,9d,9e,9f,a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,aa,ab,ac,ad,ae,af,b0,b1,b2,b3,b4,b5,b6}
+NSTAT_END entries=1
+CONN state=connected handle=0 peer=c0:01:e1:ae:00:3d peer_type=random own=64:b7:08:84:b0:66 itvl=16 (20.00 ms) latency=0 timeout=100 (1000 ms) mtu=247 rssi=-54 encrypted=0 authenticated=0 bonded=0 key_size=0
+CONN peer_param_requests=0 itvl_min=0 itvl_max=0 latency=0 timeout=0
+PROBE_END frames=853 dropped=211 bytes=20472  (run 'rec dump' for the raw frames)
+wf>  
+=== $ nstat
+nstat
+NSTAT h=0x0010 count=1067 bytes=17072 len=16..16 span_ms=30060 rate_mHz=35461 byte0={aa} byte1={80,81,82,83,84,85,86,87,88,89,8a,8b,8c,8d,8e,8f,90,91,92,93,94,95,96,97,98,99,9a,9b,9c,9d,9e,9f,a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,aa,ab,ac,ad,ae,af,b0,b1,b2,b3,b4,b5,b6}
+NSTAT_END entries=1
+wf>  
