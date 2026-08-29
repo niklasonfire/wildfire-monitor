@@ -908,7 +908,7 @@ static int on_disc_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
             d->uuid = dsc->uuid;
         }
         /* Remember the CCCD: every later subscribe writes to this handle. */
-        if (ble_uuid_cmp(&dsc->uuid.u, BLE_UUID16_DECLARE(0x2902)) == 0 &&
+        if (blex_uuid_is16(&dsc->uuid.u, 0x2902) &&
             s_disc_chr_idx >= 0 && s_disc_chr_idx < s_chr_count) {
             s_chrs[s_disc_chr_idx].cccd_handle = dsc->handle;
         }
