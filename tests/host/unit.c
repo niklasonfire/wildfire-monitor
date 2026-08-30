@@ -1167,28 +1167,349 @@ static void test_distance_survives_a_power_cycle(void)
             "distance after another minute on the far side of the restore");
 }
 
+/* ---- Consumption -------------------------------------------------------- */
+
+/* cap0007 covers 16.7 m in 47 s at under 5.7 km/h, which is less than a fifth
+ * of one Odometer count and less than a sixtieth of the window. It cannot fill
+ * a window, it cannot show Consumption rising on a motorway, and it cannot
+ * even clear the stationary guard - which makes it a fine test of the guard
+ * and a hopeless test of everything else here. So the riding below is
+ * synthesised, the same way the Odometer's wrap and the Anchor's pull are.
+ *
+ * The arithmetic that makes these tests readable: at a steady speed and a
+ * steady draw, watt-hours per kilometre is watts divided by km/h. 105 V at
+ * 10.2857 A is 1080 W, and at 36 km/h that is exactly 30 Wh/km. */
+#define CONS_VOLTS 105.0
+
+/* Amps that buy a wanted Wh/km at a wanted speed. */
+static double amps_for(double wh_per_km, double kmh)
+{
+    return wh_per_km * kmh / CONS_VOLTS;
+}
+
+/* One tick of a steady ride: the motion frame carrying the road speed and the
+ * power-block frame carrying what it is bought with. Two blocks, two clocks
+ * inside the estimator, both stepped by the same stream - which is what a real
+ * Controller link does. */
+static void feed_ride(wf_est_t *e, uint32_t t_ms, double kmh, double amps)
+{
+    feed_speed(e, t_ms, kmh);
+    feed_power(e, t_ms, CONS_VOLTS, amps);
+}
+
+/* Rides a given number of metres at a steady speed and a steady draw, starting
+ * from t0_ms, and returns the time it ended at. The frame at t0_ms itself only
+ * starts the two clocks; on a continuing ride it is a zero-length step and
+ * changes nothing, so this composes. */
+static uint32_t ride(wf_est_t *e, uint32_t t0_ms, double metres, double kmh,
+                     double amps)
+{
+    double per_tick = kmh * (1000.0 / 3600.0) * ((double)SAMPLE_MS / 1000.0);
+    long ticks = (long)(metres / per_tick + 0.5);
+    uint32_t t = t0_ms;
+
+    feed_ride(e, t, kmh, amps);
+    for (long i = 0; i < ticks; i++) {
+        t += SAMPLE_MS;
+        feed_ride(e, t, kmh, amps);
+    }
+    return t;
+}
+
+/* The all-time average as the two totals it is the ratio of, which is what the
+ * screen would show once the window has run out and is what the tests below
+ * compare the windowed figure against. */
+static double alltime_wh_per_km(const wf_est_out_t *o)
+{
+    return o->alltime_m > 0.0 ? o->alltime_wh / o->alltime_m * 1000.0 : 0.0;
+}
+
+/* The stationary-bike criterion, and it is a division and not a hypothetical:
+ * cap0007's first eight seconds are exactly this. The ignition is on, the
+ * Controller is streaming, current is leaving the Pack and the wheel is not
+ * turning, so the denominator is zero and the quotient is not a large
+ * Consumption figure but a meaningless one.
+ *
+ * The assertion is that no figure is produced at all - not that a large one is
+ * clamped - and that the field is left at zero rather than at an infinity or a
+ * NaN, which is the proof that the division never happened. */
+static void test_a_standing_bike_produces_no_consumption(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    /* A minute of ignition-on idling: motion frames arriving at 5 Hz with a
+     * road speed of zero, and 2 A of hotel load leaving the Pack. */
+    for (uint32_t t = 0; t <= 60000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 0.0, 2.0);
+    }
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.distance_valid, "a minute of motion frames left distance invalid");
+    CHECK_D(o.distance_m, 0.0, 1e-9, "a standing bike moved");
+    CHECK(o.alltime_wh > 0.0,
+          "a minute at 2 A drew no energy, so the guard is measuring nothing");
+    CHECK_D(o.alltime_m, 0.0, 1e-9, "a standing bike accumulated distance");
+    CHECK(!o.consumption_valid, "a standing bike produced a Consumption figure");
+    CHECK_D(o.consumption_wh_per_km, 0.0, 0.0,
+            "something divided by a standing bike's zero distance");
+
+    /* Creeping does not clear it either: the floor is one Odometer count, and
+     * below that the Monitor cannot claim to know how far it has gone. Fifty
+     * metres is half of one. */
+    uint32_t t = ride(&e, 60000u, 50.0, 5.0, 2.0);
+    wf_est_get(&e, &o);
+    CHECK(o.alltime_m > 40.0 && o.alltime_m < 60.0,
+          "the creep covered %.1f m, not the 50 m it was asked for",
+          o.alltime_m);
+    CHECK(!o.consumption_valid,
+          "50 m - half an Odometer count - produced a Consumption figure");
+    CHECK_D(o.consumption_wh_per_km, 0.0, 0.0, "a figure from half a count");
+
+    /* Past the floor there is a denominator worth dividing by, and the figure
+     * appears - as the all-time average, because a hundred metres is a
+     * twentieth of the window and the ring is nowhere near full. */
+    ride(&e, t, 100.0, 5.0, 2.0);
+    wf_est_get(&e, &o);
+    CHECK(o.consumption_valid, "150 m produced no Consumption figure at all");
+    CHECK(!o.consumption_windowed,
+          "150 m of riding claimed to be a full %.0f m window",
+          WF_EST_CONS_WINDOW_M);
+    CHECK_D(o.consumption_wh_per_km, alltime_wh_per_km(&o), 1e-9,
+            "the fallback figure is not the all-time average");
+    CHECK(o.consumption_wh_per_km > 0.0 && o.consumption_wh_per_km < 1e5,
+          "the first figure past the floor is %.1f Wh/km",
+          o.consumption_wh_per_km);
+}
+
+/* The window doing its job: it has to rise on the motorway and fall in town.
+ * Three kilometres, each ridden at a different steady cost, and after each one
+ * the figure has to be that kilometre's cost and not the average of everything
+ * so far - which is the difference between a rolling window and a trip meter,
+ * and is asserted by comparing against the all-time average at every step. */
+static void test_consumption_follows_the_recent_kilometre(void)
+{
+    const double town = 30.0, motorway = 70.0;
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    /* Half a window in, there is still no window. */
+    uint32_t t = ride(&e, 0, WF_EST_CONS_WINDOW_M / 2.0, 36.0,
+                      amps_for(town, 36.0));
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(!o.consumption_windowed,
+          "half a window reported itself as a full one");
+    CHECK(o.consumption_valid, "half a window and no fallback either");
+
+    /* A full one, and the figure is the town's. */
+    t = ride(&e, t, WF_EST_CONS_WINDOW_M / 2.0, 36.0, amps_for(town, 36.0));
+    wf_est_get(&e, &o);
+    CHECK(o.consumption_windowed, "a full window did not report itself as one");
+    CHECK_D(o.window_m, WF_EST_CONS_WINDOW_M, WF_EST_CONS_BUCKET_M,
+            "the window's own length");
+    CHECK_D(o.consumption_wh_per_km, town, 0.5, "a kilometre of town riding");
+
+    /* Onto the motorway. One window later the figure is the motorway's, and
+     * the all-time average - which is where a trip meter would still be
+     * sitting - is halfway between the two, so the two cannot be confused. */
+    t = ride(&e, t, WF_EST_CONS_WINDOW_M, 90.0, amps_for(motorway, 90.0));
+    wf_est_get(&e, &o);
+    CHECK(o.consumption_windowed, "the window emptied on the motorway");
+    CHECK_D(o.consumption_wh_per_km, motorway, 0.5, "a kilometre of motorway");
+    CHECK_D(alltime_wh_per_km(&o), (town + motorway) / 2.0, 0.5,
+            "the all-time average after one kilometre of each");
+    CHECK(o.consumption_wh_per_km - alltime_wh_per_km(&o) > 15.0,
+          "the windowed figure %.1f and the all-time %.1f are too close for "
+          "this test to distinguish them",
+          o.consumption_wh_per_km, alltime_wh_per_km(&o));
+
+    /* And back into town: it falls again. A trip meter cannot do this. */
+    ride(&e, t, WF_EST_CONS_WINDOW_M, 36.0, amps_for(town, 36.0));
+    wf_est_get(&e, &o);
+    CHECK_D(o.consumption_wh_per_km, town, 0.5,
+            "back to town riding after the motorway");
+    CHECK(alltime_wh_per_km(&o) > town + 5.0,
+          "the all-time average fell back to the town figure too, so the "
+          "window is not what is being measured");
+}
+
+/* "Improves across rides rather than being overwritten by the last one." That
+ * is a statement about weights, and it is why the persisted state holds two
+ * running totals and not a stored mean: a mean cannot be improved by a new
+ * ride without also carrying the distance it was taken over.
+ *
+ * Three rides of equal length at 20, 40 and 60 Wh/km. Each one moves the
+ * average by its share and no more, so the sequence is 20, 30, 40 - never 40,
+ * which is what a stored mean overwritten by the last ride would give. */
+static void test_the_all_time_average_improves_across_rides(void)
+{
+    const double leg_m = 2.0 * WF_EST_CONS_WINDOW_M;
+    const double cost[3] = {20.0, 40.0, 60.0};
+    const double want[3] = {20.0, 30.0, 40.0};
+    static const char *dist_label[3] = {
+        "the all-time distance after ride 1",
+        "the all-time distance after ride 2",
+        "the all-time distance after ride 3",
+    };
+    static const char *avg_label[3] = {
+        "the all-time average after ride 1",
+        "the all-time average after ride 2",
+        "the all-time average after ride 3",
+    };
+
+    wf_est_persist_t saved;
+    memset(&saved, 0, sizeof(saved));
+    bool have_saved = false;
+
+    for (int i = 0; i < 3; i++) {
+        wf_est_t e;
+        wf_est_init(&e, have_saved ? &saved : NULL);
+
+        ride(&e, 0, leg_m, 36.0, amps_for(cost[i], 36.0));
+
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        CHECK_D(o.alltime_m, leg_m * (i + 1), 1.0, dist_label[i]);
+        CHECK_D(alltime_wh_per_km(&o), want[i], 0.5, avg_label[i]);
+
+        /* Out through the bytes and back, exactly as est_store.c does it. */
+        uint8_t blob[WF_EST_PERSIST_BYTES];
+        wf_est_save(&e, &saved);
+        CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)),
+              "encode failed on ride %d", i + 1);
+        CHECK(wf_est_persist_decode(blob, sizeof(blob), &saved),
+              "decode failed on ride %d", i + 1);
+        have_saved = true;
+    }
+
+    /* The last ride was the most expensive of the three, and the average it
+     * left behind is well below it. A stored mean would read 60. */
+    CHECK(saved.alltime_wh / saved.alltime_m * 1000.0 < 50.0,
+          "the all-time average was overwritten by the last ride");
+}
+
+/* The power-cycle criterion: encode the state mid-ride, decode it into a fresh
+ * estimator, carry on, and the figure the rider is looking at does not step.
+ *
+ * The trap this test is built to avoid is passing by coincidence. If the
+ * all-time average happened to equal the window, a Monitor that simply forgot
+ * its window and fell back would look continuous, so the persisted history
+ * here is deliberately a long way from the ride: fifty kilometres at 80 Wh/km
+ * against a ride at 25. A fallback would show about 78 and the assertion is
+ * against a step of half a watt-hour per kilometre. */
+static void test_consumption_survives_a_power_cycle(void)
+{
+    const double ride_cost = 25.0;
+
+    wf_est_persist_t history;
+    memset(&history, 0, sizeof(history));
+    history.version    = WF_EST_PERSIST_VERSION;
+    history.alltime_m  = 50000.0f;
+    history.alltime_wh = 50.0f * 80.0f;
+
+    wf_est_t e;
+    wf_est_init(&e, &history);
+    uint32_t t = ride(&e, 0, 1.5 * WF_EST_CONS_WINDOW_M, 36.0,
+                      amps_for(ride_cost, 36.0));
+
+    wf_est_out_t before;
+    wf_est_get(&e, &before);
+    CHECK(before.consumption_windowed, "the ride did not fill a window");
+    CHECK_D(before.consumption_wh_per_km, ride_cost, 0.5,
+            "the figure before the break");
+    CHECK(alltime_wh_per_km(&before) > 60.0,
+          "the persisted history is %.1f Wh/km, too close to the ride's %.1f "
+          "for a fallback to be distinguishable from continuity",
+          alltime_wh_per_km(&before), ride_cost);
+
+    /* The break. Out through the bytes and back into a fresh estimator, which
+     * is all a power cycle is. */
+    wf_est_persist_t saved;
+    wf_est_save(&e, &saved);
+    CHECK(saved.window_m >= (float)WF_EST_CONS_WINDOW_M,
+          "a full window was not saved");
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)), "encode failed");
+    wf_est_persist_t back;
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &back), "decode failed");
+
+    wf_est_t after;
+    wf_est_init(&after, &back);
+    wf_est_out_t o;
+    wf_est_get(&after, &o);
+    CHECK(o.consumption_valid, "no Consumption figure at all after the break");
+    CHECK(o.consumption_windowed,
+          "the window was lost across the break and the figure fell back to "
+          "the all-time average");
+    CHECK_D(o.consumption_wh_per_km, before.consumption_wh_per_km, 0.5,
+            "the Consumption figure across the break");
+
+    /* And it carries on rather than merely surviving the instant: another two
+     * hundred metres at the same cost keeps it there, which is the seeded
+     * window being displaced by real buckets without a step. */
+    double worst = 0.0;
+    double prev = o.consumption_wh_per_km;
+    for (int i = 0; i < 10; i++) {
+        t = ride(&after, t, 100.0, 36.0, amps_for(ride_cost, 36.0));
+        wf_est_get(&after, &o);
+        double step = o.consumption_wh_per_km - prev;
+        if (step < 0.0) {
+            step = -step;
+        }
+        if (step > worst) {
+            worst = step;
+        }
+        prev = o.consumption_wh_per_km;
+    }
+    CHECK(worst < 0.5, "Consumption stepped by %.2f Wh/km over the kilometre "
+                       "after the break", worst);
+    CHECK_D(prev, ride_cost, 0.5, "the figure a kilometre past the break");
+
+    /* The all-time average kept the history and added the ride to it, so it
+     * has moved a little and not been replaced. */
+    CHECK(o.alltime_m > 52000.0,
+          "the all-time distance lost the history: %.0f m", o.alltime_m);
+    CHECK(alltime_wh_per_km(&o) > 60.0 && alltime_wh_per_km(&o) < 80.0,
+          "the all-time average after the ride is %.1f Wh/km",
+          alltime_wh_per_km(&o));
+}
+
+/* Builds the 24-byte layout versions 1 and 2 wrote, by hand rather than with
+ * the encoder, because the encoder only ever writes the current version. The
+ * distance fields are the ones version 1 left zeroed and version 2 spent. */
+static void build_old_blob(uint8_t blob[WF_EST_PERSIST_BYTES_V2],
+                           uint16_t version, float distance_m)
+{
+    memset(blob, 0, WF_EST_PERSIST_BYTES_V2);
+    blob[0] = 0x57;                 /* 'W' */
+    blob[1] = 0x45;                 /* 'E' */
+    blob[2] = (uint8_t)version;     /* little endian, and both fit a byte */
+    blob[4] = 1;                    /* valid */
+    blob[5] = version >= 2 ? 1u : 0u;
+    float coulomb = 20.0f, remaining = 1000.0f;
+    float rated = (float)WF_EST_RATED_CAPACITY_AH;
+    memcpy(&blob[6], &coulomb, sizeof(coulomb));
+    memcpy(&blob[10], &remaining, sizeof(remaining));
+    memcpy(&blob[14], &rated, sizeof(rated));
+    if (version >= 2) {
+        memcpy(&blob[18], &distance_m, sizeof(distance_m));
+    }
+    uint16_t crc = wf_crc16(blob, WF_EST_PERSIST_BYTES_V2 - 2, 0xffff);
+    blob[22] = (uint8_t)(crc & 0xff);
+    blob[23] = (uint8_t)(crc >> 8);
+}
+
 /* Version 1 is version 2 without distance, in bytes version 1 left zeroed. A
  * blob from that build has to be migrated deliberately - charge figures kept,
  * distance starting at nothing, which is what that build actually knew - and
  * not misread as a distance of whatever those bytes happened to hold. */
 static void test_a_version_1_blob_is_migrated(void)
 {
-    /* Built by hand rather than by the encoder, because the encoder only
-     * writes the current version. This is the byte layout version 1 wrote. */
-    uint8_t blob[WF_EST_PERSIST_BYTES];
-    memset(blob, 0, sizeof(blob));
-    blob[0] = 0x57;                 /* 'W' */
-    blob[1] = 0x45;                 /* 'E' */
-    blob[2] = 1;                    /* version 1, little endian */
-    blob[4] = 1;                    /* valid */
-    float coulomb = 20.0f, remaining = 1000.0f;
-    float rated = (float)WF_EST_RATED_CAPACITY_AH;
-    memcpy(&blob[6], &coulomb, sizeof(coulomb));
-    memcpy(&blob[10], &remaining, sizeof(remaining));
-    memcpy(&blob[14], &rated, sizeof(rated));
-    uint16_t crc = wf_crc16(blob, WF_EST_PERSIST_BYTES - 2, 0xffff);
-    blob[22] = (uint8_t)(crc & 0xff);
-    blob[23] = (uint8_t)(crc >> 8);
+    uint8_t blob[WF_EST_PERSIST_BYTES_V2];
+    build_old_blob(blob, 1, 0.0f);
 
     wf_est_persist_t p;
     CHECK(wf_est_persist_decode(blob, sizeof(blob), &p),
@@ -1205,14 +1526,70 @@ static void test_a_version_1_blob_is_migrated(void)
     CHECK(o.valid, "the migrated charge figures were not restored");
     CHECK_D(o.coulomb_ah, 20.0, 1e-6, "the restored Coulomb Count");
     CHECK(!o.distance_valid, "a version 1 blob restored a distance");
+}
 
-    /* And the flip side: a version this build has never written is not read
-     * at all, however good its checksum is. */
-    blob[2] = WF_EST_PERSIST_VERSION + 1;
-    crc = wf_crc16(blob, WF_EST_PERSIST_BYTES - 2, 0xffff);
+/* Version 2 is the layout this build replaced: 24 bytes, no Consumption. It is
+ * migrated rather than rejected, because the alternative is throwing away a
+ * rider's Distance and charge on the firmware update that added Consumption,
+ * for nothing. What it restores is no all-time average and no window - exactly
+ * what a build that did not compute Consumption knew - so the first ride after
+ * the update rebuilds both from scratch.
+ *
+ * And the flip side, which is the whole reason the length is checked against
+ * the version: bytes are never reinterpreted. A 24-byte blob claiming version
+ * 3 would have its Consumption read out of a CRC and past the end of the
+ * record; a 40-byte blob claiming version 2 would have version 3's fields
+ * silently ignored and its CRC read from the wrong place. Both are rejected. */
+static void test_a_version_2_blob_is_migrated(void)
+{
+    uint8_t blob[WF_EST_PERSIST_BYTES_V2];
+    build_old_blob(blob, 2, 4321.0f);
+
+    wf_est_persist_t p;
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &p),
+          "a version 2 blob was rejected rather than migrated");
+    CHECK_U(p.version, 2, "the version the blob was written at");
+    CHECK(p.valid, "the version 2 charge figures were dropped");
+    CHECK(p.distance_valid, "the version 2 distance was dropped");
+    CHECK_D(p.distance_m, 4321.0, 1e-6, "the migrated Distance");
+    CHECK_D(p.alltime_m, 0.0, 1e-9, "a version 2 blob carried an all-time "
+            "distance it cannot have written");
+    CHECK_D(p.alltime_wh, 0.0, 1e-9, "a version 2 blob carried an all-time "
+            "energy it cannot have written");
+    CHECK_D(p.window_m, 0.0, 1e-9, "a version 2 blob carried a window");
+
+    wf_est_t e;
+    wf_est_init(&e, &p);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.valid, "the migrated charge figures were not restored");
+    CHECK_D(o.distance_m, 4321.0, 1e-6, "the restored Distance");
+    CHECK(!o.consumption_valid,
+          "a version 2 blob produced a Consumption figure out of nothing");
+
+    /* The length and the version have to agree. */
+    blob[2] = 3;
+    uint16_t crc = wf_crc16(blob, WF_EST_PERSIST_BYTES_V2 - 2, 0xffff);
     blob[22] = (uint8_t)(crc & 0xff);
     blob[23] = (uint8_t)(crc >> 8);
     CHECK(!wf_est_persist_decode(blob, sizeof(blob), &p),
+          "a 24-byte blob claiming version 3 decoded");
+
+    uint8_t wide[WF_EST_PERSIST_BYTES];
+    wf_est_persist_t cur = {
+        .version           = 2,
+        .valid             = true,
+        .rated_capacity_ah = (float)WF_EST_RATED_CAPACITY_AH,
+    };
+    CHECK(wf_est_persist_encode(&cur, wide, sizeof(wide)), "encode failed");
+    CHECK(!wf_est_persist_decode(wide, sizeof(wide), &p),
+          "a 40-byte blob claiming version 2 decoded");
+
+    /* And a version this build has never written is not read at all, however
+     * good its checksum is. */
+    cur.version = WF_EST_PERSIST_VERSION + 1;
+    CHECK(wf_est_persist_encode(&cur, wide, sizeof(wide)), "encode failed");
+    CHECK(!wf_est_persist_decode(wide, sizeof(wide), &p),
           "a blob from a future version decoded");
 }
 
@@ -1250,7 +1627,14 @@ int main(void)
     test_persisted_state_round_trips();
     test_a_restored_count_is_not_an_anchor();
     test_distance_survives_a_power_cycle();
+
+    test_a_standing_bike_produces_no_consumption();
+    test_consumption_follows_the_recent_kilometre();
+    test_the_all_time_average_improves_across_rides();
+    test_consumption_survives_a_power_cycle();
+
     test_a_version_1_blob_is_migrated();
+    test_a_version_2_blob_is_migrated();
 
     if (failures != 0) {
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");

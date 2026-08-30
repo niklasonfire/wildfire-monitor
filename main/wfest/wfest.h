@@ -96,6 +96,73 @@
  * is true as soon as either source has spoken and false before that, because
  * a confident 0 m from a link that has never come up is worse than a dash.
  *
+ * ---------------------------------------------------------------------------
+ * Consumption, which is a ratio and so is mostly a question of what to divide
+ * by
+ * ---------------------------------------------------------------------------
+ *
+ *   Consumption     watt-hours per kilometre - energy drawn divided by the
+ *                   Distance it bought
+ *
+ * The numerator is the same integral V I dt the Remaining Energy count runs
+ * on, and deliberately not the Anchored figure: the Anchor's pull moves
+ * Remaining Energy without any energy having gone anywhere, and a Consumption
+ * that moved with it would be measuring the BMS rather than the riding. So
+ * Consumption is built from the raw integration steps, which makes it exactly
+ * as uncertain as WF_CTRL_CURRENT_LSB_PER_A and no more.
+ *
+ * The denominator is where the design is. Two things are wanted at once and
+ * they pull opposite ways:
+ *
+ *   Recency.    The number has to mean "how you are riding now", so that it
+ *               rises on the motorway and falls in town. That wants a short
+ *               window.
+ *   Steadiness. It must not swing between coasting and climbing, which is what
+ *               an instantaneous watts-over-metres-per-second does at every
+ *               throttle movement. That wants a long one.
+ *
+ * The window is over Distance and not over time, which resolves most of it: a
+ * window measured in metres holds the same amount of *riding* whatever the
+ * speed, where a window measured in seconds holds ten times as much road on a
+ * motorway as in traffic - and is empty at a red light, which is exactly when
+ * a time-windowed figure diverges. WF_EST_CONS_WINDOW_M is that one constant.
+ *
+ * It is implemented as a ring of WF_EST_CONS_BUCKETS fixed-length buckets of
+ * road, each accumulating the energy drawn while its metres were covered. A
+ * bucket closes when it has collected its span and the oldest is dropped, so
+ * the reported figure is the ratio of the totals over the last full window.
+ * The figure therefore moves once per bucket and not once per frame, which is
+ * the steadiness half made concrete: a fifty-metre step at 36 km/h is a new
+ * number every five seconds, and one bucket can move it by at most a twentieth
+ * of the difference between the road it covers and the road it replaces.
+ *
+ * Before the ring has filled there is no window, and that is precisely the
+ * first kilometre - when the rider is deciding whether to set off and wants a
+ * number most. So a persisted all-time average stands in: two running totals,
+ * energy and distance, accumulated across every ride this Monitor has seen and
+ * divided on demand. Totals and not a stored mean, because a mean cannot be
+ * improved by a new ride without also carrying the weight it was taken over,
+ * and two totals carry that for free - the tenth ride moves the average by a
+ * tenth and not by all of it. The rider is told which of the two is on screen;
+ * `consumption_windowed` is that flag and main/ui.c renders it.
+ *
+ * Both are divisions by a distance, so both are guarded. A bike standing at a
+ * junction with the ignition on draws current and covers no ground, and the
+ * quotient of those two is not a large Consumption figure, it is a meaningless
+ * one. The window's guard is structural - the ring reports only once it holds
+ * a full window of road, which a standing bike never gives it - and the
+ * all-time average has an explicit floor, WF_EST_CONS_MIN_DIST_M, of one
+ * Odometer count. Below that there is no figure at all and the screen shows a
+ * dash. cap0007 is exactly this case: 16.7 m of fused Distance in 47 s, the
+ * first eight of them stationary, and it must not produce a Consumption
+ * figure.
+ *
+ * Energy drawn while standing still is still counted; it left the Pack. It
+ * lands in whichever bucket is open when the bike moves again and washes out
+ * of the window within a kilometre. The all-time totals keep it forever, which
+ * is the honest answer for a lifetime average and does mean an afternoon
+ * parked with the ignition on and the Monitor running biases it upward.
+ *
  * WARNING, and it is the big one: every watt-hour below is scaled by
  * WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 % - upstream says 4 LSB
  * per amp, regression against the BMS says 4.77. That uncertainty propagates
@@ -208,6 +275,39 @@
 #define WF_EST_DT_MAX_MS              2000u
 #define WF_EST_DIST_TAU_S             60.0
 
+/* --------------------------------------------------- Consumption's window
+ *
+ * WINDOW_M is the stated constant the acceptance criterion asks for: the
+ * length of road Consumption is averaged over. One kilometre, which is one
+ * unit of the figure's own denominator - a Wh/km averaged over a kilometre is
+ * a sentence the rider can finish - and, at anything from town speed to
+ * motorway speed, between half a minute and two minutes of riding. Short
+ * enough that a motorway slip road shows up inside it, long enough that a
+ * single hill does not own it.
+ *
+ * BUCKETS is how finely that window is chopped, and it buys two things at the
+ * cost of memory. It is the granularity of the figure's movement - one bucket
+ * closing swaps a twentieth of the window, so the number steps rather than
+ * jitters - and it is the resolution of the window's own edge, because the
+ * window is really 1000 m to 1050 m of road rather than exactly 1000.
+ *
+ * The cost is the ring: BUCKETS pairs of doubles, 320 bytes, inside the
+ * caller's wf_est_t. That is the whole of what Consumption adds to a board
+ * running a BLE stack and a FAT writer in 320 KB, and it is a fixed 320 bytes
+ * - no allocation, no growth with ride length.
+ *
+ * MIN_DIST_M is the stationary-bike guard on the all-time average, and it is
+ * one Odometer count: below a hundred metres the Monitor cannot claim to know
+ * how far it has gone at all, which makes it the shortest distance worth
+ * dividing by. The windowed figure needs no such constant - it cannot report
+ * until it holds a full window, and a standing bike never fills one.
+ */
+#define WF_EST_CONS_WINDOW_M          1000.0
+#define WF_EST_CONS_BUCKETS           20
+#define WF_EST_CONS_BUCKET_M          (WF_EST_CONS_WINDOW_M / \
+                                       WF_EST_CONS_BUCKETS)
+#define WF_EST_CONS_MIN_DIST_M        100.0
+
 /* ----------------------------------------------------------- sign convention
  *
  * Positive current is discharge - the Controller's own convention, kept
@@ -243,17 +343,38 @@
  * migrated rather than rejected: its layout is a prefix of this one and its
  * reserved bytes are zero by construction, so it restores its charge figures
  * and no distance at all, which is precisely what a build that did not count
- * metres knew. The reserve is now spent; the field after this one grows the
- * blob, and the length check rejects the old layout at that point.
+ * metres knew.
  *
- * The two validity flags are separate because the two figures are. A Monitor
- * that saw the Controller but never the BMS has metres worth keeping and no
- * charge figure at all; the Rated Capacity guard in wf_est_init() throws away
- * a charge count and has nothing to say about a distance.
+ * Version 3 spent the reserve and grew the blob, from 24 bytes to 40, for
+ * Consumption: the two all-time totals and a summary of the rolling window.
+ * A version 2 blob is 24 bytes and is still read - migrated, not reinterpreted
+ * - because the alternative is throwing away a rider's Distance and charge on
+ * the firmware update that added Consumption, for nothing. The length is what
+ * selects the layout and the version has to agree with it, so there is no
+ * reading of the new fields out of bytes an old blob never wrote: a 24-byte
+ * blob carries version 1 or 2 and its CRC at byte 22, a 40-byte blob carries
+ * version 3 and its CRC at byte 38, and every other combination is rejected.
+ * What a migrated version 2 blob restores is no all-time average and no window
+ * - which is exactly what a build that did not compute Consumption knew - so
+ * the first ride after the update rebuilds both.
+ *
+ * The window summary, window_wh over window_m, is the one piece of state here
+ * that is a filter rather than a fact. It is saved only when the ring was full
+ * and it is restored by spreading it evenly across the ring, so the Monitor
+ * comes back from a coffee stop still knowing how the rider was riding instead
+ * of falling back to a lifetime average that a single spirited ride cannot
+ * move. It flushes out over the next kilometre. The partial bucket in progress
+ * is not saved; at most fifty metres of road is lost with it.
+ *
+ * The validity flags are separate because the figures are. A Monitor that saw
+ * the Controller but never the BMS has metres worth keeping and no charge
+ * figure at all; the Rated Capacity guard in wf_est_init() throws away a
+ * charge count and has nothing to say about a distance or a Consumption.
  */
-#define WF_EST_PERSIST_VERSION      2
+#define WF_EST_PERSIST_VERSION      3
 #define WF_EST_PERSIST_VERSION_MIN  1   /* the oldest layout still readable */
-#define WF_EST_PERSIST_BYTES        24
+#define WF_EST_PERSIST_BYTES        40
+#define WF_EST_PERSIST_BYTES_V2     24  /* the version 1 and 2 layout */
 
 typedef struct {
     uint16_t version;
@@ -263,18 +384,26 @@ typedef struct {
     float    rated_capacity_ah; /* what those were scaled against */
     bool     distance_valid;    /* distance_m means something (version 2) */
     float    distance_m;        /* Distance when it was saved (version 2) */
+    /* Consumption, version 3. The totals are all-time; the window pair is the
+     * rolling window at the moment of the save, and is zero when there was no
+     * full window to save. */
+    float    alltime_wh;        /* energy drawn over every ride, in Wh */
+    float    alltime_m;         /* Distance over every ride, in metres */
+    float    window_wh;
+    float    window_m;
 } wf_est_persist_t;
 
 /* Writes exactly WF_EST_PERSIST_BYTES into buf, little endian, with a magic,
  * the version and a Modbus CRC-16 over the rest. False when cap is too small.
+ * Always writes the current version's layout; the older ones are read only.
  * The floats travel as their IEEE-754 single bit patterns; both the Monitor
  * and the host are little-endian IEEE machines, which is the assumption. */
 bool wf_est_persist_encode(const wf_est_persist_t *p, uint8_t *buf, size_t cap);
 
-/* The reverse. False - leaving out alone - for the wrong length, the wrong
- * magic, an unknown version or a bad CRC. A blob that fails this is treated as
- * no saved state at all, which is always a safe answer: the first BMS answer
- * acquires either way. */
+/* The reverse. False - leaving out alone - for a length no layout uses, a
+ * version that does not match the length, the wrong magic or a bad CRC. A blob
+ * that fails this is treated as no saved state at all, which is always a safe
+ * answer: the first BMS answer acquires either way. */
 bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out);
 
 /* -------------------------------------------------------------- the estimator */
@@ -295,6 +424,22 @@ typedef struct {
     bool     anchor_seen;
     bool     acquired;          /* the first Anchor has been taken */
     uint32_t anchor_t_ms;
+
+    /* Consumption's rolling window: a ring of closed buckets of road, plus the
+     * one still filling. Indexed by metres covered and never by time or by
+     * frame count, so it holds the same amount of riding at any speed. Fixed
+     * size, 320 bytes, no allocation. */
+    double   cons_wh[WF_EST_CONS_BUCKETS];
+    double   cons_m[WF_EST_CONS_BUCKETS];
+    double   cons_part_wh;      /* the bucket currently filling */
+    double   cons_part_m;
+    uint8_t  cons_head;         /* where the next closed bucket goes */
+    uint8_t  cons_filled;       /* closed buckets held, capped at BUCKETS */
+
+    /* The all-time average, as the two totals it is the ratio of. Seeded from
+     * persisted state and added to for the life of the Monitor. */
+    double   alltime_wh;
+    double   alltime_m;
 
     /* distance, and the Odometer that Anchors it */
     double   distance_m;        /* metres since init, the fused figure */
@@ -351,6 +496,30 @@ typedef struct {
     bool     odo_anchored;
     double   distance_m;
     double   odo_distance_m;
+
+    /* Consumption, in watt-hours per kilometre.
+     *
+     * `consumption_valid` is false until there is a distance worth dividing by
+     * - the stationary-bike guard - and the screen shows a dash rather than
+     * the ratio of a real energy to almost no metres.
+     *
+     * `consumption_windowed` says which of the two figures this is, and the
+     * screen has to render the difference: true is the rolling window over the
+     * last WF_EST_CONS_WINDOW_M of road, which is how the rider is riding now;
+     * false is the persisted all-time average standing in until the window has
+     * filled, which is how they have ridden ever.
+     *
+     * `window_m` is how much road the ring is holding, exposed so a harness
+     * can tell "the window is not full" from "the window is full and the
+     * answer happens to match the all-time average". The all-time totals are
+     * exposed for the same reason.
+     */
+    bool     consumption_valid;
+    bool     consumption_windowed;
+    double   consumption_wh_per_km;
+    double   window_m;
+    double   alltime_m;
+    double   alltime_wh;
 
     uint32_t power_samples;
     uint32_t anchor_samples;

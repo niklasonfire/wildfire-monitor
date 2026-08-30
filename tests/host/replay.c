@@ -143,6 +143,10 @@ typedef struct {
     long     dist_points;
     double   dist_m_last, dist_odo_last;
     double   dist_step_back_max;   /* largest backwards move, must stay 0 */
+    /* Records walked, and whether a power cycle was simulated part way through
+     * this run. See power_cycle() and the criterion it exists for. */
+    long     records;
+    bool     cycled;
 } run_t;
 
 /* FNV-1a over the raw bytes of every point on the curve. The comparison is
@@ -288,8 +292,39 @@ static void run_init(run_t *r)
     wf_est_init(&r->est, NULL);
 }
 
+/* ------------------------------------------------- the simulated power cycle
+ *
+ * The Monitor loses power mid-ride - a flat cell, a knocked switch, a coffee
+ * stop long enough to turn it off - and comes back. All that is, from the
+ * estimator's point of view, is a save through NVS's bytes and a fresh
+ * wf_est_init() from what comes back, which is exactly what this does. It is
+ * driven into the middle of a real replay so that the state crossing the break
+ * is state a real ride produced, rather than something a test composed.
+ *
+ * Only the estimator is cycled. The decoded Controller state stays, standing
+ * in for a link that came back up carrying the same readings; cycling that too
+ * would be testing the decoder's re-acquisition, which is a different
+ * criterion and has its own test. */
+static void power_cycle(run_t *r)
+{
+    wf_est_persist_t saved, back;
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+
+    wf_est_save(&r->est, &saved);
+    if (!wf_est_persist_encode(&saved, blob, sizeof(blob)) ||
+        !wf_est_persist_decode(blob, sizeof(blob), &back)) {
+        fprintf(stderr, "the estimator's own state did not survive its own "
+                        "encoding\n");
+        exit(2);
+    }
+    wf_est_init(&r->est, &back);
+    r->cycled = true;
+}
+
+/* cycle_at is the record index to simulate a power cycle before, or 0 for a
+ * run with no break in it. */
 static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
-                   const odo_synth_t *synth)
+                   const odo_synth_t *synth, long cycle_at)
 {
     wfl_reader_t rd;
     if (!wfl_open(&rd, buf, len, hdr)) {
@@ -303,6 +338,10 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
 
     wfl_rec_t rec;
     while (wfl_next(&rd, &rec)) {
+        if (cycle_at > 0 && r->records == cycle_at) {
+            power_cycle(r);
+        }
+        r->records++;
         r->duration_ms = rec.t_ms;
 
         switch (rec.type) {
@@ -546,6 +585,27 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "est_distance_samples", (double)o.distance_samples);
         put(ms, "est_odo_samples", (double)o.odo_samples);
     }
+
+    /* Consumption. Unconditional, because "this ride produced no Consumption
+     * figure" is itself the fact worth pinning on a fixture that covers 16.7 m
+     * - if a future change ever makes cap0007 divide by that, the source below
+     * moves off 0 and the diff says so.
+     *
+     *   0  no figure: neither denominator cleared its guard
+     *   1  the persisted all-time average, standing in
+     *   2  the rolling window over the last WF_EST_CONS_WINDOW_M of road
+     */
+    {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        put(ms, "est_cons_source",
+            o.consumption_valid ? (o.consumption_windowed ? 2.0 : 1.0) : 0.0);
+        put(ms, "est_alltime_m", o.alltime_m);
+        put(ms, "est_alltime_wh", o.alltime_wh);
+        if (o.consumption_valid) {
+            put(ms, "est_cons_wh_per_km", o.consumption_wh_per_km);
+        }
+    }
 }
 
 /* ------------------------------------------------------------- assertions */
@@ -693,6 +753,53 @@ static void check_invariants(const char *fixture, const run_t *r)
                           "%.1f m apart, more than its own %d m quantisation",
                  o.distance_m, o.odo_distance_m, gap,
                  WF_CTRL_ODO_METRES_PER_COUNT);
+        }
+    }
+
+    /* ---- Consumption ---- */
+
+    /* The stationary-bike criterion as an invariant rather than a per-ride
+     * fact: a figure is reported only when something cleared a guard, and when
+     * nothing did the field is left at zero rather than at whatever a division
+     * by nearly no metres produced. Any Capture, including one of a bike
+     * standing at a junction with the ignition on for an hour, has to satisfy
+     * this. */
+    if (o.consumption_valid) {
+        if (o.consumption_windowed) {
+            if (o.window_m < WF_EST_CONS_WINDOW_M) {
+                fail(fixture, "a windowed Consumption of %.1f Wh/km over %.1f "
+                              "m, less than the %.0f m window it claims",
+                     o.consumption_wh_per_km, o.window_m,
+                     WF_EST_CONS_WINDOW_M);
+            }
+        } else if (o.alltime_m < WF_EST_CONS_MIN_DIST_M) {
+            fail(fixture, "an all-time Consumption of %.1f Wh/km over %.1f m, "
+                          "below the %.0f m floor",
+                 o.consumption_wh_per_km, o.alltime_m, WF_EST_CONS_MIN_DIST_M);
+        }
+    } else if (o.consumption_wh_per_km != 0.0) {
+        fail(fixture, "no Consumption figure, and yet %.3f Wh/km came out of "
+                      "the division that was not supposed to happen",
+             o.consumption_wh_per_km);
+    }
+
+    /* The all-time totals are the same two integrals the ride already
+     * publishes, so on an unbroken replay they have to agree with them exactly
+     * - anything else means Consumption is dividing something other than the
+     * energy and the metres the rest of the screen shows. On a replay with a
+     * simulated power cycle in it they deliberately do not: that is the whole
+     * point of persisting them, and the run with the break asserts its own
+     * continuity in main(). */
+    if (!r->cycled) {
+        double d_wh = o.alltime_wh - o.used_wh;
+        double d_m  = o.alltime_m - o.distance_m;
+        if (d_wh < -1e-9 || d_wh > 1e-9) {
+            fail(fixture, "Consumption's all-time energy %.6f Wh is not the "
+                          "%.6f Wh the ride drew", o.alltime_wh, o.used_wh);
+        }
+        if (d_m < -1e-9 || d_m > 1e-9) {
+            fail(fixture, "Consumption's all-time distance %.6f m is not the "
+                          "%.6f m the ride covered", o.alltime_m, o.distance_m);
         }
     }
 }
@@ -944,6 +1051,22 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                r->dist_m_last, r->dist_odo_last, r->dist_points,
                (unsigned long long)r->dist_hash);
     }
+    {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        if (!o.consumption_valid) {
+            printf("  consumption: none - %.1f m is under the %.0f m floor and "
+                   "the %.0f m window is %.0f m full\n",
+                   o.alltime_m, WF_EST_CONS_MIN_DIST_M, WF_EST_CONS_WINDOW_M,
+                   o.window_m);
+        } else {
+            printf("  consumption: %.1f Wh/km from the %s, %.2f Wh over %.1f m "
+                   "all-time\n", o.consumption_wh_per_km,
+                   o.consumption_windowed ? "rolling window"
+                                          : "all-time average",
+                   o.alltime_wh, o.alltime_m);
+        }
+    }
 }
 
 int main(int argc, char **argv)
@@ -989,7 +1112,7 @@ int main(int argc, char **argv)
         const odo_synth_t off = { .on = false, .start = 0 };
         wflog_hdr_t hdr;
         run_t r;
-        replay(buf, len, &hdr, &r, &off);
+        replay(buf, len, &hdr, &r, &off, 0);
         report(&hdr, &r);
         if (hdr.version != WFLOG_VERSION) {
             /* Not a warning: a Capture from a format this build does not know
@@ -1007,7 +1130,7 @@ int main(int argc, char **argv)
          * outside the file would show up here. */
         wflog_hdr_t hdr2;
         run_t again;
-        replay(buf, len, &hdr2, &again, &off);
+        replay(buf, len, &hdr2, &again, &off, 0);
         if (again.est_hash != r.est_hash || again.est_points != r.est_points) {
             fail(paths[i], "replaying it twice produced two different "
                            "Remaining Energy curves: %ld points hash %016llx, "
@@ -1032,8 +1155,8 @@ int main(int argc, char **argv)
         const odo_synth_t wrapped = { .on = true, .start = 65530 };
         wflog_hdr_t hdr3, hdr4;
         run_t a, b;
-        replay(buf, len, &hdr3, &a, &clear);
-        replay(buf, len, &hdr4, &b, &wrapped);
+        replay(buf, len, &hdr3, &a, &clear, 0);
+        replay(buf, len, &hdr4, &b, &wrapped, 0);
         if (a.dist_points == 0) {
             fail(paths[i], "the synthesised Odometer ramp produced no distance "
                            "at all");
@@ -1053,6 +1176,93 @@ int main(int argc, char **argv)
                            "Odometer ramp, by up to %.6f m",
                  a.dist_step_back_max > b.dist_step_back_max
                      ? a.dist_step_back_max : b.dist_step_back_max);
+        }
+
+        /* The power-cycle criterion. The same ride again with the Monitor
+         * losing power halfway through it: the estimator's state goes out
+         * through the persisted bytes and comes back into a fresh estimator,
+         * and the ride carries on into it.
+         *
+         * What this fixture can assert is the plumbing, and it is worth
+         * asserting. Consumption's two all-time totals are the only state on
+         * this screen that is supposed to cross a power cycle intact, so the
+         * broken run has to arrive at the same energy the unbroken one did -
+         * within the single-precision the blob stores them at, and not within
+         * a tolerance chosen to make it pass. Distance has one metre of
+         * legitimate difference in it and one only: the Odometer's count is
+         * deliberately not persisted, so after the break the Anchor
+         * re-acquires against the restored distance and pulls toward a
+         * slightly different target for the rest of the ride. One Odometer
+         * count is the budget, the same budget the unbroken invariant uses.
+         *
+         * What it cannot assert is the criterion's own words - that the
+         * Consumption *figure* is continuous across the break - because
+         * cap0007 covers 16.7 m and never produces a figure at either side of
+         * it. That is driven with a synthesised ride in tests/host/unit.c,
+         * against a persisted history deliberately far from the riding so that
+         * a Monitor which quietly forgot its window would fail it. */
+        wflog_hdr_t hdr5;
+        run_t cyc;
+        replay(buf, len, &hdr5, &cyc, &off, r.records / 2);
+        if (!cyc.cycled) {
+            fail(paths[i], "the simulated power cycle never happened, so the "
+                           "continuity assertion is measuring nothing");
+        } else {
+            wf_est_out_t whole, broken;
+            wf_est_get(&r.est, &whole);
+            wf_est_get(&cyc.est, &broken);
+
+            double d_wh = broken.alltime_wh - whole.alltime_wh;
+            if (d_wh < 0.0) {
+                d_wh = -d_wh;
+            }
+            /* The budget is one integration step, and it is a real loss and
+             * not a rounding: a restored estimator has no previous timestamp
+             * to integrate from, so the first power-block frame after the
+             * break only starts the clock. That is the correct answer - the
+             * Monitor was off across that interval and must not book energy
+             * for it - and it is bounded by the longest step the estimator
+             * will take, WF_EST_DT_MAX_MS, at the largest power this ride ever
+             * reached. cap0007 loses 1.5 mWh of 1.73 Wh inside a 0.51 Wh
+             * budget, which is still tight enough to catch a run that lost
+             * half the ride. */
+            double peak_a = r.ctrl_current_a_max > -r.ctrl_current_a_min
+                                ? r.ctrl_current_a_max : -r.ctrl_current_a_min;
+            double budget_wh = 1e-5 + 1e-6 * whole.alltime_wh;
+            if (r.power_frames > 0) {
+                budget_wh += r.ctrl_pack_v_max * peak_a *
+                             ((double)WF_EST_DT_MAX_MS / 3600000.0);
+            }
+            if (d_wh > budget_wh) {
+                fail(paths[i], "a power cycle mid-ride lost %.6f Wh of the "
+                               "all-time total: %.6f Wh unbroken, %.6f Wh "
+                               "across the break",
+                     d_wh, whole.alltime_wh, broken.alltime_wh);
+            }
+
+            double d_m = broken.alltime_m - whole.alltime_m;
+            if (d_m < 0.0) {
+                d_m = -d_m;
+            }
+            if (d_m > (double)WF_CTRL_ODO_METRES_PER_COUNT) {
+                fail(paths[i], "a power cycle mid-ride moved the all-time "
+                               "distance by %.1f m, more than the Odometer's "
+                               "own %d m quantisation: %.1f m unbroken, %.1f m "
+                               "across the break",
+                     d_m, WF_CTRL_ODO_METRES_PER_COUNT, whole.alltime_m,
+                     broken.alltime_m);
+            }
+            if (cyc.dist_step_back_max > 0.0) {
+                fail(paths[i], "distance moved backwards by up to %.6f m "
+                               "across the simulated power cycle",
+                     cyc.dist_step_back_max);
+            }
+            if (broken.consumption_valid != whole.consumption_valid ||
+                broken.consumption_windowed != whole.consumption_windowed) {
+                fail(paths[i], "a power cycle changed where the Consumption "
+                               "figure comes from");
+            }
+            check_invariants(paths[i], &cyc);
         }
 
         metrics_t ms = { .n = 0 };

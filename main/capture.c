@@ -407,9 +407,13 @@ static void est_persist(void)
     portENTER_CRITICAL(&s_mux);
     wf_est_save(&s_est, &p);
     portEXIT_CRITICAL(&s_mux);
-    /* Either half is worth a write on its own: a ride that saw the Controller
-     * and never the BMS has metres to keep and no charge figure at all. */
-    if (p.valid || p.distance_valid) {
+    /* Any one of the three is worth a write on its own: a ride that saw the
+     * Controller and never the BMS has metres to keep and no charge figure at
+     * all, and a ride that saw the power block and no motion frames has
+     * watt-hours for Consumption's all-time total and neither of the other
+     * two. */
+    if (p.valid || p.distance_valid || p.alltime_m > 0.0f ||
+        p.alltime_wh != 0.0f) {
         est_store_save(&p);
     }
 }

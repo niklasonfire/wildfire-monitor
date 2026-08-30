@@ -139,3 +139,23 @@ est_distance_m        16.71
 est_odo_distance_m    0.00
 est_distance_samples  243
 est_odo_samples       31
+
+# Consumption, and the fact worth pinning here is that this ride produces no
+# Consumption figure at all. 16.7 m is a sixth of one Odometer count and a
+# sixtieth of the WF_EST_CONS_WINDOW_M window, and the bike is stationary for
+# the first eight seconds of it - so neither denominator clears its guard and
+# est_cons_source stays 0. That is the stationary-bike criterion showing up on
+# a real ride rather than a synthesised one: if a future change ever divides
+# 1.73 Wh by these metres, this number moves off 0 and says so.
+#
+#   0  no figure   1  the persisted all-time average   2  the rolling window
+#
+# The two totals are the ratio Consumption would be, held separately so that
+# the all-time average improves across rides instead of being overwritten by
+# the last one. On an unbroken replay of a Monitor with no saved state they
+# have to equal the ride's own drawn energy and fused distance exactly, which
+# tests/host/replay.c asserts as an invariant; they are repeated here so that
+# a change to either shows up as a diff in this file too.
+est_cons_source       0
+est_alltime_m         16.71
+est_alltime_wh        1.73

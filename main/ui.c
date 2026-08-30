@@ -95,30 +95,58 @@ static const char *TAG = "ui";
 #define ERR_COLS       22           /* scale 1 fills the width exactly */
 #define ERR_LINES      4
 
-/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V8, same
+/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V6, same
  * as every other per-state screen - see the F_V slot comment above.
  *
- * Remaining Energy sits directly under speed because it is the one number on
- * this screen the rider actually rides by; everything below it is evidence for
- * it. Pack voltage and line current come next, because they are what says
- * mid-ride whether the Capture is worth anything: a Pack voltage that has gone
- * flat or a current stuck at zero means the ride is being wasted, and a ride
- * costs far more than a glance. The Odometer is the other way round -
- * reference material, read once at a landmark and never while moving - so it
- * is the one row demoted to scale 1, which is also what makes room for a
- * distance in metres that runs to seven digits.
+ * This screen was rebuilt when Consumption arrived, and the rebuild is worth
+ * explaining because it threw three fields away and freed two rows.
  *
- * Brake and motion share a row. They are one-word booleans and the content
- * band is 185 px, which is nine rows at scale 2 and this screen wants ten. */
+ * It had nine rows and no tenth: the content band is 185 px, which is nine
+ * rows at scale 2, and every one of them was spoken for down to y=206. Adding
+ * Consumption needed a row, and the row after that is Range - one number,
+ * bigger than everything else, which is the figure a rider actually rides by
+ * and the one the whole estimator exists to produce. Squeezing Consumption in
+ * and leaving Range to fight for space later would have meant doing this twice.
+ *
+ * So the screen now has a hero row: scale 3, directly under speed, holding the
+ * one derived figure that matters most. Today that is Remaining Energy.
+ * Whichever figure sits there, everything below it is evidence for it.
+ *
+ * What went, and why:
+ *
+ *   RPM     Redundant. Road speed is rpm times a wheel circumference and a
+ *           gearing constant, all three of which are now pinned by
+ *           tests/fixtures/cap0007.expect, and the speed is on the row above
+ *           at scale 3. Two renderings of one measurement is one too many.
+ *   BRAKE   Diagnostics, not riding. Both are booleans the rider already
+ *   MOVE    knows the answer to - they are holding the lever, they can see the
+ *           bike moving - and neither says anything about whether the decode
+ *           is working that the row of dashes speed and gear show instead does
+ *           not. Both are in every Capture and in `cap replay --fields`.
+ *
+ * What stayed, and why. Pack voltage and line current, because they are what
+ * says mid-ride whether the Capture is worth anything: a Pack voltage that has
+ * gone flat or a current stuck at zero means the ride is being wasted, and a
+ * ride costs far more than a glance. Engine temperature, because it is the one
+ * number on here that can end a ride. The Odometer, because the calibration
+ * ride reads it at two landmarks to settle WF_CTRL_ODO_METRES_PER_COUNT - and
+ * it is reference material read at a standstill rather than at speed, so it
+ * keeps its demotion to scale 1, which is also what makes room for a distance
+ * in metres that runs to seven digits.
+ *
+ * That leaves F_V7 and F_V8 unused and a clear band below y=204. Both are
+ * deliberate: the next screen wants room, not a tenth row.
+ *
+ * The character cell is 6*scale wide, so the budget is 7 columns at scale 3
+ * and 11 at scale 2. "~2729WH" is exactly 7 and loses its space to fit;
+ * "~128 WH/KM*" is exactly 11. */
 #define ROW_LIVE_SPEED  70          /* scale 3 */
-#define ROW_LIVE_WH     96          /* scale 2 from here down... */
-#define ROW_LIVE_VOLTS  114
-#define ROW_LIVE_AMPS   132
-#define ROW_LIVE_RPM    150
-#define ROW_LIVE_FLAGS  168         /* brake and motion, side by side */
-#define ROW_LIVE_TEMP   186
-#define ROW_LIVE_ODO    206         /* ...except this one, scale 1 */
-#define COL_LIVE_MOVE_X 75          /* "BRAKE" is 5 columns, "MOVE" is 4 */
+#define ROW_LIVE_HERO   96          /* scale 3: the figure the rider rides by */
+#define ROW_LIVE_CONS   122         /* scale 2 from here down... */
+#define ROW_LIVE_VOLTS  140
+#define ROW_LIVE_AMPS   158
+#define ROW_LIVE_TEMP   176
+#define ROW_LIVE_ODO    196         /* ...except this one, scale 1 */
 
 #define MSG_TITLE_Y    16
 #define MSG_SEP_Y      44
@@ -637,8 +665,9 @@ static void draw_error(const cap_status_t *st)
  * Reads cap_live_get() instead of cap_status(): the Fardriver keeps pushing
  * frames whenever the MCU link is subscribed, capture running or not, so this
  * screen is not one of the cap_state_t cases in draw_state() and can be up at
- * the same time as any of them. It shares F_TITLE/F_V0..F_V5 with those
- * screens rather than getting its own slots, same reuse as every state below. */
+ * the same time as any of them. It shares F_TITLE/F_V0..F_V6 with those
+ * screens rather than getting its own slots, same reuse as every state below;
+ * F_V7 and F_V8 are the headroom the layout comment above set aside. */
 static const char *gear_name(uint8_t gear)
 {
     switch (gear) {
@@ -663,9 +692,10 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
         FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_DIM, "%s", "-- KM/H");
     }
 
-    /* Remaining Energy, computed entirely in main/wfest. Nothing here does
-     * arithmetic on it: this is a %.0f of a number the estimator produced, and
-     * that is the whole of the display's involvement in the figure.
+    /* The hero row: Remaining Energy, computed entirely in main/wfest. Nothing
+     * here does arithmetic on it: this is a %.0f of a number the estimator
+     * produced, and that is the whole of the display's involvement in the
+     * figure.
      *
      * It is drawn in the hint colour and behind a tilde because it is
      * provisional, and the hint line says so in words. Two separate reasons,
@@ -673,12 +703,45 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * that is assumed rather than measured (WF_EST_LIMP_POINT_V, issue #8
      * measures it), and it is scaled by a line current whose LSB is uncertain
      * by 19 % until Ride 1 settles it. Dim instead while the figure rests on
-     * state restored from NVS and no BMS answer has confirmed it yet. */
+     * state restored from NVS and no BMS answer has confirmed it yet.
+     *
+     * The space between the number and the unit is what pays for the tilde:
+     * seven columns is the whole of scale 3 and "~2729 WH" is eight. */
     if (est->valid) {
-        FIELD(F_V1, 2, ROW_LIVE_WH, 2, est->anchored ? COL_HINT : COL_DIM,
-              "~%.0f WH", est->remaining_wh);
+        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, est->anchored ? COL_HINT : COL_DIM,
+              "~%.0fWH", est->remaining_wh);
     } else {
-        FIELD(F_V1, 2, ROW_LIVE_WH, 2, COL_DIM, "%s", "-- WH");
+        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, COL_DIM, "%s", "-- WH");
+    }
+
+    /* Consumption, in watt-hours per kilometre, and again the display only
+     * formats: the rolling window, the fallback and the choice between them
+     * are all made in main/wfest, where a replay can reach them.
+     *
+     * The two the rider has to be able to tell apart:
+     *
+     *   ~28 WH/KM    the rolling window over the last WF_EST_CONS_WINDOW_M of
+     *                road - how they are riding now, in the hint colour like
+     *                every other live provisional figure.
+     *   ~28 WH/KM*   the persisted all-time average, standing in because the
+     *                current ride has not covered a window yet. Dimmed, and
+     *                starred; the hint line reads "*AVG".
+     *
+     * Two marks and not one, because colour alone is not a legend - the star
+     * is what a rider can look up, and the dimming is what they notice without
+     * looking. Same pairing the hero row uses for restored-but-unanchored.
+     *
+     * A dash when neither: a bike that has not covered WF_EST_CONS_MIN_DIST_M
+     * has no denominator worth dividing by, and the estimator declines to
+     * divide rather than showing what a near-zero distance would produce. */
+    if (!est->consumption_valid) {
+        FIELD(F_V2, 2, ROW_LIVE_CONS, 2, COL_DIM, "%s", "-- WH/KM");
+    } else if (est->consumption_windowed) {
+        FIELD(F_V2, 2, ROW_LIVE_CONS, 2, COL_HINT, "~%.0f WH/KM",
+              est->consumption_wh_per_km);
+    } else {
+        FIELD(F_V2, 2, ROW_LIVE_CONS, 2, COL_DIM, "~%.0f WH/KM*",
+              est->consumption_wh_per_km);
     }
 
     /* The power block, from any of its eight frame types. One decimal on the
@@ -689,31 +752,16 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * while the Pack is being drawn from - which is the convention the
      * estimator integrates in too. */
     if (lv->power_valid) {
-        FIELD(F_V2, 2, ROW_LIVE_VOLTS, 2, COL_VALUE, "%.1f V", lv->pack_v);
-        FIELD(F_V3, 2, ROW_LIVE_AMPS, 2, COL_VALUE, "%+.1f A", lv->line_current_a);
+        FIELD(F_V3, 2, ROW_LIVE_VOLTS, 2, COL_VALUE, "%.1f V", lv->pack_v);
+        FIELD(F_V4, 2, ROW_LIVE_AMPS, 2, COL_VALUE, "%+.1f A", lv->line_current_a);
     } else {
-        FIELD(F_V2, 2, ROW_LIVE_VOLTS, 2, COL_DIM, "%s", "-- V");
-        FIELD(F_V3, 2, ROW_LIVE_AMPS, 2, COL_DIM, "%s", "-- A");
-    }
-    /* Two fields on one row, so neither may pad out to the right edge and both
-     * keep a fixed width - only their colour moves. */
-    if (lv->motion_valid) {
-        FIELD(F_V4, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
-        field_at(&s_field[F_V5], 2, ROW_LIVE_FLAGS, 2,
-                 lv->brake_switch ? DISP_RED : COL_DIM, COL_BG, false, "BRAKE");
-        field_at(&s_field[F_V6], COL_LIVE_MOVE_X, ROW_LIVE_FLAGS, 2,
-                 lv->motion ? DISP_GREEN : COL_DIM, COL_BG, false, "MOVE");
-    } else {
-        FIELD(F_V4, 2, ROW_LIVE_RPM, 2, COL_DIM, "%s", "-- RPM");
-        field_at(&s_field[F_V5], 2, ROW_LIVE_FLAGS, 2, COL_DIM, COL_BG, false,
-                 "BRAKE");
-        field_at(&s_field[F_V6], COL_LIVE_MOVE_X, ROW_LIVE_FLAGS, 2, COL_DIM,
-                 COL_BG, false, "MOVE");
+        FIELD(F_V3, 2, ROW_LIVE_VOLTS, 2, COL_DIM, "%s", "-- V");
+        FIELD(F_V4, 2, ROW_LIVE_AMPS, 2, COL_DIM, "%s", "-- A");
     }
     if (lv->b5_valid) {
-        FIELD(F_V7, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
+        FIELD(F_V5, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
     } else {
-        FIELD(F_V7, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
+        FIELD(F_V5, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
     }
     /* Metres, not counts: the calibration ride reads this at two landmarks a
      * known distance apart to settle WF_CTRL_ODO_METRES_PER_COUNT, and a raw
@@ -721,14 +769,16 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * digits are always zero - that is the Odometer's resolution showing, not
      * a formatting accident. */
     if (lv->odo_valid) {
-        FIELD(F_V8, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %" PRIu32 " M",
+        FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %" PRIu32 " M",
               wf_ctrl_odo_metres(lv->odometer_raw));
     } else {
-        FIELD(F_V8, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
+        FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
     }
-    /* The tilde on the watt-hours, explained. 18 columns of the 22 scale 1
-     * gives us, so it fits without shrinking the button hint next to it. */
-    draw_hint("PWR: BACK ~WH PROV");
+    /* The two marks on this screen, explained: the tilde says the figure is
+     * provisional, the star says the Consumption is the all-time average and
+     * not the last kilometre. 19 columns of the 22 scale 1 gives us, so it
+     * still fits without shrinking the button hint beside it. */
+    draw_hint("PWR:BACK ~PROV *AVG");
 }
 
 /* ---- message screen ----------------------------------------------------- */

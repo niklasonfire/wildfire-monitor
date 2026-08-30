@@ -26,6 +26,10 @@ bool est_store_load(wf_est_persist_t *out)
         return false;
     }
 
+    /* The buffer is the current layout's size and the length that comes back
+     * is whatever was written - a shorter blob from a build before the last
+     * version bump reads fine and is handed on at its own length, because the
+     * length is half of how the estimator tells the layouts apart. */
     uint8_t blob[WF_EST_PERSIST_BYTES];
     size_t len = sizeof(blob);
     err = nvs_get_blob(h, EST_KEY, blob, &len);
@@ -34,14 +38,17 @@ bool est_store_load(wf_est_persist_t *out)
         return false;
     }
 
-    /* The estimator decides whether these bytes are its own: magic, version
-     * and CRC are its business, not this file's. */
+    /* The estimator decides whether these bytes are its own: magic, version,
+     * length and CRC are its business, not this file's. */
     if (!wf_est_persist_decode(blob, len, out)) {
         ESP_LOGW(TAG, "saved state is not ours, starting cold");
         return false;
     }
-    ESP_LOGI(TAG, "restored %.2f Ah / %.0f Wh", (double)out->coulomb_ah,
-             (double)out->remaining_wh);
+    ESP_LOGI(TAG, "restored v%u: %.2f Ah / %.0f Wh / %.0f m, all-time "
+                  "%.0f Wh over %.0f m",
+             out->version, (double)out->coulomb_ah, (double)out->remaining_wh,
+             (double)out->distance_m, (double)out->alltime_wh,
+             (double)out->alltime_m);
     return true;
 }
 

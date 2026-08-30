@@ -109,29 +109,42 @@ bool wf_est_persist_encode(const wf_est_persist_t *p, uint8_t *buf, size_t cap)
     put_f32(&buf[10], p->remaining_wh);
     put_f32(&buf[14], p->rated_capacity_ah);
     put_f32(&buf[18], p->distance_m);       /* version 2; zero in version 1 */
-    put_u16(&buf[22], wf_crc16(buf, WF_EST_PERSIST_BYTES - 2, PERSIST_CRC_INIT));
+    put_f32(&buf[22], p->alltime_wh);       /* version 3 from here down */
+    put_f32(&buf[26], p->alltime_m);
+    put_f32(&buf[30], p->window_wh);
+    put_f32(&buf[34], p->window_m);
+    put_u16(&buf[38], wf_crc16(buf, WF_EST_PERSIST_BYTES - 2, PERSIST_CRC_INIT));
     return true;
 }
 
 bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out)
 {
-    if (buf == NULL || out == NULL || len != WF_EST_PERSIST_BYTES) {
+    if (buf == NULL || out == NULL) {
+        return false;
+    }
+    if (len != WF_EST_PERSIST_BYTES && len != WF_EST_PERSIST_BYTES_V2) {
         return false;
     }
     if (buf[0] != PERSIST_MAGIC_0 || buf[1] != PERSIST_MAGIC_1) {
         return false;
     }
-    /* A version this build has never written is rejected outright; an older
-     * one it knows the layout of is migrated. Version 1 is version 2 without
-     * distance_m, in bytes it left zeroed, so the migration is to read the
-     * distance as the zero a build that did not count metres knew. */
+    /* The length selects the layout and the version has to agree with it, so
+     * no field is ever read out of bytes the writer did not write. A version
+     * this build has never written is rejected outright; an older layout it
+     * knows is migrated - version 1 is version 2 without distance_m, version 2
+     * is version 3 without Consumption, and in both cases the migration is to
+     * restore what that build actually knew and no more. */
     uint16_t version = get_u16(&buf[2]);
     if (version < WF_EST_PERSIST_VERSION_MIN ||
         version > WF_EST_PERSIST_VERSION) {
         return false;
     }
-    if (get_u16(&buf[22]) !=
-        wf_crc16(buf, WF_EST_PERSIST_BYTES - 2, PERSIST_CRC_INIT)) {
+    bool v3 = len == WF_EST_PERSIST_BYTES;
+    if (v3 != (version >= 3)) {
+        return false;
+    }
+    if (get_u16(&buf[len - 2]) !=
+        wf_crc16(buf, len - 2, PERSIST_CRC_INIT)) {
         return false;
     }
     memset(out, 0, sizeof(*out));
@@ -142,10 +155,26 @@ bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out
     out->rated_capacity_ah = get_f32(&buf[14]);
     out->distance_valid    = version >= 2 && buf[5] != 0;
     out->distance_m        = version >= 2 ? get_f32(&buf[18]) : 0.0f;
+    if (v3) {
+        out->alltime_wh = get_f32(&buf[22]);
+        out->alltime_m  = get_f32(&buf[26]);
+        out->window_wh  = get_f32(&buf[30]);
+        out->window_m   = get_f32(&buf[34]);
+    }
     return true;
 }
 
 /* ------------------------------------------------------------ the estimator */
+
+/* A restored float worth reading. Written as a range rather than as v == v so
+ * that it rejects a NaN, an infinity and a bit pattern from a blob that passed
+ * its CRC and still holds nonsense, all in one comparison. Energy may be
+ * negative - a Monitor that has seen more regeneration than draw - so this is
+ * deliberately not a floor. */
+static bool sane_f(float v)
+{
+    return v > -1e30f && v < 1e30f;
+}
 
 void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
 {
@@ -169,6 +198,35 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
         e->distance_restored = true;
     }
 
+    /* The all-time totals, on their own terms again: they are a lifetime of
+     * riding and they depend on neither the Pack model nor an Anchor. Both
+     * comparisons are written the way round that rejects a NaN, and both
+     * totals are taken or neither is - half a ratio is not a ratio. Energy may
+     * legitimately be negative for a Monitor that has seen more regeneration
+     * than draw, which is why only the distance is floored. */
+    if (restored->alltime_m >= 0.0f && sane_f(restored->alltime_m) &&
+        sane_f(restored->alltime_wh)) {
+        e->alltime_m  = (double)restored->alltime_m;
+        e->alltime_wh = (double)restored->alltime_wh;
+    }
+
+    /* The window, spread evenly over the ring. It is saved only when the ring
+     * was full, so a non-zero window_m means there is a whole window's worth
+     * of recent riding to come back to - a coffee stop does not cost the rider
+     * their Consumption figure. Anything less than a full window was not saved
+     * and is not invented here. */
+    if (restored->window_m >= (float)WF_EST_CONS_WINDOW_M &&
+        sane_f(restored->window_m) && sane_f(restored->window_wh)) {
+        double per_m  = (double)restored->window_m / WF_EST_CONS_BUCKETS;
+        double per_wh = (double)restored->window_wh / WF_EST_CONS_BUCKETS;
+        for (int i = 0; i < WF_EST_CONS_BUCKETS; i++) {
+            e->cons_m[i]  = per_m;
+            e->cons_wh[i] = per_wh;
+        }
+        e->cons_head   = 0;
+        e->cons_filled = WF_EST_CONS_BUCKETS;
+    }
+
     if (!restored->valid) {
         return;
     }
@@ -182,6 +240,46 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
     e->coulomb_ah   = (double)restored->coulomb_ah;
     e->remaining_wh = (double)restored->remaining_wh;
     e->restored     = true;
+}
+
+/* ------------------------------------------------------------- Consumption */
+
+/* The bucket in progress has collected its span of road. File it in the ring,
+ * dropping whatever it displaces, and start a fresh one.
+ *
+ * A bucket ends up holding its span plus the overshoot of the motion step that
+ * crossed the boundary - fifty metres plus a couple, at road speed - and the
+ * overshoot is not carried forward. That is why the ratio is computed from the
+ * ring's own summed metres rather than from BUCKETS * BUCKET_M: the window is
+ * a length of road that was actually covered, not a length assumed. */
+static void cons_close_bucket(wf_est_t *e)
+{
+    e->cons_m[e->cons_head]  = e->cons_part_m;
+    e->cons_wh[e->cons_head] = e->cons_part_wh;
+    e->cons_head = (uint8_t)((e->cons_head + 1u) % WF_EST_CONS_BUCKETS);
+    if (e->cons_filled < WF_EST_CONS_BUCKETS) {
+        e->cons_filled++;
+    }
+    e->cons_part_m  = 0.0;
+    e->cons_part_wh = 0.0;
+}
+
+/* The ring's totals, summed in index order and never in ring order, so the
+ * sum is a function of the contents alone: two runs that reached the same
+ * buckets by different routes add them up in the same sequence and get the
+ * same last bit. Twenty additions, which is why nothing here is accumulated
+ * incrementally - an incremental total would drift as buckets came and went,
+ * and would drift differently depending on when the ride started. */
+static void cons_window(const wf_est_t *e, double *wh, double *m)
+{
+    double sum_wh = 0.0;
+    double sum_m  = 0.0;
+    for (int i = 0; i < WF_EST_CONS_BUCKETS; i++) {
+        sum_wh += e->cons_wh[i];
+        sum_m  += e->cons_m[i];
+    }
+    *wh = sum_wh;
+    *m  = sum_m;
 }
 
 /* ---------------------------------------------------------------- distance */
@@ -286,6 +384,15 @@ static void distance_step(wf_est_t *e, uint32_t t_ms,
     }
     e->distance_m += step;
     e->distance_samples++;
+
+    /* Consumption's denominator, and it is the same metres the rider watches
+     * accumulate - the fused figure, not the raw integral of speed - so the
+     * two can never disagree about how far the bike has gone. */
+    e->alltime_m   += step;
+    e->cons_part_m += step;
+    if (e->cons_part_m >= WF_EST_CONS_BUCKET_M) {
+        cons_close_bucket(e);
+    }
 }
 
 void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
@@ -349,6 +456,15 @@ void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
     e->used_wh      += d_wh;
     e->coulomb_ah   -= d_ah;
     e->remaining_wh -= d_wh;
+
+    /* Consumption's numerator, taken here and not from remaining_wh: the
+     * Anchor's pull below moves Remaining Energy without any energy having
+     * left the Pack, and a Consumption built on that would be measuring the
+     * BMS rather than the riding. Energy drawn while standing still goes in
+     * too - it did leave the Pack - and lands in whichever bucket is open when
+     * the bike next moves. */
+    e->alltime_wh   += d_wh;
+    e->cons_part_wh += d_wh;
 
     /* The Anchor, applied as a pull and never as an assignment. Nothing
      * happens while it is stale, which is the whole of the gap behaviour: the
@@ -436,6 +552,39 @@ void wf_est_get(const wf_est_t *e, wf_est_out_t *out)
     out->distance_samples = e->distance_samples;
     out->odo_samples      = e->odo_samples;
 
+    /* Consumption. Two candidate divisions, and the guard on each is the
+     * whole of the stationary-bike criterion.
+     *
+     * The window first, because it is the figure worth showing: the ring
+     * has to hold a full window of closed buckets before it says anything, so
+     * a bike that has never covered WF_EST_CONS_WINDOW_M cannot produce a
+     * windowed figure at all and no explicit guard is needed - the summed
+     * metres are a kilometre by construction.
+     *
+     * The all-time average second, standing in until then, and that one does
+     * need a floor: its denominator starts at nothing on a Monitor that has
+     * never ridden, and a hundred watt-hours over four metres is not a large
+     * Consumption but a meaningless one. WF_EST_CONS_MIN_DIST_M is one
+     * Odometer count, the shortest distance the Monitor can claim to know.
+     *
+     * Below both, `consumption_valid` is false and the screen shows a dash.
+     * That is the honest answer and it is what cap0007's 16.7 m produces. */
+    double win_wh, win_m;
+    cons_window(e, &win_wh, &win_m);
+    out->window_m   = win_m;
+    out->alltime_m  = e->alltime_m;
+    out->alltime_wh = e->alltime_wh;
+
+    if (e->cons_filled >= WF_EST_CONS_BUCKETS && win_m > 0.0) {
+        out->consumption_valid    = true;
+        out->consumption_windowed = true;
+        out->consumption_wh_per_km = win_wh / win_m * 1000.0;
+    } else if (e->alltime_m >= WF_EST_CONS_MIN_DIST_M) {
+        out->consumption_valid    = true;
+        out->consumption_windowed = false;
+        out->consumption_wh_per_km = e->alltime_wh / e->alltime_m * 1000.0;
+    }
+
     if (e->anchor_seen && e->last_t_valid) {
         out->anchor_age_ms = e->last_t_ms - e->anchor_t_ms;
         out->anchor_fresh  = out->anchor_age_ms <= WF_EST_ANCHOR_STALE_MS;
@@ -461,4 +610,23 @@ void wf_est_save(const wf_est_t *e, wf_est_persist_t *out)
      * thing. A ride with a Controller and no BMS still has metres to keep. */
     out->distance_valid = e->speed_seen || e->odo_seen || e->distance_restored;
     out->distance_m     = (float)e->distance_m;
+
+    /* The all-time totals, unconditionally: they are the only thing here that
+     * is supposed to improve across rides rather than be replaced by the last
+     * one, and they do that by being totals. Zeroes cost nothing to write and
+     * a flag would only be a second way of saying alltime_m is zero. */
+    out->alltime_wh = (float)e->alltime_wh;
+    out->alltime_m  = (float)e->alltime_m;
+
+    /* The window, only when it is a whole one. Half a window restored as if it
+     * were whole would report a windowed figure over half the road it claims;
+     * the all-time average is the honest fallback until the ring fills again.
+     * The bucket in progress is not saved with it - at most one bucket's worth
+     * of road is lost across a power cycle. */
+    if (e->cons_filled >= WF_EST_CONS_BUCKETS) {
+        double win_wh, win_m;
+        cons_window(e, &win_wh, &win_m);
+        out->window_wh = (float)win_wh;
+        out->window_m  = (float)win_m;
+    }
 }

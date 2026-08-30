@@ -28,7 +28,11 @@ bool est_store_load(wf_est_persist_t *out);
  *
  * Distance, added in #13, is bridged by the same write and is worth more than
  * that: a stop and a restart mid-ride carries on from the metres already
- * counted rather than from zero. What it does not survive is a Monitor that
+ * counted rather than from zero. Consumption, added in #15, is worth more
+ * again, because its all-time average is the only figure here that is supposed
+ * to get better the longer the Monitor lives - it is two running totals, and a
+ * write that never happened is a ride that never counted. What none of them
+ * survive is a Monitor that
  * loses power without shutting down, which reverts to the last orderly write.
  * That is the same limitation the charge figures have always had; if a ride
  * ever needs better, the fix is a periodic write and it costs flash wear, so
