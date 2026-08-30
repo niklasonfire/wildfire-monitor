@@ -12,7 +12,7 @@
   ],
   "generator": "scripts/gen_fields.py",
   "source_file": "field-table.json",
-  "doc_file": "docs/fardriver-fields.md",
+  "doc_file": "docs/field-table.md",
 
   "preamble": [
     "None of this is our own reverse-engineering from nothing. The field offsets are transcribed from two external projects and then checked against our own Captures wherever we have a Capture that can check them. The Confidence column says which of those two things happened for each entry, and it is the most important column in the table.",

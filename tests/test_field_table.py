@@ -14,6 +14,7 @@ Both fail loudly. The first names the record and the field that diverged; the
 second says which command puts it right.
 """
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -26,7 +27,14 @@ REPLAY = os.path.join(ROOT, "build-host", "replay")
 WFL = os.path.join(ROOT, "scripts", "wfl.py")
 GENERATOR = os.path.join(ROOT, "scripts", "gen_fields.py")
 TABLE = os.path.join(ROOT, "field-table.json")
-DOC = os.path.join(ROOT, "docs", "fardriver-fields.md")
+
+# Read out of the table rather than repeated here. Repeating it would mean a
+# renamed document could leave this test comparing a file nobody publishes
+# against a file nobody reads, and passing - a check that has quietly stopped
+# checking is worse than no check.
+with open(TABLE, encoding="utf-8") as _f:
+    DOC_REL = json.load(_f)["doc_file"]
+DOC = os.path.join(ROOT, *DOC_REL.split("/"))
 
 
 def captures():
@@ -93,9 +101,15 @@ class DocumentationIsGenerated(unittest.TestCase):
     """The third artefact. It is committed so that it can be read on the way
     past, which means it is the one that can go stale."""
 
+    def test_the_document_the_table_names_exists(self):
+        self.assertTrue(os.path.exists(DOC),
+                        "field-table.json says the document is %s, and there "
+                        "is no such file - so the test below would be "
+                        "comparing against nothing" % DOC_REL)
+
     def test_committed_document_matches_the_table(self):
         with tempfile.TemporaryDirectory() as tmp:
-            fresh = os.path.join(tmp, "fardriver-fields.md")
+            fresh = os.path.join(tmp, os.path.basename(DOC))
             subprocess.run([sys.executable, GENERATOR, TABLE, "--doc", fresh],
                            check=True)
             with open(fresh, encoding="utf-8") as f:

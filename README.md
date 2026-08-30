@@ -42,7 +42,7 @@ invariants any Capture has to satisfy. It then decodes the same Captures with
 the generated Python decoder and asserts the two languages produce identical
 numbers for every field of every record, which is what keeps ADR-0002 honest.
 It also checks that the fixtures can still be rebuilt byte for byte from the
-console dumps they came from, and that `docs/fardriver-fields.md` is still what
+console dumps they came from, and that `docs/field-table.md` is still what
 the Field Table generates.
 
 Adding a Capture to the suite is a `.wfl` and a `.expect` file dropped into
@@ -97,7 +97,7 @@ parked they idle at -1/-2 and 0/0xffff and remain unassigned. The other 47
 types looked byte-identical for the whole parked capture, but "parked" is the
 catch: type `0xb0`'s payload bytes 6..7 carry `cur_rpm`, which reads 0 while
 stationary and so is indistinguishable from a genuinely static type in a
-parked capture alone. See `docs/fardriver-fields.md` for the Field Table
+parked capture alone. See `docs/field-table.md` for the Field Table
 (gear, rpm, brake, temps, odometer, and the BMS registers), the Confidence of
 each entry, and what's still open. That document is generated from
 `field-table.json`, as are both decoders - see `docs/adr/0002-*`. Confirming anything

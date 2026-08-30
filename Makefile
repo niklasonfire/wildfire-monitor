@@ -4,7 +4,7 @@
 #
 #   make test        generate, build and replay every fixture (the one command)
 #   make gen         just run the Field Table through the generator
-#   make docs        regenerate docs/fardriver-fields.md from the Field Table
+#   make docs        regenerate docs/field-table.md from the Field Table
 #   make fixtures    rebuild the .wfl fixtures from the checked-in dumps
 #   make clean
 #
@@ -31,7 +31,7 @@ PYTHON   ?= python3
 # documentation; `make test` fails if it has drifted from the table.
 TABLE     = field-table.json
 GENERATOR = scripts/gen_fields.py
-DOC       = docs/fardriver-fields.md
+DOC       = docs/field-table.md
 GEN       = $(BUILD)/gen
 GEN_STAMP = $(GEN)/.generated
 

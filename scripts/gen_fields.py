@@ -8,7 +8,7 @@ by hand. This is the thing that produces them.
 
     scripts/gen_fields.py --c-dir build/gen          # wf_fields.h, wf_fields.c
     scripts/gen_fields.py --py-dir build-host/gen    # wf_fields.py
-    scripts/gen_fields.py --doc docs/fardriver-fields.md
+    scripts/gen_fields.py --doc docs/field-table.md
 
 The C artefacts go into a build directory and are gitignored, so nothing can be
 edited into them and survive. The document is committed, because a document

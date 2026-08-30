@@ -15,7 +15,7 @@ ADR-0001 forces decoding to exist in two languages. Hand-maintaining both, plus
 prose documentation describing them, is three copies of one truth and they will
 disagree.
 
-They already have. `docs/fardriver-fields.md` was hand-transcribed from an
+They already have. The field documentation was hand-transcribed from an
 upstream project that only ever implemented one of the Controller's three
 live-telemetry blocks. The transcription faithfully inherited that gap, and the
 document then read as authoritative — leading us to conclude the Controller

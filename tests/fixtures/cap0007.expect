@@ -1,7 +1,7 @@
 # What replaying cap0007.wfl has to produce. See cap0007.md for the ride.
 #
 # `name value`, compared to within +/-0.05 - half a display digit, which is the
-# precision docs/fardriver-fields.md quotes its values to. A name this harness
+# precision docs/field-table.md quotes its values to. A name this harness
 # does not measure is a failure, so a typo here cannot quietly assert nothing.
 
 # Records, as counted in captures/cap0007_dump.log.
@@ -20,7 +20,7 @@ ctrl_frames_bad   0
 bms_responses_ok  34
 bms_responses_bad 0
 
-# BMS, docs/fardriver-fields.md "Daly BMS fields": the Pack sat at 105.1-105.5 V
+# BMS, per the Field Table's register map: the Pack sat at 105.1-105.5 V
 # and the State of Charge did not move off 66.7 % in 47 s of crawling.
 pack_v_min        105.1
 pack_v_max        105.5

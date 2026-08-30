@@ -16,7 +16,7 @@
  * inside it; the harness owns nothing and calls the same function on the
  * stack. That is what makes the seam testable without a board.
  *
- * The field meanings, with the Confidence of each, are docs/fardriver-fields.md
+ * The field meanings, with the Confidence of each, are docs/field-table.md
  * - itself generated from the same table.
  */
 #ifndef WFDECODE_H

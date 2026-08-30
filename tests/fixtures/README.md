@@ -13,7 +13,7 @@ the whole time, rolling at 4-7 km/h with no marked manoeuvres. Peak decoded
 speed is 5.48 km/h, the Pack sat at 105.1-105.5 V and the State of Charge did
 not move off 66.7 %.
 
-This is the ride the Daly register map in `docs/fardriver-fields.md` was
+This is the ride the BMS register map in `docs/field-table.md` was
 decoded from, which is why it is the fixture: everything CONFIRMED there is
 something this file has to keep producing.
 

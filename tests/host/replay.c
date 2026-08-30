@@ -6,7 +6,7 @@
  * there needs a radio, a board or a rider: hand it the bytes and it produces
  * the same numbers it would have produced on the handlebars. So a checked-in
  * Capture plus this file is a regression test for every claim in
- * docs/fardriver-fields.md, run in a second instead of by eye once, on a ride.
+ * docs/field-table.md, run in a second instead of by eye once, on a ride.
  *
  * For every .wfl in the fixture directory it replays the whole file, collects
  * a table of measurements and compares them against the .expect file sitting
@@ -378,7 +378,7 @@ static void check_expect(const char *fixture, const char *path,
                  path, lineno, name);
             continue;
         }
-        /* Half a display digit: the values in docs/fardriver-fields.md are
+        /* Half a display digit: the values in docs/field-table.md are
          * quoted to one decimal, and that is the precision being asserted. */
         if (got->value < want - 0.05 || got->value > want + 0.05) {
             fail(fixture, "%s = %.3f, expected %.3f", name, got->value, want);
