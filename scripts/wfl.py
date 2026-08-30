@@ -29,6 +29,37 @@ ACCEL_LSB_PER_G = 4096.0
 GYRO_LSB_PER_DPS = 16.4
 
 
+def decode_daly(payload):
+    """Decode a 0xd2 Modbus read-holding-registers response from the Daly BMS.
+
+    Register map confirmed against cap0007 (docs/fardriver-fields.md, Daly
+    BMS section) - a 129-byte response to the capture's poll of 62 registers
+    starting at 0. Returns None for anything else (short frames, a different
+    address/count, or the truncated fragments an older firmware produced)."""
+    if len(payload) < 5 or payload[0] != 0xd2 or payload[1] != 0x03:
+        return None
+    n = payload[2]
+    if len(payload) < 3 + n + 2 or n % 2:
+        return None
+    regs = struct.unpack(f">{n // 2}H", payload[3:3 + n])
+
+    def reg(i):
+        return regs[i] if i < len(regs) else None
+
+    pack_v, current_raw, soc = reg(40), reg(41), reg(42)
+    temp_hi, temp_lo = reg(45), reg(46)
+    return dict(
+        pack_v=pack_v / 10.0 if pack_v is not None else None,
+        current_a=(current_raw - 30000) / 10.0 if current_raw is not None else None,
+        soc_pct=soc / 10.0 if soc is not None else None,
+        cell_max_mv=reg(43), cell_min_mv=reg(44),
+        temp_hi_c=temp_hi - 40 if temp_hi is not None else None,
+        temp_lo_c=temp_lo - 40 if temp_lo is not None else None,
+        cell_count=reg(49), avg_cell_mv=reg(55),
+        cell_mv=regs[0:28],
+    )
+
+
 def crc16(data, init=0x7F3C):
     """Modbus CRC-16 with the Fardriver's unusual initial value. Run over all
     16 bytes of a frame it leaves a residue of 0."""
@@ -152,6 +183,17 @@ def main():
             src = "mcu" if rtype == WFREC_MCU else "bms"
             if args.src and args.src != src:
                 continue
+
+            if src == "bms" and want_type is None:
+                d = decode_daly(payload)
+                if d is not None:
+                    if not args.quiet:
+                        print(f"BMS t={t_ms} pack_v={d['pack_v']:.1f} "
+                              f"current_a={d['current_a']:+.1f} soc_pct={d['soc_pct']:.1f} "
+                              f"cell_max_mv={d['cell_max_mv']} cell_min_mv={d['cell_min_mv']} "
+                              f"temp_hi_c={d['temp_hi_c']} temp_lo_c={d['temp_lo_c']} "
+                              f"cells={d['cell_count']} avg_mv={d['avg_cell_mv']}")
+                    continue
 
             ftype = payload[1] if src == "mcu" and len(payload) > 1 else None
             if src == "mcu":

@@ -79,11 +79,53 @@ telemetry, just not on that timescale.
 
 ## Daly BMS fields
 
-Lower confidence than the Fardriver table above: blackTeaDisp's byte offsets
-are written against whatever response length its own testing produced, and
-our own BMS notifications in `captures/mcu_frames.log` are `len=12`, not
-whatever length these offsets assume. Verify against a raw capture before
-relying on this table.
+### `0xd2` Modbus read-holding-registers variant — CONFIRMED
+
+This is the framing our BMS actually answers on (`daly.h`, `CAP_BMS_POLL_ADDR
+0x0000` / `CAP_BMS_POLL_COUNT 0x003e`), decoded from `cap0007` — a 47 s
+parking-lot ride at 4-7 km/h. Different framing entirely from the `a5`-cmd
+variant below; the two are not related.
+
+Request (8 bytes, written to `0xfff2`): `d2 03 <addr_hi> <addr_lo>
+<count_hi> <count_lo> <crc_lo> <crc_hi>` (`daly_build_request` in `daly.h`).
+Response to a 62-register read (`address=0, count=0x3e`) is 129 bytes: `d2 03
+7c <124 bytes, 62 big-endian u16 registers> <crc_lo> <crc_hi>`. `0x7c` = 124 =
+`2 * 62`, matching `daly_response_len()`.
+
+Register index is 0-based into those 62 u16s (register 0 = response bytes
+3-4).
+
+| Register | Field | Value | Confidence |
+| --- | --- | --- | --- |
+| 0-27 | cell_mv[0..27] | u16 BE, mV — 28 cells | CONFIRMED |
+| 40 | pack_v | u16 BE `/ 10` -> V (105.1-105.5 V seen) | CONFIRMED |
+| 41 | current_a | `(u16 BE - 30000) / 10` -> A, same offset convention as the `a5` variant's `current_ma` | CONFIRMED |
+| 42 | soc_pct | u16 BE `/ 10` -> % (constant 66.7 this ride) | CONFIRMED |
+| 43 | cell_max_mv | u16 BE, mV | CONFIRMED |
+| 44 | cell_min_mv | u16 BE, mV | CONFIRMED |
+| 45 | temp_hi_c | `u16 BE - 40` | CONFIRMED |
+| 46 | temp_lo_c | `u16 BE - 40` | CONFIRMED |
+| 49, 51 | cell_count | u16 BE, both = 28 (redundant) | CONFIRMED |
+| 55 | avg_cell_mv | u16 BE, mV | CONFIRMED |
+
+Registers between the assigned ones (28-39, 47-48, 50, 52-54, 56-61) are
+still unassigned. Decoded in `scripts/wfl.py`'s `decode_daly()`, printed as
+`BMS` lines.
+
+This resolves the voltage question from a real ride: pack_v tracked
+105.1-105.5 V here (SOC-dependent — a different ride's 106.1 V is consistent,
+just a fuller pack). Also confirms Daly's ~1300 mAh/28s-pack cell count
+matches the `capture.c` comment "carries the 28 cell voltages" written before
+this was decoded.
+
+### `a5`-cmd variant — lower confidence, unverified against our unit
+
+blackTeaDisp's byte offsets are written against whatever response length its
+own testing produced, and our own BMS notifications in
+`captures/mcu_frames.log` are `len=12`, not whatever length these offsets
+assume, nor the 129-byte `0xd2` response above. Whether this bike's Daly
+module answers this command set at all is unconfirmed — verify against a raw
+capture before relying on this table.
 
 Request frame (13 bytes, written to `0xfff2`): `a5 80 <cmd> 08 00 00 00 00 00
 00 00 00 <crc>`, single-byte CRC. Commands: `0x90` SOC, `0x91` V-range,
