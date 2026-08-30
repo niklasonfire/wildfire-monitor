@@ -33,13 +33,17 @@ Override defaults via environment: `ESPPORT` (default `/dev/ttyACM0`),
 make test                     # no board, no Docker, no BLE stack
 ```
 
-That builds the decoding in `main/wfdecode/` - pure C99, the same files the
-firmware compiles - with plain gcc, replays every recorded Capture in
-`tests/fixtures/` through it and asserts on what comes out: every Controller
-frame's checksum, the BMS register decode against the values that ride is known
-to have produced, and a handful of invariants any Capture has to satisfy. It
-also checks that the fixtures can still be rebuilt byte for byte from the
-console dumps they came from.
+That generates the decoders from the Field Table, builds the decoding in
+`main/wfdecode/` - pure C99, the same files the firmware compiles - with plain
+gcc, replays every recorded Capture in `tests/fixtures/` through it and asserts
+on what comes out: every Controller frame's checksum, the BMS register decode
+against the values that ride is known to have produced, and a handful of
+invariants any Capture has to satisfy. It then decodes the same Captures with
+the generated Python decoder and asserts the two languages produce identical
+numbers for every field of every record, which is what keeps ADR-0002 honest.
+It also checks that the fixtures can still be rebuilt byte for byte from the
+console dumps they came from, and that `docs/fardriver-fields.md` is still what
+the Field Table generates.
 
 Adding a Capture to the suite is a `.wfl` and a `.expect` file dropped into
 `tests/fixtures/`; the runner discovers them and needs no change. See
@@ -93,9 +97,10 @@ parked they idle at -1/-2 and 0/0xffff and remain unassigned. The other 47
 types looked byte-identical for the whole parked capture, but "parked" is the
 catch: type `0xb0`'s payload bytes 6..7 carry `cur_rpm`, which reads 0 while
 stationary and so is indistinguishable from a genuinely static type in a
-parked capture alone. See `docs/fardriver-fields.md` for the decoded field
-table (gear, rpm, brake, temps, odometer), sourced from a public firmware
-project for the same bike, and for what's still open. Confirming anything
+parked capture alone. See `docs/fardriver-fields.md` for the Field Table
+(gear, rpm, brake, temps, odometer, and the BMS registers), the Confidence of
+each entry, and what's still open. That document is generated from
+`field-table.json`, as are both decoders - see `docs/adr/0002-*`. Confirming anything
 new still needs a capture taken **while riding**, not at a standstill:
 
 ```bash

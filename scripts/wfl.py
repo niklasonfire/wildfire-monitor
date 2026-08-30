@@ -3,18 +3,31 @@
 
 The board writes a binary log because a ride produces ~72 records per second
 and hex over a 115200 baud console cannot keep up. This turns one back into
-something greppable, and checks the Fardriver CRC while it is at it.
+something greppable, and checks the Controller's CRC while it is at it.
 
     ./scripts/wfl.py cap0001.wfl                 # tagged one-line records
     ./scripts/wfl.py cap0001.wfl --header        # just the header
     ./scripts/wfl.py cap0001.wfl --csv out.csv   # frames as CSV
-    ./scripts/wfl.py cap0001.wfl --type 0x80     # only Fardriver type 0x80
+    ./scripts/wfl.py cap0001.wfl --type 0x80     # only Controller type 0x80
+    ./scripts/wfl.py cap0001.wfl --fields        # every decoded field, per record
+
+What the bytes mean is not written here. Per ADR-0002 it is declared once in
+`field-table.json` and generated into a Python module, which field_table.load()
+hands over; this file holds the archive format and the two frame envelopes,
+which are not fields. `--fields` prints exactly what the C decoder's
+`replay --fields` prints, and tests/test_field_table.py asserts they match.
 """
 import argparse
 import csv
 import datetime
+import os
 import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from field_table import load as _load_fields          # noqa: E402
+
+fields = _load_fields()
 
 MAGIC = b"WFCAP1\0"
 HDR_FMT = "<8sHHIqII18s18s32s"
@@ -29,40 +42,50 @@ ACCEL_LSB_PER_G = 4096.0
 GYRO_LSB_PER_DPS = 16.4
 
 
-def decode_daly(payload):
-    """Decode a 0xd2 Modbus read-holding-registers response from the Daly BMS.
+def decode_ctrl(payload):
+    """The Controller's frame envelope: aa <type> <12 payload> <crc lo hi>.
 
-    Register map confirmed against cap0007 (docs/fardriver-fields.md, Daly
-    BMS section) - a 129-byte response to the capture's poll of 62 registers
-    starting at 0. Returns None for anything else (short frames, a different
-    address/count, or the truncated fragments an older firmware produced)."""
+    Envelope only, and hand-written on purpose - it is not a field, so the
+    Field Table does not describe it. Returns (type, payload) or None, and
+    rejects exactly what wf_ctrl_frame_parse() in C rejects, so the two
+    languages agree on which frames exist before they can disagree on what is
+    in them."""
+    if len(payload) != 16 or payload[0] != 0xaa:
+        return None
+    if crc16(payload) != 0:
+        return None
+    return payload[1], payload[2:14]
+
+
+def decode_daly(payload):
+    """Decode a 0xd2 Modbus read-holding-registers response from the BMS.
+
+    Envelope here, register map from the Field Table: this checks the lead and
+    function bytes, the byte count, the length and the checksum - the same
+    rejections wf_bms_decode() makes in C - and then hands the registers to
+    the generated decoder. Returns None for anything else, including the
+    shorter unidentified notification the BMS also sends."""
     if len(payload) < 5 or payload[0] != 0xd2 or payload[1] != 0x03:
         return None
     n = payload[2]
-    if len(payload) < 3 + n + 2 or n % 2:
+    if n % 2 or len(payload) != 3 + n + 2:
         return None
-    regs = struct.unpack(f">{n // 2}H", payload[3:3 + n])
-
-    def reg(i):
-        return regs[i] if i < len(regs) else None
-
-    pack_v, current_raw, soc = reg(40), reg(41), reg(42)
-    temp_hi, temp_lo = reg(45), reg(46)
-    return dict(
-        pack_v=pack_v / 10.0 if pack_v is not None else None,
-        current_a=(current_raw - 30000) / 10.0 if current_raw is not None else None,
-        soc_pct=soc / 10.0 if soc is not None else None,
-        cell_max_mv=reg(43), cell_min_mv=reg(44),
-        temp_hi_c=temp_hi - 40 if temp_hi is not None else None,
-        temp_lo_c=temp_lo - 40 if temp_lo is not None else None,
-        cell_count=reg(49), avg_cell_mv=reg(55),
-        cell_mv=regs[0:28],
-    )
+    n_reg = n // 2
+    if n_reg > fields.WF_BMS_MAX_REGS or n_reg < fields.WF_BMS_REG_NEEDED:
+        return None
+    if crc16(payload, init=0xFFFF) != 0:
+        return None
+    regs = struct.unpack(f">{n_reg}H", payload[3:3 + n])
+    out = {"reg": regs, "n_reg": n_reg}
+    if not fields.bms_apply(out, regs):
+        return None
+    return out
 
 
 def crc16(data, init=0x7F3C):
-    """Modbus CRC-16 with the Fardriver's unusual initial value. Run over all
-    16 bytes of a frame it leaves a residue of 0."""
+    """Modbus CRC-16. The Controller's unusual initial value is the default;
+    the BMS uses the ordinary 0xffff. Run over a whole frame including its own
+    checksum it leaves a residue of 0."""
     c = init
     for b in data:
         c ^= b
@@ -101,6 +124,40 @@ def records(f):
         yield rtype, t_ms, payload
 
 
+def dump_fields(f):
+    """Every record that decodes, in file order, one line each.
+
+    The other half of ADR-0002's promise. `build-host/replay --fields` walks
+    the same Capture with the generated C decoder and prints the same lines;
+    tests/test_field_table.py asserts the two are byte-identical, which is
+    what turns "one description, two decoders" into something the build can
+    prove. A frame type the Field Table does not cover still prints its line,
+    empty, so the two have to agree on what neither of them knows too."""
+    live = {}
+    for index, (rtype, _t_ms, payload) in enumerate(records(f)):
+        if rtype == WFREC_MCU:
+            parsed = decode_ctrl(payload)
+            if parsed is None:
+                continue
+            ftype, body = parsed
+            fields.ctrl_apply(live, ftype, body)
+            row = fields.ctrl_dump(live, ftype)
+            print("c %d %02x%s" % (index, ftype, _row_text(row)))
+        elif rtype == WFREC_BMS:
+            decoded = decode_daly(payload)
+            if decoded is None:
+                continue
+            print("b %d%s" % (index, _row_text(fields.bms_dump(decoded))))
+
+
+def _row_text(row):
+    """`name=value`, at the number of decimals the field's own scale has - the
+    same formatting the C dump uses, so a float and a double cannot disagree
+    in a digit neither of them means."""
+    return "".join(" %s=%.*f" % (name, decimals, float(value))
+                   for name, value, decimals in row)
+
+
 def when(unix_start):
     if not unix_start:
         return "unknown"
@@ -113,11 +170,13 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("file")
     ap.add_argument("--header", action="store_true", help="print the header and stop")
+    ap.add_argument("--fields", action="store_true",
+                    help="every decoded field of every record, one line each")
     ap.add_argument("--csv", metavar="OUT", help="write frames to a CSV file")
     ap.add_argument("--imu-csv", metavar="OUT", dest="imu_csv",
                     help="write IMU samples to a CSV file, in g and dps")
     ap.add_argument("--src", choices=["mcu", "bms"], help="only one link")
-    ap.add_argument("--type", help="only this Fardriver frame type, e.g. 0x80")
+    ap.add_argument("--type", help="only this Controller frame type, e.g. 0x80")
     ap.add_argument("--quiet", action="store_true", help="summary only")
     args = ap.parse_args()
 
@@ -125,6 +184,9 @@ def main():
 
     with open(args.file, "rb") as f:
         h = read_header(f)
+        if args.fields:
+            dump_fields(f)
+            return
         print("HDR seq={seq} version={version} mcu={mcu} bms={bms} note={note}".format(**h),
               f"start={when(h['unix_start'])} duration_ms={h['duration_ms']}")
         if args.header:

@@ -1,0 +1,571 @@
+{
+  "title": "Field Table",
+  "note": [
+    "The single description of what every byte the Controller and the BMS send",
+    "actually means. ADR-0002: the firmware decoder, the offline decoder and the",
+    "field documentation are all generated from this file by scripts/gen_fields.py.",
+    "Edit this; never edit the three things it produces.",
+    "",
+    "JSON rather than YAML because the generator has to run inside the ESP-IDF",
+    "container and on a development machine, and neither is guaranteed to have",
+    "PyYAML. JSON has no comments, so every piece of prose lives in a `note`."
+  ],
+  "generator": "scripts/gen_fields.py",
+  "source_file": "field-table.json",
+  "doc_file": "docs/fardriver-fields.md",
+
+  "preamble": [
+    "None of this is our own reverse-engineering from nothing. The field offsets are transcribed from two external projects and then checked against our own Captures wherever we have a Capture that can check them. The Confidence column says which of those two things happened for each entry, and it is the most important column in the table.",
+
+    "**Frame envelope, confirmed by a second source.** A Controller frame is `aa <type> <12-byte payload> <crc_lo> <crc_hi>`, sixteen bytes, as in `docs/capture.md`. jackhumbert's version of the same envelope reads byte 1 as a 6-bit ID (0..54) packed with a 2-bit flags field; the flags we always see are `0b10`, which is exactly why our type byte runs `0x80..0xb6` rather than `0x00..0x36`. His `fardriver.hpp` builds its CRC table from the same two seed bytes we use as the initial value (`0x3c`, `0x7f` -> little-endian `0x7f3c`). Two independent implementations agreeing on an unusual initial value means this is the documented vendor protocol and not something bespoke to our unit.",
+
+    "**The two key spaces are different.** A Controller field is addressed by frame type plus a 0-based byte offset into the 12-byte payload, so payload byte 0 is frame byte 2, and multi-byte values are little-endian. A BMS field is addressed by a 0-based register index into the 62 big-endian u16 registers of the `0xd2` read-holding-registers response, so register 0 is response bytes 3-4. The table carries both, and the generator emits a decoder for each.",
+
+    "**What this table deliberately does not cover.** Two decodes are not offset-and-scale and stay hand-written in both languages, per ADR-0002: road speed, which needs the rpm from frame type `0xb0` and the wheel geometry from type `0xaf` at once, and phase current, which is 24-bit big-endian under a square root and is not decoded at all today. They are listed under \"Hand-written\" below so that reading this document still tells you everything the decoders produce."
+  ],
+
+  "sources": [
+    {
+      "name": "baranator/blackTeaDisp",
+      "url": "https://github.com/baranator/blackTeaDisp",
+      "note": "`src/main.cpp` - a working ESP32 dashboard for the same bike (a Blacktea Motorbikes Wildfire), the same Controller and the same BMS. Most Controller offsets below are read straight out of its notify callbacks."
+    },
+    {
+      "name": "jackhumbert/fardriver-controllers",
+      "url": "https://github.com/jackhumbert/fardriver-controllers",
+      "note": "`fardriver.hpp` - documents the frame envelope and the CRC independently, and is credited by blackTeaDisp as its own source for the envelope."
+    }
+  ],
+
+  "confidence": [
+    {
+      "id": "trusted",
+      "c": "WF_CONF_TRUSTED",
+      "summary": "taken on trust from elsewhere",
+      "was": "SOUND, and UNCERTAIN",
+      "note": "Somebody else's code says the byte means this and we have never checked it against a Capture of our own. The old document split this into SOUND (read from blackTeaDisp, which runs against this exact bike) and UNCERTAIN (blackTeaDisp's own author flags it as a guess); both collapse to here, because in neither case have we measured anything. Where the old label was UNCERTAIN the field's note says so."
+    },
+    {
+      "id": "consistent",
+      "c": "WF_CONF_CONSISTENT",
+      "summary": "consistent with our own Captures",
+      "was": "CONFIRMED",
+      "note": "Decoding a recorded Capture with this entry produces numbers that hold together - values in a physically possible range, agreeing with other registers that describe the same thing, changing when the ride changed. That is a real check and `make test` re-runs it on every fixture, but it is still our own decoder marking its own homework."
+    },
+    {
+      "id": "proven",
+      "c": "WF_CONF_PROVEN",
+      "summary": "proven against an independent measurement",
+      "was": "nothing yet",
+      "note": "A meter, a scale, a second instrument: something outside this project agreeing with the number. No entry in this table has that yet, and the empty column is the point of having it - it says plainly that every number the Monitor shows is still only as good as an upstream project plus a plausibility check."
+    }
+  ],
+
+  "devices": [
+    {
+      "id": "controller",
+      "name": "Controller",
+      "struct": "wf_ctrl_live_t",
+      "apply_fn": "wf_ctrl_fields_apply",
+      "dump_fn": "wf_ctrl_fields_dump",
+      "key_name": "frame type, payload byte offset",
+      "endian": "le",
+      "note": "The Controller talks unprompted and cycles through 55 frame types, so the types arrive at wildly different rates - `0xb0` at the link's full ~35.5 Hz, `0xaf`, `0xb5`, `0xb3` and `0x94` far slower. Each group below therefore carries its own \"seen at least once\" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.",
+      "groups": [
+        {
+          "frame_type": "0xb0",
+          "name": "motion",
+          "c_define": "WF_CTRL_TYPE_MOTION",
+          "valid_flag": "b0_valid",
+          "note": "The fast one: gear, the two motion flags, the brake switch and rpm, roughly 35 times a second."
+        },
+        {
+          "frame_type": "0xaf",
+          "name": "wheel",
+          "c_define": "WF_CTRL_TYPE_WHEEL",
+          "valid_flag": "af_valid",
+          "note": "Wheel geometry and the gearing constant. Static configuration rather than telemetry, but it only arrives on the link, so nothing can compute speed until one of these has been seen."
+        },
+        {
+          "frame_type": "0xb5",
+          "name": "temp",
+          "c_define": "WF_CTRL_TYPE_TEMP",
+          "valid_flag": "b5_valid",
+          "note": "Motor temperature."
+        },
+        {
+          "frame_type": "0xb3",
+          "name": "ctrl_temp",
+          "c_define": "WF_CTRL_TYPE_CTRL_TEMP",
+          "valid_flag": "b3_valid",
+          "note": "Controller temperature, and the least trustworthy group in the table - see the note on the field itself."
+        },
+        {
+          "frame_type": "0x94",
+          "name": "odo",
+          "c_define": "WF_CTRL_TYPE_ODO",
+          "valid_flag": "odo_valid",
+          "note": "The Odometer, which Anchors distance: coarse and it wraps, but it does not drift."
+        }
+      ],
+      "fields": [
+        {
+          "name": "gear",
+          "group": "0xb0",
+          "offset": 0,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": 12,
+          "shift": 2,
+          "scale": 1,
+          "unit": "",
+          "ctype": "uint8_t",
+          "confidence": "consistent",
+          "note": "0/1/2 = eco/standard/sport. The useful cross-check in the whole Controller table: cap0006 caught payload byte 0 taking the values 1, 5 and 9 across a deliberate eco-standard-sport-standard cycle, and `(1 & 0x0c) >> 2 = 0`, `(5 & 0x0c) >> 2 = 1`, `(9 & 0x0c) >> 2 = 2` - bit for bit, in the order the rider pressed them. Byte 1's accompanying 24/25/26 is not explained by this bitfield and remains open."
+        },
+        {
+          "name": "sliding_backwards",
+          "group": "0xb0",
+          "offset": 0,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": 16,
+          "shift": 4,
+          "scale": 1,
+          "unit": "",
+          "ctype": "bool",
+          "confidence": "trusted",
+          "note": "blackTeaDisp's name for it. Never seen set in any Capture we hold, all of which are forwards."
+        },
+        {
+          "name": "motion",
+          "group": "0xb0",
+          "offset": 0,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": 32,
+          "shift": 5,
+          "scale": 1,
+          "unit": "",
+          "ctype": "bool",
+          "confidence": "trusted",
+          "note": "Set while the wheel is turning, per blackTeaDisp. Not cross-checked against rpm in a Capture yet, which would be an easy way to promote it."
+        },
+        {
+          "name": "brake_switch",
+          "group": "0xb0",
+          "offset": 3,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": 128,
+          "shift": 7,
+          "scale": 1,
+          "unit": "",
+          "ctype": "bool",
+          "confidence": "trusted",
+          "note": "The brake lever switch, per blackTeaDisp - and cap0007 argues against it. The bit reads 1 for the whole 47 s of that ride, including while the bike is moving at 5 km/h, which is not what a brake lever does. So either the polarity is inverted, or this bit is not the brake at all. Kept in the table at trusted rather than dropped, because it is what upstream reads, but it should not go on a screen until a Capture with a marked brake pull says which."
+        },
+        {
+          "name": "cur_rpm",
+          "group": "0xb0",
+          "offset": 6,
+          "width": 2,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "rpm",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent. cap0007 peaks at 246 rpm, which through the speed formula is 5.5 km/h, against ride notes of a 4-7 km/h parking-lot crawl. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone."
+        },
+        {
+          "name": "wheel_ratio",
+          "group": "0xaf",
+          "offset": 4,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "",
+          "ctype": "uint8_t",
+          "confidence": "consistent",
+          "note": "Tyre aspect ratio. cap0007 reads 70."
+        },
+        {
+          "name": "wheel_radius",
+          "group": "0xaf",
+          "offset": 5,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "inch",
+          "ctype": "uint8_t",
+          "confidence": "consistent",
+          "note": "Rim diameter. cap0007 reads 12."
+        },
+        {
+          "name": "avg_speed_kmh",
+          "group": "0xaf",
+          "offset": 6,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "km/h",
+          "ctype": "uint8_t",
+          "confidence": "trusted",
+          "note": "blackTeaDisp's name, and cap0007 does not support it: the byte reads a constant 45 through a ride that never left 4-7 km/h, and no averaging window turns a crawl into 45 km/h. It is decoded because upstream decodes it, and it is named what upstream names it, but the name is probably wrong."
+        },
+        {
+          "name": "wheel_width",
+          "group": "0xaf",
+          "offset": 7,
+          "width": 1,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "mm",
+          "ctype": "uint8_t",
+          "confidence": "consistent",
+          "note": "Tyre section width. cap0007 reads 120. Taken together the three geometry bytes read 120/70-12, which is a real tyre marking for a bike this size - three independent bytes landing on one valid tyre is not something a slipped offset does by accident."
+        },
+        {
+          "name": "rate_ratio",
+          "group": "0xaf",
+          "offset": 8,
+          "width": 2,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "",
+          "ctype": "uint16_t",
+          "confidence": "trusted",
+          "note": "The gearing constant the speed formula divides by. cap0007 reads a suspiciously round 4000, which is consistent with a configuration value but proves nothing about the scale."
+        },
+        {
+          "name": "engine_temp",
+          "group": "0xb5",
+          "offset": 0,
+          "width": 2,
+          "endian": "le",
+          "signed": true,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "C",
+          "ctype": "int16_t",
+          "confidence": "trusted",
+          "note": "Motor temperature, signed so that a sub-zero reading is not a huge positive one. Plausible in cap0007, but a plausible ambient temperature is what almost any small integer looks like."
+        },
+        {
+          "name": "controller_temp",
+          "group": "0xb3",
+          "offset": 10,
+          "width": 1,
+          "endian": "le",
+          "signed": true,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "C",
+          "ctype": "int16_t",
+          "confidence": "trusted",
+          "note": "The weakest entry in the table, and deliberately kept visible rather than dropped. Two separate problems: blackTeaDisp's own author flags this one as a guess rather than something read off a working dashboard, and the upstream code contradicts itself about the width - it declares an i16 and then reads a single byte. This table decodes the single byte, signed, because that is what the code actually does, but the width is as unresolved as the meaning. Do not put this on a screen without checking it against something first. Payload byte 11 of the same frame alternates between 0 and 1 every 30-60 s and then back within about 2 s, which is not temperature-shaped and is not in this table at all."
+        },
+        {
+          "name": "odometer_raw",
+          "group": "0x94",
+          "offset": 8,
+          "width": 2,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "",
+          "ctype": "uint16_t",
+          "confidence": "trusted",
+          "note": "Cumulative distance, incremented roughly once per 100 m according to blackTeaDisp. cap0007 ends at 14, and 1.4 km is far more than a 47 s parking-lot crawl covers, so this is a running total from earlier riding rather than a per-Capture counter. The 100 m step is unverified: settling it needs a ride of known length."
+        }
+      ],
+      "hand_written": [
+        {
+          "after_group": "0xaf",
+          "members": [
+            {
+              "ctype": "bool",
+              "name": "speed_valid",
+              "note": "True once both halves of the speed calculation have arrived and rate_ratio is non-zero."
+            },
+            {
+              "ctype": "float",
+              "name": "cur_speed_kmh",
+              "unit": "km/h",
+              "note": "Road speed. Not in the Field Table and not generated, because it is not offset-and-scale: it needs cur_rpm from frame type 0xb0 and all four geometry bytes from type 0xaf at the same time, so it is recomputed by hand in wf_ctrl_apply() whenever either half arrives. The constant in wf_ctrl_speed_kmh() is blackTeaDisp's wheel circumference and rpm-to-km/h factor folded together, kept exactly as it reads there - a rounding \"improvement\" would stop matching the dashboard this bike was designed to be read by."
+            }
+          ]
+        }
+      ],
+      "not_decoded": [
+        {
+          "name": "phase_current",
+          "note": "24-bit big-endian under a square root. Not decoded today in either language, and ADR-0002 says it stays hand-written when it is, rather than growing the table a syntax for it."
+        },
+        {
+          "name": "payload bytes 8-9 and 10-11 of type 0xb0",
+          "note": "Genuinely unassigned. They are not rate_ratio, not odometer_raw and not anything else in this table."
+        },
+        {
+          "name": "type 0x8b",
+          "note": "Unknown here and unimplemented upstream too."
+        }
+      ]
+    },
+
+    {
+      "id": "bms",
+      "name": "BMS",
+      "struct": "wf_bms_t",
+      "apply_fn": "wf_bms_fields_apply",
+      "dump_fn": "wf_bms_fields_dump",
+      "key_name": "register index",
+      "endian": "be",
+      "note": "The BMS answers only when asked, over the `0xd2` Modbus read-holding-registers variant - a different framing entirely from the `a5`-command set in the appendix, and unrelated to it. The Monitor writes an 8-byte request `d2 03 <addr_hi> <addr_lo> <count_hi> <count_lo> <crc_lo> <crc_hi>` to handle `0xfff2` asking for 62 registers from address 0, and gets back 129 bytes: `d2 03 7c <124 bytes, 62 big-endian u16 registers> <crc_lo> <crc_hi>`, where `0x7c` = 124 = 2 x 62. Every register index below is 0-based into those 62 u16s. The whole map was decoded from cap0007, a 47 s parking-lot ride, which is why nothing here is worse than \"consistent with our own Captures\" and nothing is better either.",
+      "constants": [
+        {
+          "name": "WF_BMS_MAX_REGS",
+          "value": 62,
+          "note": "How many registers the Monitor's poll asks for, which is what fixes the response length. Not a property of the fields."
+        }
+      ],
+      "groups": [
+        {
+          "register_block": true,
+          "name": "d2",
+          "valid_flag": null,
+          "note": "One 0xd2 response decodes as a whole or not at all, so unlike the Controller there is no per-group validity flag."
+        }
+      ],
+      "fields": [
+        {
+          "name": "cell_mv",
+          "register": 0,
+          "count": 28,
+          "count_define": "WF_BMS_MAX_CELLS",
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "mV",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "One register per Cell, 28 of them. In cap0007 they sit between 3750 and 3772 mV, which is where a healthy lithium cell at two thirds charge belongs, and their sum matches the pack voltage register to within a volt in every one of the 34 responses. `make test` asserts both, per response, so a slipped register map shows up as a wild number rather than as a subtly wrong one."
+        },
+        {
+          "name": "cell_count",
+          "register": 49,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "Reads 28. Register 51 carries the same number redundantly; `make test` asserts the two agree in every response, which is a cheap check that the map has not shifted."
+        },
+        {
+          "name": "pack_v",
+          "register": 40,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 0.1,
+          "unit": "V",
+          "ctype": "float",
+          "confidence": "consistent",
+          "note": "105.1-105.5 V through cap0007, and equal to the sum of the 28 Cells to within a volt in every response - two readings of one Pack agreeing. A different ride's 106.1 V is consistent with this, just a fuller Pack."
+        },
+        {
+          "name": "current_a",
+          "register": 41,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "bias": -30000,
+          "scale": 0.1,
+          "unit": "A",
+          "ctype": "float",
+          "confidence": "consistent",
+          "note": "Positive is discharge. The 30000 offset is the same convention the `a5` command set uses for its own current field, which is the main reason to believe it. The scale is the weak part: ADR-0001 records it as uncertain by 19 %, and settling it means fitting integrated current against the BMS's own State of Charge delta across a whole ride. Until that happens, treat Coulomb Counts built on this as provisional."
+        },
+        {
+          "name": "soc_pct",
+          "register": 42,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 0.1,
+          "unit": "%",
+          "ctype": "float",
+          "confidence": "consistent",
+          "note": "State of Charge, the Anchor the Coulomb Count is corrected against. Constant at 66.7 % for the whole of cap0007, which is exactly right for 47 s of crawling and is also why that ride cannot say anything about how the value moves."
+        },
+        {
+          "name": "cell_max_mv",
+          "register": 43,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "mV",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "Matches the highest of the 28 Cell registers to within 10 mV in every cap0007 response, asserted by `make test`."
+        },
+        {
+          "name": "cell_min_mv",
+          "register": 44,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "mV",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "Matches the lowest of the 28 Cell registers to within 10 mV in every cap0007 response, asserted by `make test`. This is the Cell that sets the Pack's usable bottom."
+        },
+        {
+          "name": "temp_hi_c",
+          "register": 45,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "bias": -40,
+          "scale": 1,
+          "unit": "C",
+          "ctype": "int16_t",
+          "confidence": "consistent",
+          "note": "The 40 offset is the usual convention for an unsigned temperature byte and gives 19 C through cap0007, which matches the conditions the ride was taken in. Register 32 carries the same raw value; what distinguishes the two is unknown."
+        },
+        {
+          "name": "temp_lo_c",
+          "register": 46,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "bias": -40,
+          "scale": 1,
+          "unit": "C",
+          "ctype": "int16_t",
+          "confidence": "consistent",
+          "note": "Same offset, and equal to temp_hi_c throughout cap0007 - a Pack that has been sitting is uniform, so this ride cannot separate the two sensors."
+        },
+        {
+          "name": "avg_cell_mv",
+          "register": 55,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "mV",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "Reads 3767 against a mean of the 28 Cell registers of 3767.9-3768.0 across cap0007, i.e. the mean truncated rather than rounded. Agreeing with a number computed from 28 other registers is a strong check that this one is what it claims."
+        }
+      ],
+      "hand_written": [
+        {
+          "after_group": null,
+          "members": [
+            {
+              "ctype": "uint16_t",
+              "name": "reg",
+              "array": "WF_BMS_MAX_REGS",
+              "note": "The raw registers, unassigned ones included. Envelope, not a field: ADR-0001 keeps the bytes so that a register decoded later can be re-read out of an old Capture."
+            },
+            {
+              "ctype": "uint8_t",
+              "name": "n_reg",
+              "note": "How many registers the response actually carried."
+            }
+          ]
+        }
+      ],
+      "not_decoded": [
+        {
+          "name": "registers 28-31, 33-39, 47, 50, 52-54, 56-61",
+          "note": "Unassigned. Not zero in every case - register 48 reads 333 and registers 56-57 read single digits that move between responses - so there is more here to find."
+        },
+        {
+          "name": "register 32",
+          "note": "Carries the same raw value as register 45 throughout cap0007. Probably another temperature; not assigned, because \"probably\" is what this table exists to avoid."
+        },
+        {
+          "name": "register 51",
+          "note": "A second copy of cell_count. Read by the test as a cross-check rather than decoded into a field of its own."
+        }
+      ]
+    }
+  ],
+
+  "appendices": [
+    {
+      "title": "Correction to docs/capture.md and README.md",
+      "body": "Both documents say the only fields that move in a parked Capture are payload bytes 8-9 and 10-11 of the eight live frame types, idling at -1/-2 and 0/0xffff. That observation still stands as a description of what was captured, but the conclusion drawn from it needed correcting: **cur_rpm lives at payload bytes 6-7 of type `0xb0`, not 8-9/10-11.** Parked, rpm is 0, which is byte-identical to the 47 truly static types and so did not register as \"live\" in that Capture at all. It is not that rpm is one of the unexplained moving fields; it is that a stationary bike cannot distinguish \"live but currently zero\" from \"static\".\n\nThe same explains why `0xaf`, `0xb5`, `0xb3`, `0x94` and `0x8b` never showed up in the \"every 7th type is live\" pattern: wheel configuration, temperatures and the Odometer all change far too slowly for a short parked Capture to tell them apart from the genuinely static types. They are live telemetry, just not on that timescale."
+    },
+    {
+      "title": "The BMS `a5` command set - not in the Field Table",
+      "body": "blackTeaDisp also implements an older Daly command set, `a5 80 <cmd> 08 00 00 00 00 00 00 00 00 <crc>` written to handle `0xfff2` with a single-byte checksum, with commands `0x90` State of Charge, `0x91` voltage range, `0x92` temperature range, `0x98` errors and `0x50` parameters. Its byte offsets are written against whatever response length its author's own testing produced. Our unit's BMS notifications in `captures/mcu_frames.log` are 12 bytes long, which is neither that shape nor the 129-byte `0xd2` response above, and whether this bike's BMS answers this command set at all is unconfirmed.\n\nSo it is recorded here as prose and deliberately kept out of the Field Table: putting it in would generate a decoder that runs against a response shape we have never once seen, and a generated decoder for an unseen frame is exactly the kind of confident-looking wrong answer ADR-0002 exists to prevent. The offsets, for whoever verifies them against a real Capture first: `0x90` bytes 4-5 volt_tot_mv (u16 BE x100), bytes 8-9 current_ma ((u16 BE - 30000) x100), bytes 10-11 soc_perm (u16 BE, per mille); `0x91` bytes 4-5 highest_v_mv, byte 6 highest_v_cell, bytes 7-8 lowest_v_mv, byte 9 lowest_v_cell; `0x92` byte 4 highest_temp (u8 - 40), byte 5 highest_temp_cell, byte 6 lowest_temp (u8 - 40), byte 7 lowest_temp_cell; `0x50` bytes 4-7 capacity_mah (u32 BE)."
+    },
+    {
+      "title": "How this document is kept honest",
+      "body": "`make test` builds the generated C decoder with gcc, replays every Capture in `tests/fixtures/` through it, and asserts on the numbers - so the entries above are re-checked on a development machine rather than by eye, once, on a ride. It then decodes the same Captures with the generated Python decoder and asserts the two produce byte-identical values for every field of every record, which is what makes ADR-0002's \"one description, three artefacts\" a claim the build can prove rather than a convention. Finally it regenerates this document and fails if what is committed differs, so the table and the prose cannot drift apart either."
+    }
+  ]
+}

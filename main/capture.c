@@ -106,11 +106,13 @@ static const uint32_t k_backoff_ms[] = { 1000, 2000, 5000 };
  * Fardriver's 35.5 Hz stream on the other link. */
 #define CAP_BMS_POLL_MS     1000
 
-/* What the poll asks for: the 62 register block at 0 that carries the 28 cell
+/* What the poll asks for: the register block at 0 that carries the 28 cell
  * voltages, the pack voltage, current, SoC and the temperatures. Only the 0xd2
- * protocol variant answers on this unit; the 0x81 one is silent. */
+ * protocol variant answers on this unit; the 0x81 one is silent. The count is
+ * the Field Table's, so that asking for fewer registers than the decoder reads
+ * is not something these two files can disagree about. */
 #define CAP_BMS_POLL_ADDR   0x0000
-#define CAP_BMS_POLL_COUNT  0x003e
+#define CAP_BMS_POLL_COUNT  WF_BMS_MAX_REGS
 
 /* A polled link, or all zeroes for one that is only ever pushed to. */
 typedef struct {

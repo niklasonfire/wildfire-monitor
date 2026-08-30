@@ -94,4 +94,32 @@ simply reads 0 while parked, indistinguishable from a static field. See
 from. Bytes 8..9/10..11 of `0xb0` remain genuinely unassigned. Assigning
 meaning to a field from scratch still needs a capture taken **while riding**,
 which the host-driven flow above cannot deliver, because it needs a PC on the
-serial link. See `docs/standalone-capture.md`.
+serial link. That is what the standalone capture below is for.
+
+## Standalone capture
+
+The flow above needs `./wf.sh` on the other end of the USB cable, so it cannot
+follow the bike. The standalone capture runs on the Monitor alone: it connects
+to both devices by itself, writes a Capture to flash as a `.wfl` file, and is
+driven from the console only before and after the ride.
+
+```
+cap status | scan | idle | rec | stop | mark [text]
+caps                 # list the Captures on flash
+capdump <seq>        # print one over the console
+caprm <seq>|all      # delete
+wifi on              # Wi-Fi readout mode, for pulling files off without a cable
+```
+
+`cap rec` starts recording and `cap stop` ends it; `cap mark` drops a Marker at
+the moment a deliberate manoeuvre starts or ends, which is what separates an
+experiment from a blob of frames. A Capture holds only what the two devices
+said - never anything the Monitor worked out from it, per ADR-0001 - so it can
+be re-decoded whenever the Field Table improves.
+
+Afterwards, off the bike:
+
+```bash
+./scripts/wfl.py cap0007.wfl              # tagged one-line records
+./scripts/wfl.py cap0007.wfl --fields     # every decoded field, per record
+```

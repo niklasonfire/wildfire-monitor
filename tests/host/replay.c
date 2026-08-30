@@ -15,7 +15,13 @@
  * that is a fact about one particular ride lives in that ride's .expect file.
  * Adding a Capture is therefore two files and no change to this program.
  *
- *   ./replay [fixture-dir]        default: tests/fixtures
+ *   ./replay [fixture-dir]           default: tests/fixtures
+ *   ./replay --fields <capture.wfl>  every generated field of every record
+ *
+ * The second mode is the other half of ADR-0002. It prints what the generated
+ * C decoder makes of every record, in a canonical form the generated Python
+ * decoder prints identically, so tests/test_field_table.py can assert the
+ * two languages agree byte for byte rather than by inspection.
  */
 #include <dirent.h>
 #include <stdarg.h>
@@ -385,6 +391,58 @@ static void check_expect(const char *fixture, const char *path,
            path);
 }
 
+/* ----------------------------------------------- the cross-language dump */
+
+/* One field, as text. The decimal count comes from the field's own scale, so
+ * a value the table says has one decimal is printed with exactly one - which
+ * is what keeps C's float and Python's double from disagreeing in a digit
+ * neither of them means. */
+static void print_field(void *ctx, const char *name, double value, int decimals)
+{
+    (void)ctx;
+    printf(" %s=%.*f", name, decimals, value);
+}
+
+/* Every record that decodes, in file order, one line each: the record's index
+ * in the file, then every field the generated decoder assigns from it. A
+ * frame type the Field Table does not cover still prints its line, empty, so
+ * that the two languages have to agree on what they do not know either. */
+static void dump_fields(const uint8_t *buf, size_t len)
+{
+    wfl_reader_t rd;
+    if (!wfl_open(&rd, buf, len, NULL)) {
+        fprintf(stderr, "not a Capture, or too short to hold a header\n");
+        exit(2);
+    }
+
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+
+    wfl_rec_t rec;
+    long index = 0;
+    while (wfl_next(&rd, &rec)) {
+        long here = index++;
+        if (rec.type == WFREC_MCU) {
+            wf_ctrl_frame_t f;
+            if (!wf_ctrl_frame_parse(rec.data, rec.len, &f)) {
+                continue;
+            }
+            wf_ctrl_apply(&live, &f);
+            printf("c %ld %02x", here, f.type);
+            wf_ctrl_fields_dump(&live, f.type, print_field, NULL);
+            putchar('\n');
+        } else if (rec.type == WFREC_BMS) {
+            wf_bms_t b;
+            if (!wf_bms_decode(rec.data, rec.len, &b)) {
+                continue;
+            }
+            printf("b %ld", here);
+            wf_bms_fields_dump(&b, print_field, NULL);
+            putchar('\n');
+        }
+    }
+}
+
 /* ------------------------------------------------------------------- main */
 
 static uint8_t *slurp(const char *path, size_t *out_len)
@@ -492,6 +550,22 @@ static void report(const wflog_hdr_t *h, const run_t *r)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "--fields") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "usage: replay --fields <capture.wfl>\n");
+            return 2;
+        }
+        size_t len = 0;
+        uint8_t *buf = slurp(argv[2], &len);
+        if (buf == NULL) {
+            fprintf(stderr, "%s cannot be read\n", argv[2]);
+            return 2;
+        }
+        dump_fields(buf, len);
+        free(buf);
+        return 0;
+    }
+
     const char *dir = (argc > 1) ? argv[1] : "tests/fixtures";
 
     char **paths;

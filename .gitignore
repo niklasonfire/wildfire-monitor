@@ -7,6 +7,8 @@ dependencies.lock
 *.log
 !captures/*.log
 
-# host test build
+# host test build. Both build directories hold the decoders generated from
+# field-table.json (build/gen, build-host/gen): generated, never committed, so
+# they cannot be edited into and cannot drift from the table.
 build-host/
 __pycache__/
