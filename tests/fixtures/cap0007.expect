@@ -70,3 +70,39 @@ ctrl_current_a_max 8.75
 # more than 0.30 V across the 34 responses. A slipped payload offset on either
 # side could not land inside that.
 pack_v_device_gap_max 0.30
+
+# The estimation seam, main/wfest. Every figure here is provisional twice
+# over: it is scaled by WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 %
+# until Ride 1 settles it, and it counts down to a Limp Point of 84.0 V that
+# is assumed rather than measured. They are pinned so that a change to either
+# is deliberate and shows up as a diff, not so that they are believed.
+#
+# 34 BMS answers, 244 power-block frames: the same counts the decode above
+# asserts, which is the plumbing check - the estimator saw everything the
+# decoder saw and nothing else. The curve has a point per record either of
+# them was fed, and starts at the first BMS answer because before that there
+# is no Anchor and so nothing to show.
+est_points          1694
+est_power_samples   244
+est_anchor_samples  34
+
+# The ride: 47 s of crawling took 1.73 Wh out of the Pack, so Remaining
+# Energy fell 1.6 Wh from where the 66.7 % Anchor put it. The maximum is the
+# first point, before anything was drawn; the minimum is not the last, because
+# the line current dips to -0.25 A near the end and that little of the energy
+# comes back - which is the sign convention showing up in a real ride.
+est_wh_first        2729.04
+est_wh_last         2727.42
+est_wh_min          2727.38
+est_wh_max          2729.04
+est_used_wh         1.73
+est_used_ah         0.02
+
+# The Anchor holding. The BMS never moved off 66.7 %, the Coulomb Count
+# integrated 0.016 Ah out of the Pack, and the gap between them never reached
+# a thirtieth of a percent. This ride cannot show the Anchor pulling a real
+# drift back - its State of Charge does not move and its current barely does -
+# so that is driven with synthesised streams in tests/host/unit.c instead.
+est_soc_last        66.67
+est_anchor_soc_last 66.70
+est_soc_gap_max     0.03

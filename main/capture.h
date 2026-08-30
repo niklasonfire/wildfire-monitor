@@ -18,6 +18,7 @@
 
 #include "esp_err.h"
 #include "wfdecode/wfdecode.h"
+#include "wfest/wfest.h"
 
 typedef enum {
     CAP_IDLE = 0,     /* radio quiet, nothing to do */
@@ -83,6 +84,13 @@ const char *cap_state_str(cap_state_t s);
  * capture is running - the live screen has to work while just riding, not only
  * mid-capture. */
 void cap_live_get(wf_ctrl_live_t *out);
+
+/* Snapshot of what main/wfest makes of those fields: Remaining Energy, the
+ * Coulomb Count and how it stands against its Anchor. Fed from the same two
+ * notification streams as cap_live_get(), capture running or not, and every
+ * figure in it is computed in the estimator - callers format it and do no
+ * arithmetic of their own. */
+void cap_est_get(wf_est_out_t *out);
 
 /* Stops everything and takes NimBLE and the BT controller down so the Wi-Fi
  * readout mode has the RAM. The only way back to capturing is a reboot. */

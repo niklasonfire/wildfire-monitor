@@ -22,6 +22,14 @@
  * C decoder makes of every record, in a canonical form the generated Python
  * decoder prints identically, so tests/test_field_table.py can assert the
  * two languages agree byte for byte rather than by inspection.
+ *
+ * Every Capture also goes through main/wfest, the estimation seam, and the
+ * whole Remaining Energy curve is hashed. Each fixture is replayed twice and
+ * the two hashes have to match bit for bit: that is the acceptance criterion
+ * "replaying a recorded Capture produces the identical Remaining Energy curve
+ * every time", asserted rather than intended. It is a hash of every point and
+ * not of the final value, because a curve can arrive at the right answer by
+ * two different routes and only one of them is deterministic.
  */
 #include <dirent.h>
 #include <stdarg.h>
@@ -31,6 +39,7 @@
 #include <string.h>
 
 #include "wfdecode.h"
+#include "wfest.h"
 #include "wfl_read.h"
 
 #define MAX_FIXTURE_BYTES (16 * 1024 * 1024)
@@ -128,7 +137,63 @@ typedef struct {
     long     pack_v_device_samples;
     long     dropped_last;
     uint32_t duration_ms;
+    /* The estimation seam, main/wfest, fed the same records in the same order
+     * the Monitor feeds it live. Nothing here reads a clock: every t_ms comes
+     * out of the record it arrived on. */
+    wf_est_t est;
+    uint64_t est_hash;          /* over the whole Remaining Energy curve */
+    long     est_points;
+    double   est_wh_first, est_wh_last;
+    double   est_wh_min, est_wh_max;
+    /* How far the Coulomb Count ever got from its Anchor, in percent of the
+     * Pack. The acceptance criterion is that this does not diverge. */
+    double   est_soc_gap_max;
+    long     est_soc_gap_samples;
 } run_t;
+
+/* FNV-1a over the raw bytes of every point on the curve. The comparison is
+ * between two replays of the same file in the same binary, so hashing the bit
+ * pattern is exactly the right strictness: no tolerance, because a tolerance
+ * is the thing this criterion is about not needing. */
+static void curve_point(run_t *r, double wh)
+{
+    uint8_t bytes[sizeof(double)];
+    memcpy(bytes, &wh, sizeof(bytes));
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        r->est_hash ^= bytes[i];
+        r->est_hash *= 0x100000001b3ull;
+    }
+    if (r->est_points == 0) {
+        r->est_wh_first = wh;
+        r->est_wh_min = r->est_wh_max = wh;
+    }
+    if (wh < r->est_wh_min) r->est_wh_min = wh;
+    if (wh > r->est_wh_max) r->est_wh_max = wh;
+    r->est_wh_last = wh;
+    r->est_points++;
+}
+
+/* Sampled after every record the estimator was fed, so the curve is what the
+ * live screen would have shown at each of those instants. */
+static void est_sample(run_t *r)
+{
+    wf_est_out_t o;
+    wf_est_get(&r->est, &o);
+    if (!o.valid) {
+        return;
+    }
+    curve_point(r, o.remaining_wh);
+    if (o.anchored && o.anchor_samples > 0) {
+        double gap = o.soc_pct - o.anchor_soc_pct;
+        if (gap < 0.0) {
+            gap = -gap;
+        }
+        if (gap > r->est_soc_gap_max) {
+            r->est_soc_gap_max = gap;
+        }
+        r->est_soc_gap_samples++;
+    }
+}
 
 static void run_init(run_t *r)
 {
@@ -139,6 +204,10 @@ static void run_init(run_t *r)
     r->ctrl_pack_v_max = r->ctrl_current_a_max = -1e9;
     r->cell_mv_min = 0xffffu;
     r->cell_count_stable = true;
+    r->est_hash = 0xcbf29ce484222325ull;   /* FNV-1a offset basis */
+    /* Cold: a fixture carries no persisted state, so every replay of it starts
+     * from the same nothing. That is half of why replays agree. */
+    wf_est_init(&r->est, NULL);
 }
 
 static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
@@ -192,6 +261,11 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
                     r->ctrl_current_a_max = r->live.line_current_a;
                 }
             }
+            /* Exactly what main/capture.c does on the bike, in the same place:
+             * decode, then hand the decoded state and the record's own
+             * timestamp to the estimator. */
+            wf_est_feed_ctrl(&r->est, rec.t_ms, f.type, &r->live);
+            est_sample(r);
             break;
         }
 
@@ -253,6 +327,11 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
             } else if (b.cell_count != r->cell_count) {
                 r->cell_count_stable = false;
             }
+            /* The Anchor. Per ADR-0003 the estimator takes the State of Charge
+             * from here and nothing else - not this device's pack voltage, not
+             * its current, and certainly not any energy figure it offers. */
+            wf_est_feed_bms(&r->est, rec.t_ms, &b);
+            est_sample(r);
             break;
         }
 
@@ -341,6 +420,23 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "cell_extreme_mismatch", (double)r->cell_extreme_mismatch);
         put(ms, "cell_count_disagree", (double)r->cell_count_disagree);
     }
+
+    if (r->est_points > 0) {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        put(ms, "est_points", (double)r->est_points);
+        put(ms, "est_wh_first", r->est_wh_first);
+        put(ms, "est_wh_last", r->est_wh_last);
+        put(ms, "est_wh_min", r->est_wh_min);
+        put(ms, "est_wh_max", r->est_wh_max);
+        put(ms, "est_used_wh", o.used_wh);
+        put(ms, "est_used_ah", o.used_ah);
+        put(ms, "est_soc_last", o.soc_pct);
+        put(ms, "est_anchor_soc_last", o.anchor_soc_pct);
+        put(ms, "est_soc_gap_max", r->est_soc_gap_max);
+        put(ms, "est_power_samples", (double)o.power_samples);
+        put(ms, "est_anchor_samples", (double)o.anchor_samples);
+    }
 }
 
 /* ------------------------------------------------------------- assertions */
@@ -426,6 +522,54 @@ static void check_invariants(const char *fixture, const run_t *r)
         fail(fixture, "the Controller and the BMS disagree about pack voltage "
                       "by up to %.2f V across %ld responses",
              r->pack_v_device_gap_max, r->pack_v_device_samples);
+    }
+
+    /* ---- the estimation seam, main/wfest ---- */
+    wf_est_out_t o;
+    wf_est_get(&r->est, &o);
+
+    if (r->bms_responses_ok > 0 && !o.anchored) {
+        fail(fixture, "%ld BMS answers and the estimator never acquired an "
+                      "Anchor", r->bms_responses_ok);
+    }
+    if (o.anchored && r->est_points == 0) {
+        fail(fixture, "the estimator anchored but produced no curve");
+    }
+    /* Remaining Energy counts down to the Limp Point, so it cannot exceed what
+     * a full Pack holds above it, and wf_est_get() clamps the bottom at zero.
+     * Outside this the model or the current scale has gone wrong, not the
+     * ride. */
+    if (r->est_points > 0) {
+        double full = wf_est_energy_above_limp_wh(100.0);
+        if (r->est_wh_min < 0.0 || r->est_wh_max > full) {
+            fail(fixture, "Remaining Energy ran %.1f-%.1f Wh, outside the "
+                          "0-%.1f Wh a full Pack holds above the Limp Point",
+                 r->est_wh_min, r->est_wh_max, full);
+        }
+    }
+    /* The acceptance criterion, as an invariant rather than a per-ride fact:
+     * the Coulomb Count is Anchored to the BMS's State of Charge and does not
+     * diverge from it. Five percent of the Pack is loose enough for a long
+     * ride's honest integration drift between answers and far tighter than
+     * anything a broken Anchor would stay inside. */
+    if (r->est_soc_gap_samples > 0 && r->est_soc_gap_max > 5.0) {
+        fail(fixture, "the Coulomb Count drifted %.2f %% from its Anchor over "
+                      "%ld samples", r->est_soc_gap_max, r->est_soc_gap_samples);
+    }
+}
+
+/* Per ADR-0001 nothing the estimator concludes may reach a Capture, so a
+ * Capture cannot carry a record type that would hold one. Every type the
+ * format defines is raw device output (WFREC_MCU, WFREC_BMS), board telemetry
+ * (WFREC_TELEM, WFREC_IMU) or text the rider or the firmware wrote
+ * (WFREC_EVENT). A fixture holding anything else means a derived value found
+ * its way into the archive after all. */
+static void check_no_derived_records(const char *fixture, const run_t *r)
+{
+    if (r->other_records != 0) {
+        fail(fixture, "%ld records of a type this build does not know: a "
+                      "Capture holds raw device output only (ADR-0001)",
+             r->other_records);
     }
 }
 
@@ -645,6 +789,16 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                r->current_a_min, r->current_a_max, r->cell_count,
                r->cell_mv_min, r->cell_mv_max);
     }
+    if (r->est_points > 0) {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        printf("  estimate: %.0f -> %.0f Wh above a provisional %.1f V Limp "
+               "Point (%.0f %% of Pack), %.2f Wh drawn, coulomb %.2f %% vs "
+               "anchor %.2f %%, curve %ld points hash %016llx\n",
+               r->est_wh_first, r->est_wh_last, WF_EST_LIMP_POINT_V,
+               wf_est_limp_soc_pct(), o.used_wh, o.soc_pct, o.anchor_soc_pct,
+               r->est_points, (unsigned long long)r->est_hash);
+    }
 }
 
 int main(int argc, char **argv)
@@ -699,9 +853,27 @@ int main(int argc, char **argv)
                  hdr.version, WFLOG_VERSION);
         }
 
+        /* The determinism criterion. The same bytes go through the same code a
+         * second time and the whole Remaining Energy curve has to come out
+         * identical - every point, bit for bit, not just the figure it ends
+         * on. Anything the estimator picked up from a clock, from uninitialised
+         * memory or from an accumulation whose order depended on something
+         * outside the file would show up here. */
+        wflog_hdr_t hdr2;
+        run_t again;
+        replay(buf, len, &hdr2, &again);
+        if (again.est_hash != r.est_hash || again.est_points != r.est_points) {
+            fail(paths[i], "replaying it twice produced two different "
+                           "Remaining Energy curves: %ld points hash %016llx, "
+                           "then %ld points hash %016llx",
+                 r.est_points, (unsigned long long)r.est_hash,
+                 again.est_points, (unsigned long long)again.est_hash);
+        }
+
         metrics_t ms = { .n = 0 };
         collect(&r, &ms);
         check_invariants(paths[i], &r);
+        check_no_derived_records(paths[i], &r);
 
         char expect[512];
         snprintf(expect, sizeof(expect), "%.*s.expect",

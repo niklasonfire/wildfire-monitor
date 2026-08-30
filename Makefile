@@ -1,6 +1,7 @@
 # Host build. The firmware is built by ./idf.sh in the ESP-IDF container; this
-# builds the part of it that does not need a board - the pure decoding in
-# main/wfdecode - and replays recorded Captures through it.
+# builds the parts of it that do not need a board - the pure decoding in
+# main/wfdecode and the pure estimation in main/wfest - and replays recorded
+# Captures through them.
 #
 #   make test        generate, build, unit-test and replay every fixture
 #   make gen         just run the Field Table through the generator
@@ -14,6 +15,12 @@
 CC       ?= gcc
 OPT      ?= -O2
 WARN      = -Wall -Wextra -Werror
+# Determinism. GCC contracts a*b+c into a fused multiply-add by default, which
+# rounds once instead of twice - a better answer, and a different one depending
+# on what the compiler chose to fuse. main/wfest has to produce the same
+# Remaining Energy curve here and on the Monitor, so the licence is withdrawn
+# in both builds; see main/CMakeLists.txt for the other half.
+FPDET     = -ffp-contract=off
 # The decoding is C99 and nothing else, which is what lets it compile both here
 # and in the ESP-IDF build. The harness around it may use POSIX.
 PURE_STD  = -std=c99
@@ -21,6 +28,7 @@ HOST_STD  = -std=c99 -D_DEFAULT_SOURCE
 
 BUILD     = build-host
 WFDECODE  = main/wfdecode
+WFEST     = main/wfest
 FIXTURES  = tests/fixtures
 PYTHON   ?= python3
 
@@ -35,7 +43,9 @@ DOC       = docs/field-table.md
 GEN       = $(BUILD)/gen
 GEN_STAMP = $(GEN)/.generated
 
-PURE_OBJ  = $(BUILD)/wfdecode.o $(BUILD)/wfl_read.o $(BUILD)/wf_fields.o
+PURE_OBJ  = $(BUILD)/wfdecode.o $(BUILD)/wfl_read.o $(BUILD)/wf_fields.o \
+            $(BUILD)/wfest.o
+INC       = -I$(WFDECODE) -I$(WFEST) -I$(GEN)
 REPLAY    = $(BUILD)/replay
 UNIT      = $(BUILD)/unit
 
@@ -69,20 +79,24 @@ $(GEN_STAMP): $(TABLE) $(GENERATOR) | $(BUILD)
 	$(PYTHON) $(GENERATOR) $(TABLE) --c-dir $(GEN) --py-dir $(GEN) --stamp $@
 
 $(BUILD)/wf_fields.o: $(GEN_STAMP) | $(BUILD)
-	$(CC) $(PURE_STD) $(WARN) $(OPT) -I$(WFDECODE) -I$(GEN) \
+	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) \
 	    -c $(GEN)/wf_fields.c -o $@
 
+$(BUILD)/wfest.o: $(WFEST)/wfest.c $(WFEST)/wfest.h $(GEN_STAMP) | $(BUILD)
+	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
+
 $(BUILD)/%.o: $(WFDECODE)/%.c $(GEN_STAMP) | $(BUILD)
-	$(CC) $(PURE_STD) $(WARN) $(OPT) -I$(WFDECODE) -I$(GEN) -c $< -o $@
+	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
 
 $(REPLAY): tests/host/replay.c $(PURE_OBJ) | $(BUILD)
-	$(CC) $(HOST_STD) $(WARN) $(OPT) -I$(WFDECODE) -I$(GEN) \
+	$(CC) $(HOST_STD) $(WARN) $(OPT) $(FPDET) $(INC) \
 	    tests/host/replay.c $(PURE_OBJ) -o $@
 
-# Built with PURE_STD, not HOST_STD: it links nothing but main/wfdecode, so it
-# holds that seam to the same C99-and-nothing-else rule the firmware needs.
+# Built with PURE_STD, not HOST_STD: it links nothing but main/wfdecode and
+# main/wfest, so it holds those seams to the same C99-and-nothing-else rule the
+# firmware needs.
 $(UNIT): tests/host/unit.c $(PURE_OBJ) | $(BUILD)
-	$(CC) $(PURE_STD) $(WARN) $(OPT) -I$(WFDECODE) -I$(GEN) \
+	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) \
 	    tests/host/unit.c $(PURE_OBJ) -o $@
 
 # The dumps are the only surviving copy of these rides; the .wfl next to them

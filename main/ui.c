@@ -95,24 +95,30 @@ static const char *TAG = "ui";
 #define ERR_COLS       22           /* scale 1 fills the width exactly */
 #define ERR_LINES      4
 
-/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V7, same
+/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V8, same
  * as every other per-state screen - see the F_V slot comment above.
  *
- * Pack voltage and line current sit directly under speed, above rpm, because
- * they are what says mid-ride whether the Capture is worth anything: a Pack
- * voltage that has gone flat or a current stuck at zero means the ride is
- * being wasted, and a ride costs far more than a glance. The Odometer is the
- * other way round - reference material, read once at a landmark and never
- * while moving - so it is the one row demoted to scale 1, which is also what
- * makes room for a distance in metres that runs to seven digits. */
+ * Remaining Energy sits directly under speed because it is the one number on
+ * this screen the rider actually rides by; everything below it is evidence for
+ * it. Pack voltage and line current come next, because they are what says
+ * mid-ride whether the Capture is worth anything: a Pack voltage that has gone
+ * flat or a current stuck at zero means the ride is being wasted, and a ride
+ * costs far more than a glance. The Odometer is the other way round -
+ * reference material, read once at a landmark and never while moving - so it
+ * is the one row demoted to scale 1, which is also what makes room for a
+ * distance in metres that runs to seven digits.
+ *
+ * Brake and motion share a row. They are one-word booleans and the content
+ * band is 185 px, which is nine rows at scale 2 and this screen wants ten. */
 #define ROW_LIVE_SPEED  70          /* scale 3 */
-#define ROW_LIVE_VOLTS  98          /* scale 2 from here down... */
-#define ROW_LIVE_AMPS   116
-#define ROW_LIVE_RPM    134
-#define ROW_LIVE_BRAKE  152
-#define ROW_LIVE_MOTION 170
-#define ROW_LIVE_TEMP   188
-#define ROW_LIVE_ODO    208         /* ...except this one, scale 1 */
+#define ROW_LIVE_WH     96          /* scale 2 from here down... */
+#define ROW_LIVE_VOLTS  114
+#define ROW_LIVE_AMPS   132
+#define ROW_LIVE_RPM    150
+#define ROW_LIVE_FLAGS  168         /* brake and motion, side by side */
+#define ROW_LIVE_TEMP   186
+#define ROW_LIVE_ODO    206         /* ...except this one, scale 1 */
+#define COL_LIVE_MOVE_X 75          /* "BRAKE" is 5 columns, "MOVE" is 4 */
 
 #define MSG_TITLE_Y    16
 #define MSG_SEP_Y      44
@@ -154,7 +160,7 @@ typedef struct {
 enum {
     F_CLOCK = 0, F_BATT, F_BATT_MV,
     F_TITLE, F_LINK1, F_LINK2, F_SUB1, F_SUB2,
-    F_V0, F_V1, F_V2, F_V3, F_V4, F_V5, F_V6, F_V7,
+    F_V0, F_V1, F_V2, F_V3, F_V4, F_V5, F_V6, F_V7, F_V8,
     F_COUNT
 };
 
@@ -643,7 +649,7 @@ static const char *gear_name(uint8_t gear)
     }
 }
 
-static void draw_live(const wf_ctrl_live_t *lv)
+static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
 {
     if (lv->b0_valid) {
         draw_title(gear_name(lv->gear), DISP_GREEN);
@@ -656,34 +662,58 @@ static void draw_live(const wf_ctrl_live_t *lv)
     } else {
         FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_DIM, "%s", "-- KM/H");
     }
+
+    /* Remaining Energy, computed entirely in main/wfest. Nothing here does
+     * arithmetic on it: this is a %.0f of a number the estimator produced, and
+     * that is the whole of the display's involvement in the figure.
+     *
+     * It is drawn in the hint colour and behind a tilde because it is
+     * provisional, and the hint line says so in words. Two separate reasons,
+     * both worth the rider knowing: it counts down to a Limp Point of 84.0 V
+     * that is assumed rather than measured (WF_EST_LIMP_POINT_V, issue #8
+     * measures it), and it is scaled by a line current whose LSB is uncertain
+     * by 19 % until Ride 1 settles it. Dim instead while the figure rests on
+     * state restored from NVS and no BMS answer has confirmed it yet. */
+    if (est->valid) {
+        FIELD(F_V1, 2, ROW_LIVE_WH, 2, est->anchored ? COL_HINT : COL_DIM,
+              "~%.0f WH", est->remaining_wh);
+    } else {
+        FIELD(F_V1, 2, ROW_LIVE_WH, 2, COL_DIM, "%s", "-- WH");
+    }
+
     /* The power block, from any of its eight frame types. One decimal on the
      * volts because that is the resolution the field has; one on the amps
      * because the scale behind them is still unsettled by 19 % (see
      * WF_CTRL_CURRENT_LSB_PER_A) and a second decimal would be a precision
      * this number does not have. The sign is the Controller's own, positive
-     * while the Pack is being drawn from. */
+     * while the Pack is being drawn from - which is the convention the
+     * estimator integrates in too. */
     if (lv->power_valid) {
-        FIELD(F_V1, 2, ROW_LIVE_VOLTS, 2, COL_VALUE, "%.1f V", lv->pack_v);
-        FIELD(F_V2, 2, ROW_LIVE_AMPS, 2, COL_VALUE, "%+.1f A", lv->line_current_a);
+        FIELD(F_V2, 2, ROW_LIVE_VOLTS, 2, COL_VALUE, "%.1f V", lv->pack_v);
+        FIELD(F_V3, 2, ROW_LIVE_AMPS, 2, COL_VALUE, "%+.1f A", lv->line_current_a);
     } else {
-        FIELD(F_V1, 2, ROW_LIVE_VOLTS, 2, COL_DIM, "%s", "-- V");
-        FIELD(F_V2, 2, ROW_LIVE_AMPS, 2, COL_DIM, "%s", "-- A");
+        FIELD(F_V2, 2, ROW_LIVE_VOLTS, 2, COL_DIM, "%s", "-- V");
+        FIELD(F_V3, 2, ROW_LIVE_AMPS, 2, COL_DIM, "%s", "-- A");
     }
+    /* Two fields on one row, so neither may pad out to the right edge and both
+     * keep a fixed width - only their colour moves. */
     if (lv->b0_valid) {
-        FIELD(F_V3, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
-        FIELD(F_V4, 2, ROW_LIVE_BRAKE, 2, lv->brake_switch ? DISP_RED : COL_DIM,
-              "BRAKE %s", lv->brake_switch ? "ON" : "off");
-        FIELD(F_V5, 2, ROW_LIVE_MOTION, 2, lv->motion ? DISP_GREEN : COL_DIM,
-              "MOVING %s", lv->motion ? "yes" : "no");
+        FIELD(F_V4, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
+        field_at(&s_field[F_V5], 2, ROW_LIVE_FLAGS, 2,
+                 lv->brake_switch ? DISP_RED : COL_DIM, COL_BG, false, "BRAKE");
+        field_at(&s_field[F_V6], COL_LIVE_MOVE_X, ROW_LIVE_FLAGS, 2,
+                 lv->motion ? DISP_GREEN : COL_DIM, COL_BG, false, "MOVE");
     } else {
-        FIELD(F_V3, 2, ROW_LIVE_RPM, 2, COL_DIM, "%s", "-- RPM");
-        FIELD(F_V4, 2, ROW_LIVE_BRAKE, 2, COL_DIM, "%s", "BRAKE --");
-        FIELD(F_V5, 2, ROW_LIVE_MOTION, 2, COL_DIM, "%s", "MOVING --");
+        FIELD(F_V4, 2, ROW_LIVE_RPM, 2, COL_DIM, "%s", "-- RPM");
+        field_at(&s_field[F_V5], 2, ROW_LIVE_FLAGS, 2, COL_DIM, COL_BG, false,
+                 "BRAKE");
+        field_at(&s_field[F_V6], COL_LIVE_MOVE_X, ROW_LIVE_FLAGS, 2, COL_DIM,
+                 COL_BG, false, "MOVE");
     }
     if (lv->b5_valid) {
-        FIELD(F_V6, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
+        FIELD(F_V7, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
     } else {
-        FIELD(F_V6, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
+        FIELD(F_V7, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
     }
     /* Metres, not counts: the calibration ride reads this at two landmarks a
      * known distance apart to settle WF_CTRL_ODO_METRES_PER_COUNT, and a raw
@@ -691,12 +721,14 @@ static void draw_live(const wf_ctrl_live_t *lv)
      * digits are always zero - that is the Odometer's resolution showing, not
      * a formatting accident. */
     if (lv->odo_valid) {
-        FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %" PRIu32 " M",
+        FIELD(F_V8, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %" PRIu32 " M",
               wf_ctrl_odo_metres(lv->odometer_raw));
     } else {
-        FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
+        FIELD(F_V8, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
     }
-    draw_hint("PWR: BACK");
+    /* The tilde on the watt-hours, explained. 18 columns of the 22 scale 1
+     * gives us, so it fits without shrinking the button hint next to it. */
+    draw_hint("PWR: BACK ~WH PROV");
 }
 
 /* ---- message screen ----------------------------------------------------- */
@@ -820,8 +852,10 @@ static void ui_task(void *arg)
             draw_bar();
             if (live) {
                 wf_ctrl_live_t lv;
+                wf_est_out_t   est;
                 cap_live_get(&lv);
-                draw_live(&lv);
+                cap_est_get(&est);
+                draw_live(&lv, &est);
             } else {
                 draw_state(&st, full);
             }

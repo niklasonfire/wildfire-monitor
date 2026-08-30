@@ -18,12 +18,21 @@
  *     decoder reads the offsets the Field Table declares, including a negative
  *     line current, which that ride never produced.
  *
- * Same rules as the rest of main/wfdecode: pure C99, no board, no fixtures.
+ *   - almost everything main/wfest does. cap0007's State of Charge is pinned
+ *     at 66.7 % for the whole 47 s and its current never leaves -0.25..8.75 A,
+ *     so that ride is an excellent determinism and plumbing fixture and a
+ *     hopeless physics one. The Anchor pulling a drifting Coulomb Count back,
+ *     a gap in the BMS stream, the sign convention and the persisted state all
+ *     have to be driven with synthesised streams here instead.
+ *
+ * Same rules as the rest of main/wfdecode and main/wfest: pure C99, no board,
+ * no fixtures.
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "wfdecode.h"
+#include "wfest.h"
 
 static int failures;
 
@@ -194,6 +203,481 @@ static void test_a_type_outside_the_block_changes_nothing(void)
     CHECK(close_to(live.pack_v, 0.0), "type 0x82 wrote pack_v %.3f", live.pack_v);
 }
 
+/* ============================================================ the estimator */
+
+#define CHECK_D(got, want, tol, what)                                         \
+    do {                                                                      \
+        double g_ = (double)(got), w_ = (double)(want), t_ = (double)(tol);   \
+        double d_ = g_ - w_;                                                  \
+        if (d_ < 0.0) { d_ = -d_; }                                           \
+        CHECK(d_ <= t_, "%s: got %.4f, expected %.4f +/- %.4f",               \
+              (what), g_, w_, t_);                                            \
+    } while (0)
+
+/* The synthesised streams below are the whole point of this section: a
+ * Controller power sample every SAMPLE_MS and a BMS answer every POLL_MS, at
+ * whatever voltage, current and State of Charge the test wants. Both mimic
+ * what the real streams do - the Controller's power block at ~5.2 Hz per
+ * ADR-0003, the BMS at ~1 Hz. */
+#define SAMPLE_MS  200u
+#define POLL_MS    1000u
+
+static void feed_power(wf_est_t *e, uint32_t t_ms, double volts, double amps)
+{
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+    live.power_valid    = true;
+    live.pack_v         = (float)volts;
+    live.line_current_a = (float)amps;
+    /* Any of the eight will do; wf_est_feed_ctrl() treats them alike, which
+     * test_power_block_decodes_at_every_type() above pins on the decode side. */
+    wf_est_feed_ctrl(e, t_ms, wf_ctrl_type_power[0], &live);
+}
+
+static void feed_soc(wf_est_t *e, uint32_t t_ms, double soc_pct)
+{
+    wf_bms_t b;
+    memset(&b, 0, sizeof(b));
+    b.soc_pct = (float)soc_pct;
+    wf_est_feed_bms(e, t_ms, &b);
+}
+
+static double remaining(const wf_est_t *e)
+{
+    wf_est_out_t o;
+    wf_est_get(e, &o);
+    return o.remaining_wh;
+}
+
+static double soc_of(const wf_est_t *e)
+{
+    wf_est_out_t o;
+    wf_est_get(e, &o);
+    return o.soc_pct;
+}
+
+/* ---- the provisional Limp Point model ---------------------------------- */
+
+/* The numbers in wfest.h's header comment, asserted rather than asserted-in-
+ * prose. If one of the provisional constants is corrected these move, and they
+ * are meant to: the failure is the notification. */
+static void test_limp_point_model(void)
+{
+    /* The line passes through the point cap0007 measured, by construction. */
+    CHECK_D(wf_est_pack_v_at_soc(WF_EST_PACK_SOC_AT_REF), WF_EST_PACK_V_AT_REF,
+            1e-9, "the line through cap0007's measured point");
+    CHECK_D(wf_est_pack_v_at_soc(100.0), WF_EST_PACK_V_FULL, 1e-9,
+            "the line at a full Pack");
+
+    /* 84.0 V is about 9 % on this line, so roughly a tenth of the Pack sits
+     * below the Limp Point and is never offered to the rider. */
+    CHECK_D(wf_est_limp_soc_pct(), 9.034, 0.01, "the Limp Point as a percentage");
+    CHECK_D(wf_est_pack_v_at_soc(wf_est_limp_soc_pct()), WF_EST_LIMP_POINT_V,
+            1e-9, "pack voltage at the Limp Point");
+
+    /* Nothing left at or below the Limp Point, and never a negative. */
+    CHECK_D(wf_est_energy_above_limp_wh(wf_est_limp_soc_pct()), 0.0, 1e-9,
+            "energy at the Limp Point");
+    CHECK_D(wf_est_energy_above_limp_wh(0.0), 0.0, 1e-9,
+            "energy at a flat Pack");
+
+    /* A full Pack, and cap0007's 66.7 %. Both quoted in wfest.h. */
+    CHECK_D(wf_est_energy_above_limp_wh(100.0), 4584.0, 2.0,
+            "energy above the Limp Point, full");
+    CHECK_D(wf_est_energy_above_limp_wh(WF_EST_PACK_SOC_AT_REF), 2729.0, 2.0,
+            "energy above the Limp Point at cap0007's 66.7 %");
+
+    /* The cross-check wfest.h claims: this line integrated over the whole Pack
+     * gives about 5.0 kWh against the ~5.2 kWh the Pack is reckoned to hold.
+     * That is 0 % to 100 %, so it includes the charge below the Limp Point. */
+    double v_mean_full = (wf_est_pack_v_at_soc(0.0) + WF_EST_PACK_V_FULL) / 2.0;
+    CHECK_D(v_mean_full * WF_EST_RATED_CAPACITY_AH, 4956.0, 5.0,
+            "the whole Pack by this line, against the ~5.2 kWh nameplate");
+}
+
+/* ---- acquisition -------------------------------------------------------- */
+
+/* Nothing to show before the BMS has spoken: no Anchor, no persisted state, no
+ * number. A screen full of confident watt-hours computed from a Pack we have
+ * not measured would be worse than a dash. */
+static void test_nothing_before_the_first_anchor(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(!o.valid, "valid before any input");
+    CHECK(!o.anchored, "anchored before any input");
+
+    for (uint32_t t = 0; t < 5000; t += SAMPLE_MS) {
+        feed_power(&e, t, 105.0, 10.0);
+    }
+    wf_est_get(&e, &o);
+    CHECK(!o.valid, "valid on Controller frames alone");
+    CHECK_U(o.power_samples, 25, "power samples integrated before the Anchor");
+}
+
+/* The one assignment there is. */
+static void test_the_first_anchor_acquires(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, 50.0);
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.valid, "not valid after the first BMS answer");
+    CHECK(o.anchored, "not anchored after the first BMS answer");
+    CHECK_D(o.coulomb_ah, 0.5 * WF_EST_RATED_CAPACITY_AH, 1e-3,
+            "the Coulomb Count acquired at 50 %");
+    CHECK_D(o.remaining_wh, wf_est_energy_above_limp_wh(50.0), 1e-3,
+            "Remaining Energy acquired at 50 %");
+    CHECK(o.anchor_fresh, "the Anchor is not fresh the moment it arrived");
+}
+
+/* ---- the sign convention ------------------------------------------------ */
+
+/* Positive line current is discharge, the Controller's own convention. The BMS
+ * reads the other way on discharge and that never comes up, because the only
+ * BMS number consumed anywhere is the State of Charge. */
+static void test_sign_convention(void)
+{
+    wf_est_t drain, regen;
+    wf_est_init(&drain, NULL);
+    wf_est_init(&regen, NULL);
+    feed_soc(&drain, 0, 50.0);
+    feed_soc(&regen, 0, 50.0);
+    double start = remaining(&drain);
+
+    /* One hour at 100 A and 100 V is 100 Ah and 10 kWh, which is more than the
+     * Pack holds - deliberately, so the direction is unmistakable. Ten seconds
+     * of it is enough to see the sign. The sample at t = 0 only starts the
+     * clock, so the ten seconds integrated are 0 to 10000 ms. */
+    for (uint32_t t = 0; t <= 10000u; t += SAMPLE_MS) {
+        feed_power(&drain, t, 100.0, 100.0);
+        feed_power(&regen, t, 100.0, -100.0);
+    }
+
+    CHECK(remaining(&drain) < start,
+          "drawing 100 A did not take Remaining Energy down");
+    CHECK(remaining(&regen) > start,
+          "regenerating 100 A did not put Remaining Energy back");
+
+    /* 100 A * 100 V for 10 s is 27.78 Wh, and the Anchor pull over 10 s is
+     * 3 % of the error, so the figures are checked loosely on the energy and
+     * tightly on nothing but the direction. */
+    wf_est_out_t o;
+    wf_est_get(&drain, &o);
+    CHECK_D(o.used_wh, 100.0 * 100.0 * 10.0 / 3600.0, 0.5,
+            "energy drawn over 10 s at 100 A and 100 V");
+    CHECK_D(o.used_ah, 100.0 * 10.0 / 3600.0, 0.01,
+            "charge drawn over 10 s at 100 A");
+    wf_est_get(&regen, &o);
+    CHECK(o.used_wh < 0.0, "regeneration counted as energy drawn");
+}
+
+/* ---- the Coulomb Count against its Anchor ------------------------------- */
+
+/* The acceptance criterion, driven for an hour of simulated riding.
+ *
+ * The current is fed in 19 % high, which is exactly the uncertainty
+ * WF_CTRL_CURRENT_LSB_PER_A actually carries - upstream says 4 LSB per amp,
+ * regression against the BMS says 4.77 - so this is the drift the Anchor
+ * exists to absorb and not an invented one. Unanchored, an hour of it puts the
+ * Coulomb Count nearly an amp-hour below the truth. Anchored, the steady-state
+ * error of a first-order tracker is the drift rate times the time constant,
+ * which is under a tenth of an amp-hour.
+ */
+static void test_the_coulomb_count_tracks_the_anchor(void)
+{
+    const double v = 100.0;
+    const double true_a = 5.0;          /* what the Pack is really giving */
+    const double seen_a = 5.0 * 1.19;   /* what the Controller's scale claims */
+    const double hours = 1.0;
+    const uint32_t end_ms = (uint32_t)(hours * 3600.0 * 1000.0);
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, 80.0);
+
+    double worst_gap_pct = 0.0;
+    for (uint32_t t = SAMPLE_MS; t <= end_ms; t += SAMPLE_MS) {
+        feed_power(&e, t, v, seen_a);
+        if (t % POLL_MS == 0) {
+            /* The BMS, telling the truth at 0.1 % resolution. */
+            double true_soc = 80.0 - (true_a * (t / 3600000.0) /
+                                      WF_EST_RATED_CAPACITY_AH) * 100.0;
+            feed_soc(&e, t, true_soc);
+            double gap = soc_of(&e) - true_soc;
+            if (gap < 0.0) {
+                gap = -gap;
+            }
+            if (gap > worst_gap_pct) {
+                worst_gap_pct = gap;
+            }
+        }
+    }
+
+    /* The Pack really lost 5 Ah, which is 10 % of 50 Ah. */
+    double true_end_soc = 70.0;
+    CHECK_D(soc_of(&e), true_end_soc, 0.5,
+            "the Coulomb Count after an hour on a 19 % high current scale");
+    CHECK(worst_gap_pct < 0.5,
+          "the Coulomb Count wandered %.3f %% from its Anchor, which is a "
+          "divergence and not a wobble", worst_gap_pct);
+
+    /* And the same hour with the Anchor withheld after acquisition, to show
+     * the assertion above is about the Anchor and not about the numbers being
+     * small. The 19 % scale error alone is worth nearly 2 % of the Pack. */
+    wf_est_t loose;
+    wf_est_init(&loose, NULL);
+    feed_soc(&loose, 0, 80.0);
+    for (uint32_t t = SAMPLE_MS; t <= end_ms; t += SAMPLE_MS) {
+        feed_power(&loose, t, v, seen_a);
+    }
+    CHECK(soc_of(&loose) < true_end_soc - 1.5,
+          "the unanchored count only drifted to %.3f %%, so this test is not "
+          "measuring what it claims", soc_of(&loose));
+}
+
+/* ---- a gap in the BMS stream -------------------------------------------- */
+
+/* A hard re-anchor on the first answer after a gap is the step the acceptance
+ * criteria forbid, so the gap is made as unkind as it can be: two minutes of
+ * silence during which the Controller reports a current that is wildly wrong,
+ * then the BMS returns and says nothing has changed. The accumulated error is
+ * over 300 Wh. The step across the return has to be a rounding error next to
+ * it, and the error still has to be gone by the end of the ride.
+ */
+static void test_a_bms_gap_produces_no_step(void)
+{
+    const double v = 100.0;
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, 80.0);
+
+    uint32_t t = SAMPLE_MS;
+    /* A minute of both streams, resting. */
+    for (; t <= 60000u; t += SAMPLE_MS) {
+        feed_power(&e, t, v, 0.0);
+        if (t % POLL_MS == 0) {
+            feed_soc(&e, t, 80.0);
+        }
+    }
+
+    /* Two minutes with the BMS gone and 100 A of nonsense on the Controller. */
+    uint32_t gap_end = t + 120000u;
+    for (; t <= gap_end; t += SAMPLE_MS) {
+        feed_power(&e, t, v, 100.0);
+    }
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(!o.anchor_fresh, "the Anchor still counts as fresh after 2 minutes");
+    CHECK(o.anchor_age_ms > WF_EST_ANCHOR_STALE_MS,
+          "the Anchor's age was not carried through the gap");
+
+    double drift_wh = wf_est_energy_above_limp_wh(80.0) - remaining(&e);
+    CHECK(drift_wh > 200.0,
+          "the gap only moved Remaining Energy by %.1f Wh, so this test is not "
+          "measuring what it claims", drift_wh);
+
+    /* The BMS comes back. */
+    double before = remaining(&e);
+    feed_soc(&e, t, 80.0);
+    CHECK_D(remaining(&e), before, 1e-9,
+            "a BMS answer moved Remaining Energy by itself");
+    feed_power(&e, t + SAMPLE_MS, v, 0.0);
+    double step = remaining(&e) - before;
+    if (step < 0.0) {
+        step = -step;
+    }
+    CHECK(step < 1.0,
+          "Remaining Energy stepped %.2f Wh when the BMS came back, against "
+          "%.1f Wh of accumulated error - that is a re-anchor, not a pull",
+          step, drift_wh);
+
+    /* Graceful is not the same as inert: half an hour later the error is gone.
+     * At rest, so nothing but the Anchor is moving the figure. */
+    uint32_t settle_end = t + 1800000u;
+    for (t += SAMPLE_MS; t <= settle_end; t += SAMPLE_MS) {
+        feed_power(&e, t, v, 0.0);
+        if (t % POLL_MS == 0) {
+            feed_soc(&e, t, 80.0);
+        }
+    }
+    CHECK_D(remaining(&e), wf_est_energy_above_limp_wh(80.0), 2.0,
+            "Remaining Energy half an hour after the gap closed");
+}
+
+/* ---- what drives an integration step ------------------------------------ */
+
+/* Only the power block's eight frame types carry a fresh pack voltage and line
+ * current, so only they may take a step. Otherwise the integration interval
+ * would be set by whichever of the other 47 types happened to arrive, and the
+ * curve would depend on arrival timing rather than on the recorded stream. */
+static void test_only_the_power_block_integrates(void)
+{
+    wf_est_t plain, noisy;
+    wf_est_init(&plain, NULL);
+    wf_est_init(&noisy, NULL);
+    feed_soc(&plain, 0, 60.0);
+    feed_soc(&noisy, 0, 60.0);
+
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+    live.power_valid    = true;
+    live.pack_v         = 100.0f;
+    live.line_current_a = 20.0f;
+
+    for (uint32_t t = SAMPLE_MS; t <= 60000u; t += SAMPLE_MS) {
+        wf_est_feed_ctrl(&plain, t, wf_ctrl_type_power[0], &live);
+        /* The same ride, with the 35 Hz of everything else interleaved. */
+        for (uint32_t k = 1; k < 7; k++) {
+            wf_est_feed_ctrl(&noisy, t - SAMPLE_MS + k * 28u,
+                             WF_CTRL_TYPE_MOTION, &live);
+        }
+        wf_est_feed_ctrl(&noisy, t, wf_ctrl_type_power[0], &live);
+    }
+
+    CHECK(memcmp(&plain, &noisy, sizeof(plain)) == 0,
+          "interleaving non-power frames changed the estimate: %.6f vs %.6f Wh",
+          remaining(&plain), remaining(&noisy));
+}
+
+/* A stalled link must not book the whole stall at the last current it saw. */
+static void test_a_long_gap_is_clamped(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, 60.0);
+    feed_power(&e, SAMPLE_MS, 100.0, 50.0);
+
+    wf_est_out_t o;
+    /* Ten minutes later, one frame. At 50 A that would be 8.3 Ah if it were
+     * believed; WF_EST_DT_MAX_MS caps it at 2 s, which is 0.028 Ah. */
+    feed_power(&e, SAMPLE_MS + 600000u, 100.0, 50.0);
+    wf_est_get(&e, &o);
+    CHECK_D(o.used_ah, 50.0 * (WF_EST_DT_MAX_MS / 1000.0) / 3600.0, 1e-6,
+            "charge booked for a ten-minute stall");
+}
+
+/* ---- determinism -------------------------------------------------------- */
+
+/* The synthesised half of the acceptance criterion; tests/host/replay.c does
+ * the same over a real recorded Capture. Same input, same state, bit for bit -
+ * memcmp and not a tolerance, because a tolerance is what this criterion is
+ * about not having. */
+static void test_the_same_input_gives_the_same_state(void)
+{
+    wf_est_t a, b;
+    wf_est_init(&a, NULL);
+    wf_est_init(&b, NULL);
+
+    for (int pass = 0; pass < 2; pass++) {
+        wf_est_t *e = pass == 0 ? &a : &b;
+        feed_soc(e, 0, 73.5);
+        for (uint32_t t = SAMPLE_MS; t <= 120000u; t += SAMPLE_MS) {
+            double amps = 12.0 + 30.0 * (double)((t / SAMPLE_MS) % 17u) / 17.0;
+            feed_power(e, t, 104.0 - amps * 0.02, amps);
+            if (t % POLL_MS == 0) {
+                feed_soc(e, t, 73.5 - (double)(t / 20000u) * 0.1);
+            }
+        }
+    }
+    CHECK(memcmp(&a, &b, sizeof(a)) == 0,
+          "two identical synthesised rides produced different state");
+}
+
+/* ---- persisted state ---------------------------------------------------- */
+
+static void test_persisted_state_round_trips(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, 42.0);
+    for (uint32_t t = SAMPLE_MS; t <= 30000u; t += SAMPLE_MS) {
+        feed_power(&e, t, 98.0, 25.0);
+    }
+
+    wf_est_persist_t saved;
+    wf_est_save(&e, &saved);
+    CHECK(saved.valid, "a ridden estimator saved as invalid");
+
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)),
+          "encoding the persisted state failed");
+    CHECK(!wf_est_persist_encode(&saved, blob, sizeof(blob) - 1),
+          "encoding into a short buffer succeeded");
+
+    wf_est_persist_t back;
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &back),
+          "decoding the persisted state failed");
+    CHECK_D(back.coulomb_ah, saved.coulomb_ah, 1e-6, "coulomb_ah round trip");
+    CHECK_D(back.remaining_wh, saved.remaining_wh, 1e-6,
+            "remaining_wh round trip");
+    CHECK_D(back.rated_capacity_ah, WF_EST_RATED_CAPACITY_AH, 1e-6,
+            "rated_capacity_ah round trip");
+
+    /* Anything else is not our blob. NVS hands back whatever is in the
+     * partition, including what an older build left there. */
+    CHECK(!wf_est_persist_decode(blob, sizeof(blob) - 1, &back),
+          "a short blob decoded");
+    blob[9] ^= 0x01;
+    CHECK(!wf_est_persist_decode(blob, sizeof(blob), &back),
+          "a blob with a flipped bit decoded");
+    blob[9] ^= 0x01;
+    blob[0] = 'X';
+    CHECK(!wf_est_persist_decode(blob, sizeof(blob), &back),
+          "a blob with the wrong magic decoded");
+}
+
+/* A restored count bridges the gap to the first BMS answer and is not itself
+ * an Anchor: the Pack may have been charged while the Monitor was off, and
+ * pulling gently toward the truth from a count that is 40 % wrong would take a
+ * quarter of an hour. So the first answer after a restore still acquires. */
+static void test_a_restored_count_is_not_an_anchor(void)
+{
+    wf_est_persist_t saved = {
+        .version           = WF_EST_PERSIST_VERSION,
+        .valid             = true,
+        .coulomb_ah        = 15.0f,
+        .remaining_wh      = 750.0f,
+        .rated_capacity_ah = (float)WF_EST_RATED_CAPACITY_AH,
+    };
+
+    wf_est_t e;
+    wf_est_init(&e, &saved);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.valid, "a restored estimator has nothing to show");
+    CHECK(!o.anchored, "a restored count was treated as an Anchor");
+    CHECK_D(o.coulomb_ah, 15.0, 1e-6, "the restored Coulomb Count");
+    CHECK_D(o.remaining_wh, 750.0, 1e-6, "the restored Remaining Energy");
+
+    /* The Pack was charged overnight. The first answer says so, and is
+     * believed at once. */
+    feed_soc(&e, 1000, 95.0);
+    wf_est_get(&e, &o);
+    CHECK(o.anchored, "the first answer after a restore did not acquire");
+    CHECK_D(o.coulomb_ah, 0.95 * WF_EST_RATED_CAPACITY_AH, 1e-3,
+            "the Coulomb Count after acquiring over a stale restore");
+
+    /* A count saved against a different Rated Capacity is a count of something
+     * else, so it is dropped rather than rescaled. */
+    saved.rated_capacity_ah = 60.0f;
+    wf_est_init(&e, &saved);
+    wf_est_get(&e, &o);
+    CHECK(!o.valid, "a count saved against 60 Ah was restored onto a 50 Ah Pack");
+
+    saved.rated_capacity_ah = (float)WF_EST_RATED_CAPACITY_AH;
+    saved.version = WF_EST_PERSIST_VERSION + 1;
+    wf_est_init(&e, &saved);
+    wf_est_get(&e, &o);
+    CHECK(!o.valid, "a count from a future version was restored");
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(void)
@@ -205,10 +689,23 @@ int main(void)
     test_line_current_is_signed();
     test_a_type_outside_the_block_changes_nothing();
 
+    test_limp_point_model();
+    test_nothing_before_the_first_anchor();
+    test_the_first_anchor_acquires();
+    test_sign_convention();
+    test_the_coulomb_count_tracks_the_anchor();
+    test_a_bms_gap_produces_no_step();
+    test_only_the_power_block_integrates();
+    test_a_long_gap_is_clamped();
+    test_the_same_input_gives_the_same_state();
+    test_persisted_state_round_trips();
+    test_a_restored_count_is_not_an_anchor();
+
     if (failures != 0) {
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");
         return 1;
     }
-    printf("unit: odometer wrap and the power block, all assertions hold\n");
+    printf("unit: odometer wrap, the power block and the estimator, "
+           "all assertions hold\n");
     return 0;
 }

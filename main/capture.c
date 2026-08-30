@@ -48,6 +48,7 @@
 #include "board.h"
 #include "capture_store.h"
 #include "daly.h"
+#include "est_store.h"
 #include "imu.h"
 #include "rtc_bm8563.h"
 
@@ -206,6 +207,10 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static cap_status_t   s_pub;              /* guarded by s_mux */
 static cap_link_ctx_t s_link[CAP_LINK_COUNT];
 static wf_ctrl_live_t s_live;             /* guarded by s_mux, see cap_live_get() */
+/* The estimation seam. Same deal as s_live: main/wfest owns the arithmetic and
+ * knows nothing about this file; this file owns the lock, the state and the
+ * clock it feeds in. See cap_est_get(). */
+static wf_est_t       s_est;              /* guarded by s_mux */
 
 static QueueHandle_t     s_queue;
 static SemaphoreHandle_t s_op_sem;        /* one GATT op in flight, on our task */
@@ -354,7 +359,7 @@ static void post_msg(uint8_t type, uint8_t link, int reason)
  * notify_sink() - so the live screen works whenever the link is up, capture
  * running or not.
  */
-static void controller_decode(const uint8_t *data, uint16_t len)
+static void controller_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
 {
     wf_ctrl_frame_t frame;
     if (!wf_ctrl_frame_parse(data, len, &frame)) {
@@ -362,7 +367,49 @@ static void controller_decode(const uint8_t *data, uint16_t len)
     }
     portENTER_CRITICAL(&s_mux);
     wf_ctrl_apply(&s_live, &frame);
+    /* Then the estimation, on the state the decode just updated. Same lock,
+     * same critical section, same argument for it being short: a couple of
+     * multiplications on a power-block frame and a list scan on everything
+     * else.
+     *
+     * The timestamp is a parameter, here as everywhere - main/wfest never
+     * reads a clock. Uptime and not capture time, because the live screen has
+     * to work while just riding, and cap_t_ms() is zero until a capture
+     * starts. */
+    wf_est_feed_ctrl(&s_est, t_ms, frame.type, &s_live);
     portEXIT_CRITICAL(&s_mux);
+}
+
+/* The Anchor. Decoded off every BMS notification whether or not a capture is
+ * running, same as the Controller side, and for the same reason: the rider's
+ * Remaining Energy must not depend on whether the ride is being recorded.
+ *
+ * Validation - a 129-byte frame and a CRC over all of it - happens outside the
+ * critical section. Only the fold is inside. */
+static void bms_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
+{
+    wf_bms_t bms;
+    if (!wf_bms_decode(data, len, &bms)) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mux);
+    wf_est_feed_bms(&s_est, t_ms, &bms);
+    portEXIT_CRITICAL(&s_mux);
+}
+
+/* Copies the estimator's state out under the lock and writes it to NVS outside
+ * it: est_store_save() does flash I/O and must not be anywhere near a critical
+ * section. Called from the capture task when a capture ends and when BLE goes
+ * down, never on a timer - see est_store.h. */
+static void est_persist(void)
+{
+    wf_est_persist_t p;
+    portENTER_CRITICAL(&s_mux);
+    wf_est_save(&s_est, &p);
+    portEXIT_CRITICAL(&s_mux);
+    if (p.valid) {
+        est_store_save(&p);
+    }
 }
 
 /* ------------------------------------------------------ notification sink */
@@ -373,13 +420,19 @@ static void notify_sink(int idx, const uint8_t *data, uint16_t len)
         len = CAP_MAX_NOTIFY;
     }
 
-    if (idx == CAP_LINK_MCU) {
-        controller_decode(data, len);
-    }
-
     /* Liveness is tracked even before the file is open, so the stale watchdog
      * has a valid baseline the moment recording starts. */
     uint32_t uptime = now_ms();
+
+    /* Decoding and estimation run off the same uptime, before anything is
+     * written: what the rider sees is not conditional on a capture running,
+     * and - per ADR-0001 - what it concludes never goes near store_write()
+     * below. */
+    if (idx == CAP_LINK_MCU) {
+        controller_decode(data, len, uptime);
+    } else if (idx == CAP_LINK_BMS) {
+        bms_decode(data, len, uptime);
+    }
 
     if (!s_rec_on) {
         portENTER_CRITICAL(&s_mux);
@@ -1193,6 +1246,9 @@ static void do_record_stop(const char *reason)
     }
     scan_end();
     refresh_store_counters();
+    /* Not into the Capture - ADR-0001 - into NVS, which is the Monitor's own
+     * scratchpad and not an archive of the ride. */
+    est_persist();
     set_state(CAP_DONE);
 
     ESP_LOGI(TAG, "capture done seq=%d frames=%" PRIu32 " dropped=%" PRIu32
@@ -1485,6 +1541,9 @@ static void do_ble_shutdown(void)
         link_drop(i);
     }
     scan_end();
+    /* The last chance: after this the links are gone and nothing else will
+     * update the estimator before the reboot the readout mode ends in. */
+    est_persist();
     s_ble_down = true;
     set_state(CAP_IDLE);
 
@@ -1659,6 +1718,14 @@ esp_err_t cap_init(void)
     memset(s_link, 0, sizeof(s_link));
     s_pub.state = CAP_IDLE;
     s_pub.seq = -1;
+
+    /* The estimator, seeded from whatever the last session left in NVS. A
+     * restored count bridges the seconds between power-on and the first BMS
+     * answer and is deliberately not treated as an Anchor - see wfest.h. When
+     * there is nothing saved, or what is saved is not ours, it starts cold and
+     * the first answer acquires. */
+    wf_est_persist_t saved;
+    wf_est_init(&s_est, est_store_load(&saved) ? &saved : NULL);
     for (int i = 0; i < CAP_LINK_COUNT; i++) {
         s_link[i].conn_handle = BLE_HS_CONN_HANDLE_NONE;
         copy_str(s_pub.link[i].name, sizeof(s_pub.link[i].name),
@@ -1850,6 +1917,19 @@ void cap_live_get(wf_ctrl_live_t *out)
     memcpy(out, &s_live, sizeof(*out));
     portEXIT_CRITICAL(&s_mux);
 }
+
+void cap_est_get(wf_est_out_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    /* wf_est_get() is a handful of loads and a divide over caller-owned state,
+     * which is short enough for the spinlock the estimator is updated under. */
+    portENTER_CRITICAL(&s_mux);
+    wf_est_get(&s_est, out);
+    portEXIT_CRITICAL(&s_mux);
+}
+
 
 esp_err_t cap_ble_shutdown(void)
 {
