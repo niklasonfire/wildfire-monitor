@@ -6,3 +6,7 @@ dependencies.lock
 .ccache/
 *.log
 !captures/*.log
+
+# host test build
+build-host/
+__pycache__/

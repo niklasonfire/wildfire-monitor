@@ -654,7 +654,7 @@ static int cmd_crc(int argc, char **argv)
         return 1;
     }
     uint16_t init = (argc >= 3) ? (uint16_t)strtol(argv[2], NULL, 0) : 0xFFFF;
-    uint16_t crc = modbus_crc16(s_buf, len, init);
+    uint16_t crc = wf_crc16(s_buf, len, init);
     printf("CRC init=0x%04x value=0x%04x le=%02x%02x be=%02x%02x\n", init, crc,
            crc & 0xff, crc >> 8, crc >> 8, crc & 0xff);
     return 0;

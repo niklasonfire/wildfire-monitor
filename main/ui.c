@@ -633,7 +633,7 @@ static const char *gear_name(uint8_t gear)
     }
 }
 
-static void draw_live(const fardriver_live_t *lv)
+static void draw_live(const wf_ctrl_live_t *lv)
 {
     if (lv->b0_valid) {
         draw_title(gear_name(lv->gear), DISP_GREEN);
@@ -790,7 +790,7 @@ static void ui_task(void *arg)
             s_last_state = (int)st.state;
             draw_bar();
             if (live) {
-                fardriver_live_t lv;
+                wf_ctrl_live_t lv;
                 cap_live_get(&lv);
                 draw_live(&lv);
             } else {

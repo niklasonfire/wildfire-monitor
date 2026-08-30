@@ -26,6 +26,11 @@ documented vendor protocol, not something bespoke to our unit.
 Payload byte numbering below is 0-based from the start of the 12-byte
 payload, i.e. payload byte 0 is frame byte 2.
 
+The CONFIRMED entries below are no longer only checked by eye: `make test`
+replays the Captures in `tests/fixtures/` through `main/wfdecode/` and asserts
+on the numbers they produce, so a change that breaks one of these decodes
+fails on a development machine instead of on the next ride.
+
 ## Decoded fields
 
 Confidence key: **CONFIRMED** - matches our own cap0006 decode, derived

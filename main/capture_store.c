@@ -463,7 +463,7 @@ esp_err_t store_begin(int64_t unix_start, const char *note,
     hdr.seq = (uint32_t)seq;
     hdr.unix_start = unix_start;
     hdr.boot_ms = s_boot_ms;
-    hdr.reserved = 0;   /* patched to duration_ms by store_end(), see below */
+    hdr.duration_ms = 0;   /* patched by store_end(), see below */
     snprintf(hdr.note, sizeof(hdr.note), "%s", note != NULL ? note : "");
 
     if (fwrite(&hdr, 1, sizeof(hdr), s_file) != sizeof(hdr)) {
@@ -580,13 +580,12 @@ esp_err_t store_end(void)
 
     xSemaphoreTake(s_file_mtx, portMAX_DELAY);
     if (s_file != NULL) {
-        /* The header has no duration field, so the reserved uint32 carries
-         * duration_ms. Patching it here is far cheaper than making the host
+        /* Patching the duration in here is far cheaper than making the host
          * walk to the last record just to learn how long the ride was; it
          * stays 0 when the bike cut power mid-capture, which is the documented
          * "unknown". */
         uint32_t duration = s_last_t_ms;
-        fseek(s_file, (long)offsetof(wflog_hdr_t, reserved), SEEK_SET);
+        fseek(s_file, (long)offsetof(wflog_hdr_t, duration_ms), SEEK_SET);
         fwrite(&duration, 1, sizeof(duration), s_file);
         fseek(s_file, 0, SEEK_END);
         fflush(s_file);
@@ -656,7 +655,7 @@ esp_err_t store_stat(int seq, store_entry_t *out)
         if (fread(&hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
             memcmp(hdr.magic, WFLOG_MAGIC, strlen(WFLOG_MAGIC)) == 0) {
             out->unix_start = hdr.unix_start;
-            out->duration_ms = hdr.reserved;
+            out->duration_ms = hdr.duration_ms;
         }
         fclose(f);
     }

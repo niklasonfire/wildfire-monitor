@@ -8,37 +8,23 @@
  * copy of the checksum would be a second place to get it wrong, so the framing
  * lives here rather than in either of them.
  *
- * Header only on purpose: two short pure functions and no state, so neither
- * caller pays for a translation unit or a link-time dependency.
+ * Header only on purpose: two short functions and no state. The checksum they
+ * use is wf_crc16() from wfdecode, which is also what verifies the responses -
+ * one implementation of Modbus CRC-16 in the whole project.
  */
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 
+#include "wfdecode/wfdecode.h"
+
 /* A request is [start, function, addr_hi, addr_lo, count_hi, count_lo,
  * crc_lo, crc_hi] - Modbus RTU with a device-specific start byte in place of
  * the slave address. */
 #define DALY_REQ_LEN        8
-#define DALY_FUNC_READ      0x03    /* read holding registers */
-#define DALY_START_D2       0xd2    /* the variant this unit answers on */
-
-/* Modbus CRC-16: init 0xFFFF, reflected polynomial 0xA001, no final xor,
- * appended least significant byte first. The Fardriver controller uses the
- * same algorithm with a different seed, which is why the initial value is a
- * parameter rather than baked in. */
-static inline uint16_t modbus_crc16(const uint8_t *data, size_t len,
-                                    uint16_t init)
-{
-    uint16_t crc = init;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++) {
-            crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
-        }
-    }
-    return crc;
-}
+#define DALY_FUNC_READ      WF_BMS_FUNC_READ
+#define DALY_START_D2       WF_BMS_LEAD  /* the variant this unit answers on */
 
 /* Fills DALY_REQ_LEN bytes at frame. Computing the checksum here rather than
  * carrying a hardcoded frame around is what makes a different register block
@@ -53,7 +39,7 @@ static inline void daly_build_request(uint8_t *frame, uint8_t start,
     frame[3] = (uint8_t)(address & 0xff);
     frame[4] = (uint8_t)(count >> 8);
     frame[5] = (uint8_t)(count & 0xff);
-    uint16_t crc = modbus_crc16(frame, 6, 0xFFFF);
+    uint16_t crc = wf_crc16(frame, 6, WF_BMS_CRC_INIT);
     frame[6] = (uint8_t)(crc & 0xff);
     frame[7] = (uint8_t)(crc >> 8);
 }

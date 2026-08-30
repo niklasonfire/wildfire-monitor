@@ -27,6 +27,25 @@ are needed.
 Override defaults via environment: `ESPPORT` (default `/dev/ttyACM0`),
 `ESPBAUD` (default `460800`), `IDF_IMAGE` (default `espressif/idf:v6.1`).
 
+## Tests
+
+```bash
+make test                     # no board, no Docker, no BLE stack
+```
+
+That builds the decoding in `main/wfdecode/` - pure C99, the same files the
+firmware compiles - with plain gcc, replays every recorded Capture in
+`tests/fixtures/` through it and asserts on what comes out: every Controller
+frame's checksum, the BMS register decode against the values that ride is known
+to have produced, and a handful of invariants any Capture has to satisfy. It
+also checks that the fixtures can still be rebuilt byte for byte from the
+console dumps they came from.
+
+Adding a Capture to the suite is a `.wfl` and a `.expect` file dropped into
+`tests/fixtures/`; the runner discovers them and needs no change. See
+`tests/fixtures/README.md`. `make fixtures` rebuilds the `.wfl` files from the
+dumps in `captures/` via `scripts/dump2wfl.py`.
+
 ## What the firmware does
 
 Stage one of the project: a BLE central that finds the two devices on the

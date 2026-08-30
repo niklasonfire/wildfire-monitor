@@ -1,0 +1,52 @@
+# What replaying cap0007.wfl has to produce. See cap0007.md for the ride.
+#
+# `name value`, compared to within +/-0.05 - half a display digit, which is the
+# precision docs/fardriver-fields.md quotes its values to. A name this harness
+# does not measure is a failure, so a typo here cannot quietly assert nothing.
+
+# Records, as counted in captures/cap0007_dump.log.
+ctrl_records      1674
+bms_records       34
+event_records     8
+marker_records    0
+telem_records     10
+imu_records       942
+dropped           0
+
+# Every Controller frame's checksum verifies (init 0x7f3c, residue 0), and
+# every BMS answer is a well-formed 129-byte 0xd2 response.
+ctrl_frames_ok    1674
+ctrl_frames_bad   0
+bms_responses_ok  34
+bms_responses_bad 0
+
+# BMS, docs/fardriver-fields.md "Daly BMS fields": the Pack sat at 105.1-105.5 V
+# and the State of Charge did not move off 66.7 % in 47 s of crawling.
+pack_v_min        105.1
+pack_v_max        105.5
+soc_pct_min       66.7
+soc_pct_max       66.7
+cell_count        28
+cell_mv_min       3750
+cell_mv_max       3772
+
+# Three readings of the same Pack that have to agree, checked per response:
+# the sum of the 28 Cells against the pack voltage register, the highest and
+# lowest Cell registers against the Cell array, and the two redundant
+# cell-count registers against each other.
+cell_sum_mismatch     0
+cell_extreme_mismatch 0
+cell_count_disagree   0
+
+# Controller. The ride never left walking pace, so the decoded speed has to
+# stay in the 4-7 km/h the notes record; 5.48 km/h is the peak of this one.
+# The wheel geometry from type 0xaf is what that speed is computed from, so it
+# is pinned too - a slip there would move every speed in the ride.
+speed_kmh_max     5.48
+rpm_max           246
+wheel_radius      12
+wheel_width       120
+wheel_ratio       70
+rate_ratio        4000
+odometer_raw      14
+gear_last         0
