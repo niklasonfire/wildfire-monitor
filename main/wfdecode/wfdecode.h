@@ -63,8 +63,21 @@ bool wf_ctrl_frame_parse(const uint8_t *data, size_t len, wf_ctrl_frame_t *out);
  * Monitor calls it from. */
 void wf_ctrl_apply(wf_ctrl_live_t *live, const wf_ctrl_frame_t *frame);
 
-/* Not in the Field Table, and deliberately: speed needs the rpm from frame
- * type 0xb0 and the wheel geometry from type 0xaf at once, which is not an
+/* True when `type` is one of the `count` types in `types`.
+ *
+ * The Controller repeats one twelve-byte layout across a block of eight frame
+ * types, and the Field Table exports each block as an array because the eight
+ * are a list and not an arithmetic run - the stride is 7 except across the
+ * last step, which is 6. Everything that has to ask "is this frame carrying
+ * the power block" or "the motion block" asks it here, so there is one loop
+ * rather than a copy of it in the decoder, the estimator and the harness.
+ *
+ *     wf_ctrl_type_in(wf_ctrl_type_power, WF_CTRL_TYPE_POWER_COUNT, type)
+ */
+bool wf_ctrl_type_in(const uint8_t *types, size_t count, uint8_t type);
+
+/* Not in the Field Table, and deliberately: speed needs the rpm from the
+ * motion block and the wheel geometry from type 0xaf at once, which is not an
  * offset and a scale. This is blackTeaDisp's own conversion, wheel
  * circumference and the rpm->km/h factor folded into one constant, kept
  * exactly as it reads there rather than re-derived, since a rounding

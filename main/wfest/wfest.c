@@ -162,18 +162,6 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
     e->restored     = true;
 }
 
-/* One of the eight frame types the Field Table says carries the power block.
- * Looked up rather than computed: the eight are not an arithmetic run. */
-static bool is_power_type(uint8_t type)
-{
-    for (int i = 0; i < WF_CTRL_TYPE_POWER_COUNT; i++) {
-        if (wf_ctrl_type_power[i] == type) {
-            return true;
-        }
-    }
-    return false;
-}
-
 void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
                       const wf_ctrl_live_t *live)
 {
@@ -183,7 +171,9 @@ void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
     e->last_t_ms    = t_ms;
     e->last_t_valid = true;
 
-    if (!is_power_type(frame_type) || !live->power_valid) {
+    if (!wf_ctrl_type_in(wf_ctrl_type_power, WF_CTRL_TYPE_POWER_COUNT,
+                         frame_type) ||
+        !live->power_valid) {
         return;
     }
 

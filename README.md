@@ -99,9 +99,12 @@ all sharing the payload prefix `0118 0000 0000 0000`. Within these, only
 payload bytes 8..9 and 10..11 (frame bytes `10..11` and `12..13`) change;
 parked they idle at -1/-2 and 0/0xffff and remain unassigned. The other 47
 types looked byte-identical for the whole parked capture, but "parked" is the
-catch: type `0xb0`'s payload bytes 6..7 carry `cur_rpm`, which reads 0 while
+catch: these eight are the `motion` group, their payload byte 0 is gear and
+the motion flags, and their bytes 6..7 carry `cur_rpm`, which reads 0 while
 stationary and so is indistinguishable from a genuinely static type in a
-parked capture alone. See `docs/field-table.md` for the Field Table
+parked capture alone. Two of the other 47 are eight-type blocks in exactly the
+same way: `0x81`+ is pack voltage and line current, and `0x82`+ is live and
+still unidentified. See `docs/field-table.md` for the Field Table
 (gear, rpm, brake, temps, odometer, and the BMS registers), the Confidence of
 each entry, and what's still open. That document is generated from
 `field-table.json`, as are both decoders - see `docs/adr/0002-*`. Confirming anything

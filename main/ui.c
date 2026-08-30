@@ -651,7 +651,7 @@ static const char *gear_name(uint8_t gear)
 
 static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
 {
-    if (lv->b0_valid) {
+    if (lv->motion_valid) {
         draw_title(gear_name(lv->gear), DISP_GREEN);
     } else {
         draw_title("--", COL_DIM);
@@ -697,7 +697,7 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
     }
     /* Two fields on one row, so neither may pad out to the right edge and both
      * keep a fixed width - only their colour moves. */
-    if (lv->b0_valid) {
+    if (lv->motion_valid) {
         FIELD(F_V4, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
         field_at(&s_field[F_V5], 2, ROW_LIVE_FLAGS, 2,
                  lv->brake_switch ? DISP_RED : COL_DIM, COL_BG, false, "BRAKE");

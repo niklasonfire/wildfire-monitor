@@ -81,20 +81,6 @@ static const metric_t *find(const metrics_t *ms, const char *name)
     return NULL;
 }
 
-/* One of the eight frame types of the power block. The Field Table exports the
- * list because the eight are not an arithmetic run - the stride is 7 except
- * for 0xab -> 0xb1, which is 6 - so there is nothing to compute and everything
- * to look up. */
-static bool is_power_type(uint8_t type)
-{
-    for (int i = 0; i < WF_CTRL_TYPE_POWER_COUNT; i++) {
-        if (wf_ctrl_type_power[i] == type) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* --------------------------------------------------------------- the run */
 
 typedef struct {
@@ -234,10 +220,13 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
             }
             r->ctrl_frames_ok++;
             wf_ctrl_apply(&r->live, &f);
-            if (r->live.b0_valid && r->live.cur_rpm > r->rpm_max) {
+            bool motion_frame = wf_ctrl_type_in(wf_ctrl_type_motion,
+                                                WF_CTRL_TYPE_MOTION_COUNT,
+                                                f.type);
+            if (r->live.motion_valid && r->live.cur_rpm > r->rpm_max) {
                 r->rpm_max = r->live.cur_rpm;
             }
-            if (r->live.speed_valid && f.type == WF_CTRL_TYPE_MOTION) {
+            if (r->live.speed_valid && motion_frame) {
                 r->speed_samples++;
                 if (r->live.cur_speed_kmh > r->speed_kmh_max) {
                     r->speed_kmh_max = r->live.cur_speed_kmh;
@@ -246,7 +235,9 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
             /* Counted per frame rather than per type: all eight carry the
              * same two fields, and what matters downstream is how often the
              * pair arrives, not which of the eight brought it. */
-            if (r->live.power_valid && is_power_type(f.type)) {
+            if (r->live.power_valid &&
+                wf_ctrl_type_in(wf_ctrl_type_power, WF_CTRL_TYPE_POWER_COUNT,
+                                f.type)) {
                 r->power_frames++;
                 if (r->live.pack_v < r->ctrl_pack_v_min) {
                     r->ctrl_pack_v_min = r->live.pack_v;
@@ -395,6 +386,10 @@ static void collect(const run_t *r, metrics_t *ms)
     }
     if (r->speed_samples > 0) {
         put(ms, "speed_kmh_max", r->speed_kmh_max);
+        /* How many times the ride produced a fresh road speed. One per frame
+         * of the motion block, so this is the rate distance is integrated at,
+         * pinned as a number: eight of the 55 types, not one. */
+        put(ms, "speed_samples", (double)r->speed_samples);
     }
     if (r->power_frames > 0) {
         put(ms, "power_frames", (double)r->power_frames);

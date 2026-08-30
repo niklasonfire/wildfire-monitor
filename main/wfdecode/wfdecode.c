@@ -38,6 +38,19 @@ bool wf_ctrl_frame_parse(const uint8_t *data, size_t len, wf_ctrl_frame_t *out)
     return true;
 }
 
+bool wf_ctrl_type_in(const uint8_t *types, size_t count, uint8_t type)
+{
+    if (types == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (types[i] == type) {
+            return true;
+        }
+    }
+    return false;
+}
+
 float wf_ctrl_speed_kmh(uint16_t rpm, uint8_t wheel_radius, uint8_t wheel_width,
                         uint8_t wheel_ratio, uint16_t rate_ratio)
 {
@@ -57,10 +70,15 @@ void wf_ctrl_apply(wf_ctrl_live_t *live, const wf_ctrl_frame_t *frame)
     wf_ctrl_fields_apply(live, frame->type, frame->payload);
 
     /* Speed is the one Controller value the Field Table cannot describe: it
-     * needs both halves, the rpm from 0xb0 and the wheel geometry from 0xaf.
-     * Whichever arrives second recomputes it. */
-    if ((frame->type == WF_CTRL_TYPE_MOTION || frame->type == WF_CTRL_TYPE_WHEEL) &&
-        live->b0_valid && live->af_valid) {
+     * needs both halves, the rpm from the motion block and the wheel geometry
+     * from 0xaf. Whichever arrives second recomputes it - and the motion block
+     * is eight frame types, so that is 5.2 Hz and not the 0.65 Hz reading one
+     * of them gave. Distance integrates this, so its staleness is a distance
+     * error. */
+    if ((wf_ctrl_type_in(wf_ctrl_type_motion, WF_CTRL_TYPE_MOTION_COUNT,
+                         frame->type) ||
+         frame->type == WF_CTRL_TYPE_WHEEL) &&
+        live->motion_valid && live->af_valid) {
         live->cur_speed_kmh = wf_ctrl_speed_kmh(live->cur_rpm,
                                                 live->wheel_radius,
                                                 live->wheel_width,

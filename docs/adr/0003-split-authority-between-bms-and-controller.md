@@ -34,6 +34,15 @@ So the Controller's stream is integrated for short-term resolution and Anchored
 to the BMS's state of charge for long-term truth. The same pattern applies to
 distance: integrated speed for resolution, Odometer as the Anchor.
 
+Speed arrives at 5.2 Hz too, from its own block of eight frame types — the same
+shape as the power block, and the same correction, found the same way. The
+Field Table declared that block at one type until #13, which had road speed
+updating every 1.5 s. Integrating a speed that stale is a distance error, and
+distance is what Consumption and Range are divided by, so the two rates being
+equal is not a coincidence worth glossing over: one sample of voltage, current
+and speed arrives together every ~193 ms, and everything below is built on that
+being one sample.
+
 We compute from raw voltage and current rather than consuming the numbers both
 devices already offer. The Controller reports its own state of charge at 1%
 resolution and its own consumption quantised to 4 Wh/km, both by unknown and

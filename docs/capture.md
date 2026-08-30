@@ -88,11 +88,11 @@ All 709 frames of `captures/mcu_frames.log` pass this.
 Parked, only payload bytes 8..9 and 10..11 of the eight live frame types move,
 and they sit at -1/-2 and 0/0xffff - idle noise. That is still true as a
 description of a parked capture, but it does not mean these are the only
-telemetry fields: `cur_rpm` lives at payload bytes 6..7 of type `0xb0` and
-simply reads 0 while parked, indistinguishable from a static field. See
-`docs/field-table.md` for the Field Table, the Confidence of each entry and
-what it's sourced from. Bytes 8..9/10..11 of `0xb0` remain genuinely
-unassigned. Assigning
+telemetry fields: `cur_rpm` lives at payload bytes 6..7 of all eight of those
+types - they are the `motion` block - and simply reads 0 while parked,
+indistinguishable from a static field. See `docs/field-table.md` for the Field
+Table, the Confidence of each entry and what it's sourced from. Bytes
+8..9/10..11 of the motion block remain genuinely unassigned. Assigning
 meaning to a field from scratch still needs a capture taken **while riding**,
 which the host-driven flow above cannot deliver, because it needs a PC on the
 serial link. That is what the standalone capture below is for.

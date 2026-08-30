@@ -10,8 +10,13 @@ produce.
 The seventh Capture, taken on 2026-08-30 (`unix_start=1788080992`,
 `note=wildfire idf v6.1`). A 47 s parking-lot ride: ignition on, both links up
 the whole time, rolling at 4-7 km/h with no marked manoeuvres. Peak decoded
-speed is 5.48 km/h, the Pack sat at 105.1-105.5 V and the State of Charge did
+speed is 5.64 km/h, the Pack sat at 105.1-105.5 V and the State of Charge did
 not move off 66.7 %.
+
+It is also the ride that caught the `motion` block being declared at one frame
+type instead of eight (#13). That peak read 5.48 km/h until then, not because
+the decoding of rpm was wrong but because seven frames in eight were being
+skipped and the fastest moment of the ride fell in one of them.
 
 This is the ride the BMS register map in `docs/field-table.md` was
 decoded from, which is why it is the fixture: everything CONFIRMED there is

@@ -39,11 +39,20 @@ cell_extreme_mismatch 0
 cell_count_disagree   0
 
 # Controller. The ride never left walking pace, so the decoded speed has to
-# stay in the 4-7 km/h the notes record; 5.48 km/h is the peak of this one.
+# stay in the 4-7 km/h the notes record; 5.64 km/h is the peak of this one.
 # The wheel geometry from type 0xaf is what that speed is computed from, so it
 # is pinned too - a slip there would move every speed in the ride.
-speed_kmh_max     5.48
-rpm_max           246
+#
+# Both of these moved in #13 and the movement is the fix, not a regression:
+# the motion block is eight frame types and the Field Table declared one, so
+# rpm was read at 0.64 Hz and the fastest moment of the ride - 253 rpm - fell
+# on one of the seven that were being ignored. speed_samples is the rate
+# itself: 237 fresh road speeds over 47 s rather than 30. Not the block's full
+# 244, because speed needs the wheel geometry from type 0xaf too and the first
+# seven motion frames of the ride arrived before it did.
+speed_kmh_max     5.64
+speed_samples     237
+rpm_max           253
 wheel_radius      12
 wheel_width       120
 wheel_ratio       70

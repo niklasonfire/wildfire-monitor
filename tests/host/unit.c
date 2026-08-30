@@ -190,8 +190,8 @@ static void test_line_current_is_signed(void)
 }
 
 /* A type outside the block must leave the power fields alone: the eight are a
- * list precisely because they are not an arithmetic run, and 0x82 sits between
- * two of them. */
+ * list precisely because they are not an arithmetic run, and 0x82 belongs to
+ * the third block, one past 0x81. */
 static void test_a_type_outside_the_block_changes_nothing(void)
 {
     wf_ctrl_live_t live;
@@ -201,6 +201,79 @@ static void test_a_type_outside_the_block_changes_nothing(void)
           "a frame we built ourselves did not parse");
     CHECK(!live.power_valid, "type 0x82 set power_valid");
     CHECK(close_to(live.pack_v, 0.0), "type 0x82 wrote pack_v %.3f", live.pack_v);
+}
+
+/* -------------------------------------------------------- the motion block */
+
+/* The mistake ADR-0002 exists to prevent, caught for the third time in #13:
+ * gear, the flags and rpm live in a block of eight frame types and the Field
+ * Table declared one of them, so everything computed from rpm - road speed,
+ * and the distance integrated from it - updated at 0.64 Hz instead of 5.17 Hz.
+ *
+ * cap0007 is what established the block, and tests/fixtures/cap0007.expect
+ * asserts the rate it produces. This asserts the decoder's half: all eight
+ * types have to write the same fields out of the same offsets, and no other
+ * type may.
+ */
+static bool apply_motion(wf_ctrl_live_t *live, uint8_t type, uint8_t byte0,
+                         uint16_t rpm)
+{
+    uint8_t payload[WF_CTRL_PAYLOAD_LEN];
+    memset(payload, 0, sizeof(payload));
+    payload[0] = byte0;
+    payload[6] = (uint8_t)(rpm & 0xff);
+    payload[7] = (uint8_t)(rpm >> 8);
+
+    uint8_t frame[WF_CTRL_FRAME_LEN];
+    make_frame(frame, type, payload);
+
+    wf_ctrl_frame_t parsed;
+    if (!wf_ctrl_frame_parse(frame, sizeof(frame), &parsed)) {
+        return false;
+    }
+    wf_ctrl_apply(live, &parsed);
+    return true;
+}
+
+static void test_motion_block_decodes_at_every_type(void)
+{
+    CHECK_U(WF_CTRL_TYPE_MOTION_COUNT, 8, "types in the motion block");
+
+    for (int i = 0; i < WF_CTRL_TYPE_MOTION_COUNT; i++) {
+        uint8_t type = wf_ctrl_type_motion[i];
+        wf_ctrl_live_t live;
+        memset(&live, 0, sizeof(live));
+
+        CHECK(!live.motion_valid, "type 0x%02x: valid before any frame", type);
+        /* 0x39: gear 2 (sport), sliding_backwards and motion both set - the
+         * value cap0007 caught at t = 4.7 s, on 0x87 and 0x8e and nowhere
+         * else, which is the gear change the single-type decode never saw. */
+        if (!apply_motion(&live, type, 0x39, 253)) {
+            CHECK(false, "type 0x%02x: a frame we built ourselves did not parse",
+                  type);
+            continue;
+        }
+        CHECK(live.motion_valid, "type 0x%02x: motion_valid not set", type);
+        CHECK_U(live.cur_rpm, 253, "cur_rpm from the motion block");
+        CHECK_U(live.gear, 2, "gear from the motion block");
+        CHECK(live.sliding_backwards, "type 0x%02x: sliding_backwards", type);
+        CHECK(live.motion, "type 0x%02x: motion", type);
+    }
+}
+
+/* The third block of eight, 0x82 0x89 0x90 0x97 0x9e 0xa5 0xac 0xb2, is live
+ * telemetry in cap0007 and the Field Table assigns it nothing. A frame from it
+ * shaped like a motion frame must therefore change nothing at all - the eight
+ * are a list because the blocks interleave, and 0x82 sits one past 0x81. */
+static void test_the_undecoded_third_block_changes_nothing(void)
+{
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+
+    CHECK(apply_motion(&live, 0x82, 0x39, 253),
+          "a frame we built ourselves did not parse");
+    CHECK(!live.motion_valid, "type 0x82 set motion_valid");
+    CHECK_U(live.cur_rpm, 0, "type 0x82 wrote cur_rpm");
 }
 
 /* ============================================================ the estimator */
@@ -536,7 +609,7 @@ static void test_only_the_power_block_integrates(void)
         /* The same ride, with the 35 Hz of everything else interleaved. */
         for (uint32_t k = 1; k < 7; k++) {
             wf_est_feed_ctrl(&noisy, t - SAMPLE_MS + k * 28u,
-                             WF_CTRL_TYPE_MOTION, &live);
+                             wf_ctrl_type_motion[0], &live);
         }
         wf_est_feed_ctrl(&noisy, t, wf_ctrl_type_power[0], &live);
     }
@@ -688,6 +761,8 @@ int main(void)
     test_power_block_decodes_at_every_type();
     test_line_current_is_signed();
     test_a_type_outside_the_block_changes_nothing();
+    test_motion_block_decodes_at_every_type();
+    test_the_undecoded_third_block_changes_nothing();
 
     test_limp_point_model();
     test_nothing_before_the_first_anchor();

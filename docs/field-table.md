@@ -9,7 +9,7 @@ None of this is our own reverse-engineering from nothing. The field offsets are 
 
 **The two key spaces are different.** A Controller field is addressed by frame type plus a 0-based byte offset into the 12-byte payload, so payload byte 0 is frame byte 2, and multi-byte values are little-endian. A BMS field is addressed by a 0-based register index into the 62 big-endian u16 registers of the `0xd2` read-holding-registers response, so register 0 is response bytes 3-4. The table carries both, and the generator emits a decoder for each.
 
-**What this table deliberately does not cover.** Two decodes are not offset-and-scale and stay hand-written in both languages, per ADR-0002: road speed, which needs the rpm from frame type `0xb0` and the wheel geometry from type `0xaf` at once, and phase current, which is 24-bit big-endian under a square root and is not decoded at all today. They are listed under "Hand-written" below so that reading this document still tells you everything the decoders produce.
+**What this table deliberately does not cover.** Two decodes are not offset-and-scale and stay hand-written in both languages, per ADR-0002: road speed, which needs the rpm from the `motion` block and the wheel geometry from type `0xaf` at once, and phase current, which is 24-bit big-endian under a square root and is not decoded at all today. They are listed under "Hand-written" below so that reading this document still tells you everything the decoders produce.
 
 ## Where this comes from
 
@@ -33,11 +33,19 @@ None of this is our own reverse-engineering from nothing. The field offsets are 
 
 ## Controller
 
-The Controller talks unprompted and cycles through all 55 frame types in order, so the link's ~35.5 Hz is shared out evenly: cap0007 carries 1674 frames in 47.1 s, and every one of the 55 types appears 30 or 31 times, which is ~0.65 Hz each. A field therefore updates as often as the block of types carrying it is wide - once per cycle if it lives at one type, eight times per cycle for the power block below. Each group carries its own "seen at least once" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.
+The Controller talks unprompted and cycles through all 55 frame types in order, so the link's ~35.5 Hz is shared out evenly: cap0007 carries 1674 frames in 47.1 s, and every one of the 55 types appears 30 or 31 times, which is ~0.65 Hz each. A field therefore updates as often as the block of types carrying it is wide - once per cycle at ~0.65 Hz if it lives at one type, eight times per cycle at ~5.2 Hz if it lives in a block.
+
+**There are exactly three blocks of eight**, and they are neighbours: `0x80+k, 0x87+k, 0x8e+k, 0x95+k, 0x9c+k, 0xa3+k, 0xaa+k, 0xb0+k` for k = 0, 1 and 2, which is the `motion` block, the `power` block and a third that is not decoded at all. That was established by grouping every one of cap0007's 1674 frames by type and comparing the twelve payload bytes: the members of a block carry the same layout and move together, and k = 3 and beyond do not - `0x83`, `0x8a`, `0x91`, `0x98`, `0x9f`, `0xa6`, `0xad` and `0xb3` have eight different payloads and nothing in common. The four single-type groups below were checked the same way and each is genuinely alone: no other type in the Capture ever carries the payload `0xaf`, `0xb5`, `0xb3` or `0x94` carries.
+
+Each group carries its own "seen at least once" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.
 
 | Frame type | Group | What it carries |
 | --- | --- | --- |
-| `0xb0` | motion | Gear, the two motion flags, the brake switch and rpm, once per 55-type cycle - ~0.65 Hz, not the 35 Hz an earlier version of this note claimed. Road speed is computed from this group's rpm, so speed updates at that rate too. |
+| `0x80`, `0x87`, `0x8e`, `0x95`, `0x9c`, `0xa3`, `0xaa`, `0xb0` | motion | Gear, the two motion flags, the brake switch and rpm. **This group was declared as `0xb0` alone until #13**, which is the third time the mistake ADR-0002 exists to prevent has been found: upstream implements one of the Controller's three eight-type blocks, and the transcription inherited the gap. All eight types carry the same twelve bytes, measured against cap0007 - payload byte 0 takes its values from the same small set in every one of them, and `cur_rpm` at bytes 6-7 spans 0 to 243-253 in every one. Together they are 244 frames in 47.1 s, **5.17 Hz**, against 0.64 Hz for `0xb0` by itself.
+
+What the missing seven cost is measurable rather than theoretical. Gear went to sport for 400 ms at t = 4.7 s in cap0007, and it appears in `0x87` and `0x8e` and in no other frame of the ride - the single-type decode did not see that gear change at all. Worst-case staleness on rpm falls from 1.66 s to 0.32 s.
+
+Road speed is computed from this group's rpm, so speed updates at 5.2 Hz too - which is what #13's integrated distance rests on: integrating a speed that could be a second and a half old would put that error into every kilometre and into the Consumption and Range figures under it. |
 | `0x81`, `0x88`, `0x8f`, `0x96`, `0x9d`, `0xa4`, `0xab`, `0xb1` | power | Pack voltage and line current, and the reason the Field Table has to be able to say "one field, several frame types": these eight types all carry the same twelve-byte layout, and in cap0007 all eight read the same voltage to a tenth of a volt across the whole ride. The types step by 7 except for the last, `0xab` -> `0xb1`, which steps by 6 - the block does not divide the 55-type cycle evenly, so the eight are listed rather than generated from a stride. Eight types out of 55 is eight samples per cycle: 244 frames in 47.1 s of cap0007, **5.2 Hz**. That is 8x anything else the Controller sends and ~5x the BMS's ~1 Hz poll, which is what ADR-0003's split of authority rests on - but it is not the 35 Hz that ADR was originally written with, and #17's internal-resistance estimate from load steps has to be designed for 5 Hz. |
 | `0xaf` | wheel | Wheel geometry and the gearing constant. Static configuration rather than telemetry, but it only arrives on the link, so nothing can compute speed until one of these has been seen. |
 | `0xb5` | temp | Motor temperature. |
@@ -56,11 +64,11 @@ Numbers the decoding needs that are not a field: each is declared once here, gen
 
 | Frame type | Payload byte | Width | Endian | Signed | Mask/shift | Bias/scale | Unit | Field | Confidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `0xb0` | 0 | 1 byte | - | no | `& 0x0c` `>> 2` | - | - | `gear` | consistent |
-| `0xb0` | 0 | 1 byte | - | no | `& 0x10` `>> 4` | - | - | `sliding_backwards` | trusted |
-| `0xb0` | 0 | 1 byte | - | no | `& 0x20` `>> 5` | - | - | `motion` | trusted |
-| `0xb0` | 3 | 1 byte | - | no | `& 0x80` `>> 7` | - | - | `brake_switch` | trusted |
-| `0xb0` | 6-7 | 2 bytes | little | no | - | - | rpm | `cur_rpm` | consistent |
+| `motion` | 0 | 1 byte | - | no | `& 0x0c` `>> 2` | - | - | `gear` | consistent |
+| `motion` | 0 | 1 byte | - | no | `& 0x10` `>> 4` | - | - | `sliding_backwards` | trusted |
+| `motion` | 0 | 1 byte | - | no | `& 0x20` `>> 5` | - | - | `motion` | trusted |
+| `motion` | 3 | 1 byte | - | no | `& 0x80` `>> 7` | - | - | `brake_switch` | trusted |
+| `motion` | 6-7 | 2 bytes | little | no | - | - | rpm | `cur_rpm` | consistent |
 | `power` | 0-1 | 2 bytes | little | no | - | x 0.1 | V | `pack_v` | consistent |
 | `power` | 4-5 | 2 bytes | little | yes | - | / `WF_CTRL_CURRENT_LSB_PER_A` | A | `line_current_a` | consistent |
 | `0xaf` | 4 | 1 byte | - | no | - | - | - | `wheel_ratio` | consistent |
@@ -84,7 +92,7 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **`brake_switch`** (taken on trust from elsewhere) - The brake lever switch, per blackTeaDisp - and cap0007 argues against it. The bit reads 1 for the whole 47 s of that ride, including while the bike is moving at 5 km/h, which is not what a brake lever does. So either the polarity is inverted, or this bit is not the brake at all. Kept in the table at trusted rather than dropped, because it is what upstream reads, but it should not go on a screen until a Capture with a marked brake pull says which.
 
-**`cur_rpm`** (consistent with our own Captures) - Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent. cap0007 peaks at 246 rpm, which through the speed formula is 5.5 km/h, against ride notes of a 4-7 km/h parking-lot crawl. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone.
+**`cur_rpm`** (consistent with our own Captures) - Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent - then, in #13, caused it a second time, because the entry was here but declared at one frame type out of the eight that carry it. cap0007 peaks at 253 rpm across the whole block, which through the speed formula is 5.6 km/h, against ride notes of a 4-7 km/h parking-lot crawl; reading `0xb0` alone the peak was 246, because the fastest moment of the ride landed on one of the other seven. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone.
 
 **`pack_v`** (consistent with our own Captures) - Pack voltage as the Controller measures it - the same quantity the BMS reports in register 40, from a second instrument on the same Pack, which is what makes this the best-corroborated entry in the whole table. Across cap0007 all eight types of the power block read 105.0-105.5 V, and the BMS's own `pack_v` reads 105.1-105.5 V over the same 47 s. Compared response by response, the two devices are never further apart than 0.30 V and average 0.09 V; `make test` asserts that gap stays under 2 V for any Capture that carries both, so a slipped offset on either side shows up as a device disagreement rather than as a plausible number. Consistent rather than proven all the same: two devices agreeing is not a meter, and no meter has been on this Pack.
 
@@ -110,7 +118,7 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **`speed_valid`** (`bool`) - True once both halves of the speed calculation have arrived and rate_ratio is non-zero.
 
-**`cur_speed_kmh`** (`float`) - Road speed. Not in the Field Table and not generated, because it is not offset-and-scale: it needs cur_rpm from frame type 0xb0 and all four geometry bytes from type 0xaf at the same time, so it is recomputed by hand in wf_ctrl_apply() whenever either half arrives. The constant in wf_ctrl_speed_kmh() is blackTeaDisp's wheel circumference and rpm-to-km/h factor folded together, kept exactly as it reads there - a rounding "improvement" would stop matching the dashboard this bike was designed to be read by.
+**`cur_speed_kmh`** (`float`) - Road speed. Not in the Field Table and not generated, because it is not offset-and-scale: it needs cur_rpm from any of the motion block's eight frame types and all four geometry bytes from type 0xaf at the same time, so it is recomputed by hand in wf_ctrl_apply() whenever either half arrives. The constant in wf_ctrl_speed_kmh() is blackTeaDisp's wheel circumference and rpm-to-km/h factor folded together, kept exactly as it reads there - a rounding "improvement" would stop matching the dashboard this bike was designed to be read by.
 
 ### Not decoded
 
@@ -118,7 +126,9 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **payload bytes 2-3 and 6-11 of the power block** - The eight types of the power block carry more than pack voltage and line current. Bytes 8-9 and 10-11 are the pair the appendix below describes as the only thing moving in a parked Capture, idling at -1/-2 and 0/0xffff; phase current is one of the things in here, and is listed separately. Nothing in this range is assigned.
 
-**payload bytes 8-9 and 10-11 of type 0xb0** - Genuinely unassigned. They are not rate_ratio, not odometer_raw and not anything else in this table.
+**payload bytes 8-9 and 10-11 of the motion block** - Genuinely unassigned. They are not rate_ratio, not odometer_raw and not anything else in this table. Parked they idle at -1/-2 and 0/0xffff, which is what README.md and docs/capture.md describe.
+
+**the third block of eight, 0x82 0x89 0x90 0x97 0x9e 0xa5 0xac 0xb2** - The Controller's third eight-type block, found by the same grouping of cap0007 that corrected the `motion` block in #13, and assigned nothing at all. Payload byte 0 reads a constant 35, byte 3 runs 21-25 and byte 2 moves over almost its whole range between consecutive frames, so it is live telemetry at 5.2 Hz rather than configuration - the only other signal this bike sends that fast. Not in the table because no upstream source names it and nothing in it has been identified; it is written down here so that the next person looks at it rather than rediscovering the block.
 
 **type 0x8b** - Unknown here and unimplemented upstream too.
 
@@ -187,11 +197,15 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 ## Correction to docs/capture.md and README.md
 
-Both documents say the only fields that move in a parked Capture are payload bytes 8-9 and 10-11 of the eight live frame types, idling at -1/-2 and 0/0xffff. That observation still stands as a description of what was captured, but the conclusion drawn from it needed correcting: **cur_rpm lives at payload bytes 6-7 of type `0xb0`, not 8-9/10-11.** Parked, rpm is 0, which is byte-identical to the 47 truly static types and so did not register as "live" in that Capture at all. It is not that rpm is one of the unexplained moving fields; it is that a stationary bike cannot distinguish "live but currently zero" from "static".
+Both documents say the only fields that move in a parked Capture are payload bytes 8-9 and 10-11 of the eight live frame types `0x80 0x87 0x8e 0x95 0x9c 0xa3 0xaa 0xb0`, idling at -1/-2 and 0/0xffff. That observation still stands as a description of what was captured, but the conclusion drawn from it needed correcting twice.
 
-The same explains why `0xaf`, `0xb5`, `0xb3`, `0x94` and `0x8b` never showed up in the "every 7th type is live" pattern: wheel configuration, temperatures and the Odometer all change far too slowly for a short parked Capture to tell them apart from the genuinely static types. They are live telemetry, just not on that timescale.
+**First: cur_rpm lives at payload bytes 6-7, not 8-9/10-11.** Parked, rpm is 0, which is byte-identical to the truly static types and so did not register as "live" in that Capture at all. It is not that rpm is one of the unexplained moving fields; it is that a stationary bike cannot distinguish "live but currently zero" from "static".
 
-Those "eight live frame types" now have a name: they are the `power` group, `0x81 0x88 0x8f 0x96 0x9d 0xa4 0xab 0xb1`, and payload bytes 0-1 and 4-5 of each are pack voltage and line current. Parked, voltage is steady and current is zero, so neither registered as moving in that Capture either - the same blind spot, for the same reason.
+**Second, and this one cost a whole ticket: those eight types are the `motion` group, all of them.** The Field Table declared the group at `0xb0` alone until #13, so gear, the flags, rpm and the road speed computed from it updated at 0.64 Hz when the bike was sending them at 5.17 Hz. The document that first described this bike had the eight types written down correctly - the transcription into the table did not.
+
+The same blind spot explains why `0xaf`, `0xb5`, `0xb3`, `0x94` and `0x8b` never showed up in the "every 7th type is live" pattern: wheel configuration, temperatures and the Odometer all change far too slowly for a short parked Capture to tell them apart from the genuinely static types. They are live telemetry, just not on that timescale.
+
+And there is a second eight-type block hiding in the same place, the `power` group `0x81 0x88 0x8f 0x96 0x9d 0xa4 0xab 0xb1`, whose payload bytes 0-1 and 4-5 are pack voltage and line current. Parked, voltage is steady and current is zero, so neither registered as moving in that Capture either - the same blind spot, for the same reason. A third block, `0x82 0x89 0x90 0x97 0x9e 0xa5 0xac 0xb2`, is live too and is not decoded; see Not decoded above.
 
 ## The BMS `a5` command set - not in the Field Table
 
