@@ -95,14 +95,24 @@ static const char *TAG = "ui";
 #define ERR_COLS       22           /* scale 1 fills the width exactly */
 #define ERR_LINES      4
 
-/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V5, same
- * as every other per-state screen - see the F_V slot comment above. */
-#define ROW_LIVE_SPEED  70
-#define ROW_LIVE_RPM    100
-#define ROW_LIVE_BRAKE  120
-#define ROW_LIVE_MOTION 138
-#define ROW_LIVE_TEMP   158
-#define ROW_LIVE_ODO    178
+/* Live screen: gear borrows the title row, the rest reuses F_V0..F_V7, same
+ * as every other per-state screen - see the F_V slot comment above.
+ *
+ * Pack voltage and line current sit directly under speed, above rpm, because
+ * they are what says mid-ride whether the Capture is worth anything: a Pack
+ * voltage that has gone flat or a current stuck at zero means the ride is
+ * being wasted, and a ride costs far more than a glance. The Odometer is the
+ * other way round - reference material, read once at a landmark and never
+ * while moving - so it is the one row demoted to scale 1, which is what makes
+ * room for the two new ones. */
+#define ROW_LIVE_SPEED  70          /* scale 3 */
+#define ROW_LIVE_VOLTS  98          /* scale 2 from here down... */
+#define ROW_LIVE_AMPS   116
+#define ROW_LIVE_RPM    134
+#define ROW_LIVE_BRAKE  152
+#define ROW_LIVE_MOTION 170
+#define ROW_LIVE_TEMP   188
+#define ROW_LIVE_ODO    208         /* ...except this one, scale 1 */
 
 #define MSG_TITLE_Y    16
 #define MSG_SEP_Y      44
@@ -144,7 +154,7 @@ typedef struct {
 enum {
     F_CLOCK = 0, F_BATT, F_BATT_MV,
     F_TITLE, F_LINK1, F_LINK2, F_SUB1, F_SUB2,
-    F_V0, F_V1, F_V2, F_V3, F_V4, F_V5, F_V6,
+    F_V0, F_V1, F_V2, F_V3, F_V4, F_V5, F_V6, F_V7,
     F_COUNT
 };
 
@@ -646,26 +656,39 @@ static void draw_live(const wf_ctrl_live_t *lv)
     } else {
         FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_DIM, "%s", "-- KM/H");
     }
+    /* The power block, from any of its eight frame types. One decimal on the
+     * volts because that is the resolution the field has; one on the amps
+     * because the scale behind them is still unsettled by 19 % (see
+     * WF_CTRL_CURRENT_LSB_PER_A) and a second decimal would be a precision
+     * this number does not have. The sign is the Controller's own, positive
+     * while the Pack is being drawn from. */
+    if (lv->power_valid) {
+        FIELD(F_V1, 2, ROW_LIVE_VOLTS, 2, COL_VALUE, "%.1f V", lv->pack_v);
+        FIELD(F_V2, 2, ROW_LIVE_AMPS, 2, COL_VALUE, "%+.1f A", lv->line_current_a);
+    } else {
+        FIELD(F_V1, 2, ROW_LIVE_VOLTS, 2, COL_DIM, "%s", "-- V");
+        FIELD(F_V2, 2, ROW_LIVE_AMPS, 2, COL_DIM, "%s", "-- A");
+    }
     if (lv->b0_valid) {
-        FIELD(F_V1, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
-        FIELD(F_V2, 2, ROW_LIVE_BRAKE, 2, lv->brake_switch ? DISP_RED : COL_DIM,
+        FIELD(F_V3, 2, ROW_LIVE_RPM, 2, COL_VALUE, "%u RPM", lv->cur_rpm);
+        FIELD(F_V4, 2, ROW_LIVE_BRAKE, 2, lv->brake_switch ? DISP_RED : COL_DIM,
               "BRAKE %s", lv->brake_switch ? "ON" : "off");
-        FIELD(F_V3, 2, ROW_LIVE_MOTION, 2, lv->motion ? DISP_GREEN : COL_DIM,
+        FIELD(F_V5, 2, ROW_LIVE_MOTION, 2, lv->motion ? DISP_GREEN : COL_DIM,
               "MOVING %s", lv->motion ? "yes" : "no");
     } else {
-        FIELD(F_V1, 2, ROW_LIVE_RPM, 2, COL_DIM, "%s", "-- RPM");
-        FIELD(F_V2, 2, ROW_LIVE_BRAKE, 2, COL_DIM, "%s", "BRAKE --");
-        FIELD(F_V3, 2, ROW_LIVE_MOTION, 2, COL_DIM, "%s", "MOVING --");
+        FIELD(F_V3, 2, ROW_LIVE_RPM, 2, COL_DIM, "%s", "-- RPM");
+        FIELD(F_V4, 2, ROW_LIVE_BRAKE, 2, COL_DIM, "%s", "BRAKE --");
+        FIELD(F_V5, 2, ROW_LIVE_MOTION, 2, COL_DIM, "%s", "MOVING --");
     }
     if (lv->b5_valid) {
-        FIELD(F_V4, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
+        FIELD(F_V6, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
     } else {
-        FIELD(F_V4, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
+        FIELD(F_V6, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
     }
     if (lv->odo_valid) {
-        FIELD(F_V5, 2, ROW_LIVE_ODO, 2, COL_DIM, "ODO %u", lv->odometer_raw);
+        FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %u", lv->odometer_raw);
     } else {
-        FIELD(F_V5, 2, ROW_LIVE_ODO, 2, COL_DIM, "%s", "ODO --");
+        FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
     }
     draw_hint("PWR: BACK");
 }

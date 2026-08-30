@@ -33,15 +33,22 @@ None of this is our own reverse-engineering from nothing. The field offsets are 
 
 ## Controller
 
-The Controller talks unprompted and cycles through 55 frame types, so the types arrive at wildly different rates - `0xb0` at the link's full ~35.5 Hz, `0xaf`, `0xb5`, `0xb3` and `0x94` far slower. Each group below therefore carries its own "seen at least once" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.
+The Controller talks unprompted and cycles through all 55 frame types in order, so the link's ~35.5 Hz is shared out evenly: cap0007 carries 1674 frames in 47.1 s, and every one of the 55 types appears 30 or 31 times, which is ~0.65 Hz each. A field therefore updates as often as the block of types carrying it is wide - once per cycle if it lives at one type, eight times per cycle for the power block below. Each group carries its own "seen at least once" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.
 
 | Frame type | Group | What it carries |
 | --- | --- | --- |
-| `0xb0` | motion | The fast one: gear, the two motion flags, the brake switch and rpm, roughly 35 times a second. |
+| `0xb0` | motion | Gear, the two motion flags, the brake switch and rpm, once per 55-type cycle - ~0.65 Hz, not the 35 Hz an earlier version of this note claimed. Road speed is computed from this group's rpm, so speed updates at that rate too. |
+| `0x81`, `0x88`, `0x8f`, `0x96`, `0x9d`, `0xa4`, `0xab`, `0xb1` | power | Pack voltage and line current, and the reason the Field Table has to be able to say "one field, several frame types": these eight types all carry the same twelve-byte layout, and in cap0007 all eight read the same voltage to a tenth of a volt across the whole ride. The types step by 7 except for the last, `0xab` -> `0xb1`, which steps by 6 - the block does not divide the 55-type cycle evenly, so the eight are listed rather than generated from a stride. Eight types out of 55 is eight samples per cycle: 244 frames in 47.1 s of cap0007, **5.2 Hz**. That is 8x anything else the Controller sends and ~5x the BMS's ~1 Hz poll, which is what ADR-0003's split of authority rests on - but it is not the 35 Hz that ADR was originally written with, and #17's internal-resistance estimate from load steps has to be designed for 5 Hz. |
 | `0xaf` | wheel | Wheel geometry and the gearing constant. Static configuration rather than telemetry, but it only arrives on the link, so nothing can compute speed until one of these has been seen. |
 | `0xb5` | temp | Motor temperature. |
 | `0xb3` | ctrl_temp | Controller temperature, and the least trustworthy group in the table - see the note on the field itself. |
 | `0x94` | odo | The Odometer, which Anchors distance: coarse and it wraps, but it does not drift. |
+
+### Constants
+
+Numbers the decoding needs that are not a field: each is declared once here, generated into both decoders under the name below, and corrected in one place.
+
+**`WF_CTRL_CURRENT_LSB_PER_A`** = 4 - How many raw counts of `line_current_a` make one amp, and the single most consequential unmeasured number in this project - ADR-0003 makes it the gain on every watt-hour ever counted, so its error propagates undiminished into range. **Two candidates, 19 % apart, and this table has picked neither.** Upstream sources say 4 LSB per amp; a regression of our own Controller current against the BMS's says 4.77. cap0007 cannot decide between them: its peak of 35 raw is 8.75 A at 4 and 7.34 A at 4.77, and the BMS read -5.1 A at that moment, but the BMS's poll lag is not removed from that comparison, so it separates nothing. The value here is 4 because it is the upstream number and because an integer divisor is exact in both a C float and a Python double, which keeps the two generated decoders agreeing digit for digit - not because it is more likely to be right. Ride 1, the calibration ride, closes this by fitting integrated current against the BMS's own State of Charge delta over a whole ride; it is tracked as issue #12. Correct it here and every decoder, the document and the live screen follow.
 
 ### Fields
 
@@ -52,6 +59,8 @@ The Controller talks unprompted and cycles through 55 frame types, so the types 
 | `0xb0` | 0 | 1 byte | - | no | `& 0x20` `>> 5` | - | - | `motion` | trusted |
 | `0xb0` | 3 | 1 byte | - | no | `& 0x80` `>> 7` | - | - | `brake_switch` | trusted |
 | `0xb0` | 6-7 | 2 bytes | little | no | - | - | rpm | `cur_rpm` | consistent |
+| `power` | 0-1 | 2 bytes | little | no | - | x 0.1 | V | `pack_v` | consistent |
+| `power` | 4-5 | 2 bytes | little | yes | - | / `WF_CTRL_CURRENT_LSB_PER_A` | A | `line_current_a` | consistent |
 | `0xaf` | 4 | 1 byte | - | no | - | - | - | `wheel_ratio` | consistent |
 | `0xaf` | 5 | 1 byte | - | no | - | - | inch | `wheel_radius` | consistent |
 | `0xaf` | 6 | 1 byte | - | no | - | - | km/h | `avg_speed_kmh` | trusted |
@@ -61,7 +70,7 @@ The Controller talks unprompted and cycles through 55 frame types, so the types 
 | `0xb3` | 10 | 1 byte | - | yes | - | - | C | `controller_temp` | trusted |
 | `0x94` | 8-9 | 2 bytes | little | no | - | - | - | `odometer_raw` | trusted |
 
-Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before the bias where the Signed column says so. A `-` in the Bias/scale column means the raw number is the value.
+Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before the bias where the Signed column says so. A `-` in the Bias/scale column means the raw number is the value; a `/ NAME` there means the scale is one over the constant of that name above, which is how a factor nobody has measured yet stays a single number in a single place.
 
 ### What each field is, and how far it is trusted
 
@@ -74,6 +83,10 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 **`brake_switch`** (taken on trust from elsewhere) - The brake lever switch, per blackTeaDisp - and cap0007 argues against it. The bit reads 1 for the whole 47 s of that ride, including while the bike is moving at 5 km/h, which is not what a brake lever does. So either the polarity is inverted, or this bit is not the brake at all. Kept in the table at trusted rather than dropped, because it is what upstream reads, but it should not go on a screen until a Capture with a marked brake pull says which.
 
 **`cur_rpm`** (consistent with our own Captures) - Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent. cap0007 peaks at 246 rpm, which through the speed formula is 5.5 km/h, against ride notes of a 4-7 km/h parking-lot crawl. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone.
+
+**`pack_v`** (consistent with our own Captures) - Pack voltage as the Controller measures it - the same quantity the BMS reports in register 40, from a second instrument on the same Pack, which is what makes this the best-corroborated entry in the whole table. Across cap0007 all eight types of the power block read 105.0-105.5 V, and the BMS's own `pack_v` reads 105.1-105.5 V over the same 47 s. Compared response by response, the two devices are never further apart than 0.30 V and average 0.09 V; `make test` asserts that gap stays under 2 V for any Capture that carries both, so a slipped offset on either side shows up as a device disagreement rather than as a plausible number. Consistent rather than proven all the same: two devices agreeing is not a meter, and no meter has been on this Pack.
+
+**`line_current_a`** (consistent with our own Captures) - Line current, signed, positive while the Pack is being drawn from. Across cap0007 the raw value runs -1..35, which is -0.25..8.75 A at the constant as it stands, and it tracks the ride: flat zero while parked, rising through 19, 27, 35 as the bike pulls away and falling back as it coasts. **The sign is inverted relative to the BMS.** At the moment the Controller peaks at +35 the BMS reads -5.1 A, and the BMS's own note calls positive discharge - so exactly one of the two is the wrong way round and this table does not yet know which. The Controller's polarity is the one shown on the live screen, because reading positive under load is what a rider expects; #12 settles which convention is right at the same time as it settles the scale. **The scale is genuinely open** - see `WF_CTRL_CURRENT_LSB_PER_A`, which is where both candidates and the 19 % between them are written down. Consistent means the shape of this signal matches the ride, not that its gain is known.
 
 **`wheel_ratio`** (consistent with our own Captures) - Tyre aspect ratio. cap0007 reads 70.
 
@@ -101,6 +114,8 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **phase_current** - 24-bit big-endian under a square root. Not decoded today in either language, and ADR-0002 says it stays hand-written when it is, rather than growing the table a syntax for it.
 
+**payload bytes 2-3 and 6-11 of the power block** - The eight types of the power block carry more than pack voltage and line current. Bytes 8-9 and 10-11 are the pair the appendix below describes as the only thing moving in a parked Capture, idling at -1/-2 and 0/0xffff; phase current is one of the things in here, and is listed separately. Nothing in this range is assigned.
+
 **payload bytes 8-9 and 10-11 of type 0xb0** - Genuinely unassigned. They are not rate_ratio, not odometer_raw and not anything else in this table.
 
 **type 0x8b** - Unknown here and unimplemented upstream too.
@@ -108,6 +123,12 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 ## BMS
 
 The BMS answers only when asked, over the `0xd2` Modbus read-holding-registers variant - a different framing entirely from the `a5`-command set in the appendix, and unrelated to it. The Monitor writes an 8-byte request `d2 03 <addr_hi> <addr_lo> <count_hi> <count_lo> <crc_lo> <crc_hi>` to handle `0xfff2` asking for 62 registers from address 0, and gets back 129 bytes: `d2 03 7c <124 bytes, 62 big-endian u16 registers> <crc_lo> <crc_hi>`, where `0x7c` = 124 = 2 x 62. Every register index below is 0-based into those 62 u16s. The whole map was decoded from cap0007, a 47 s parking-lot ride, which is why nothing here is worse than "consistent with our own Captures" and nothing is better either.
+
+### Constants
+
+Numbers the decoding needs that are not a field: each is declared once here, generated into both decoders under the name below, and corrected in one place.
+
+**`WF_BMS_MAX_REGS`** = 62 - How many registers the Monitor's poll asks for, which is what fixes the response length. Not a property of the fields.
 
 ### Fields
 
@@ -124,7 +145,7 @@ The BMS answers only when asked, over the `0xd2` Modbus read-holding-registers v
 | `d2` | 46 | u16 | big | no | - | -40 | C | `temp_lo_c` | consistent |
 | `d2` | 55 | u16 | big | no | - | - | mV | `avg_cell_mv` | consistent |
 
-Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before the bias where the Signed column says so. A `-` in the Bias/scale column means the raw number is the value.
+Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before the bias where the Signed column says so. A `-` in the Bias/scale column means the raw number is the value; a `/ NAME` there means the scale is one over the constant of that name above, which is how a factor nobody has measured yet stays a single number in a single place.
 
 ### What each field is, and how far it is trusted
 
@@ -167,6 +188,8 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 Both documents say the only fields that move in a parked Capture are payload bytes 8-9 and 10-11 of the eight live frame types, idling at -1/-2 and 0/0xffff. That observation still stands as a description of what was captured, but the conclusion drawn from it needed correcting: **cur_rpm lives at payload bytes 6-7 of type `0xb0`, not 8-9/10-11.** Parked, rpm is 0, which is byte-identical to the 47 truly static types and so did not register as "live" in that Capture at all. It is not that rpm is one of the unexplained moving fields; it is that a stationary bike cannot distinguish "live but currently zero" from "static".
 
 The same explains why `0xaf`, `0xb5`, `0xb3`, `0x94` and `0x8b` never showed up in the "every 7th type is live" pattern: wheel configuration, temperatures and the Odometer all change far too slowly for a short parked Capture to tell them apart from the genuinely static types. They are live telemetry, just not on that timescale.
+
+Those "eight live frame types" now have a name: they are the `power` group, `0x81 0x88 0x8f 0x96 0x9d 0xa4 0xab 0xb1`, and payload bytes 0-1 and 4-5 of each are pack voltage and line current. Parked, voltage is steady and current is zero, so neither registered as moving in that Capture either - the same blind spot, for the same reason.
 
 ## The BMS `a5` command set - not in the Field Table
 

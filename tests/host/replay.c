@@ -72,6 +72,20 @@ static const metric_t *find(const metrics_t *ms, const char *name)
     return NULL;
 }
 
+/* One of the eight frame types of the power block. The Field Table exports the
+ * list because the eight are not an arithmetic run - the stride is 7 except
+ * for 0xab -> 0xb1, which is 6 - so there is nothing to compute and everything
+ * to look up. */
+static bool is_power_type(uint8_t type)
+{
+    for (int i = 0; i < WF_CTRL_TYPE_POWER_COUNT; i++) {
+        if (wf_ctrl_type_power[i] == type) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* --------------------------------------------------------------- the run */
 
 typedef struct {
@@ -86,6 +100,12 @@ typedef struct {
     unsigned rpm_max;
     double   speed_kmh_max;
     long     speed_samples;
+    /* The power block: pack voltage and line current, eight of the 55 frame
+     * types, and the only Controller telemetry fast enough for ADR-0003's
+     * split of authority to mean anything. */
+    long     power_frames;
+    double   ctrl_pack_v_min, ctrl_pack_v_max;
+    double   ctrl_current_a_min, ctrl_current_a_max;
     /* BMS */
     double   pack_v_min, pack_v_max;
     double   soc_pct_min, soc_pct_max;
@@ -99,6 +119,13 @@ typedef struct {
     long     cell_sum_mismatch;      /* reg 40 vs the sum of reg 0-27 */
     long     cell_extreme_mismatch;  /* reg 43/44 vs the extremes of reg 0-27 */
     long     cell_count_disagree;    /* reg 49 vs reg 51 */
+    /* The one cross-device check there is: the Controller and the BMS measure
+     * the same Pack with separate instruments, so the largest gap between
+     * their two pack voltages is the strongest evidence either decode is
+     * right. Sampled at every BMS response, against whatever the Controller
+     * last said. */
+    double   pack_v_device_gap_max;
+    long     pack_v_device_samples;
     long     dropped_last;
     uint32_t duration_ms;
 } run_t;
@@ -108,6 +135,8 @@ static void run_init(run_t *r)
     memset(r, 0, sizeof(*r));
     r->pack_v_min = r->soc_pct_min = r->current_a_min = 1e9;
     r->pack_v_max = r->soc_pct_max = r->current_a_max = -1e9;
+    r->ctrl_pack_v_min = r->ctrl_current_a_min = 1e9;
+    r->ctrl_pack_v_max = r->ctrl_current_a_max = -1e9;
     r->cell_mv_min = 0xffffu;
     r->cell_count_stable = true;
 }
@@ -143,6 +172,24 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
                 r->speed_samples++;
                 if (r->live.cur_speed_kmh > r->speed_kmh_max) {
                     r->speed_kmh_max = r->live.cur_speed_kmh;
+                }
+            }
+            /* Counted per frame rather than per type: all eight carry the
+             * same two fields, and what matters downstream is how often the
+             * pair arrives, not which of the eight brought it. */
+            if (r->live.power_valid && is_power_type(f.type)) {
+                r->power_frames++;
+                if (r->live.pack_v < r->ctrl_pack_v_min) {
+                    r->ctrl_pack_v_min = r->live.pack_v;
+                }
+                if (r->live.pack_v > r->ctrl_pack_v_max) {
+                    r->ctrl_pack_v_max = r->live.pack_v;
+                }
+                if (r->live.line_current_a < r->ctrl_current_a_min) {
+                    r->ctrl_current_a_min = r->live.line_current_a;
+                }
+                if (r->live.line_current_a > r->ctrl_current_a_max) {
+                    r->ctrl_current_a_max = r->live.line_current_a;
                 }
             }
             break;
@@ -186,6 +233,20 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
             }
             if (b.reg[49] != b.reg[51]) {
                 r->cell_count_disagree++;
+            }
+            /* Two instruments, one Pack. The Controller's reading is up to a
+             * fifth of a second old here and the BMS averages internally, so
+             * they are allowed to differ a little - but only a little, and
+             * check_invariants() says how much. */
+            if (r->live.power_valid) {
+                double gap = r->live.pack_v - b.pack_v;
+                if (gap < 0.0) {
+                    gap = -gap;
+                }
+                if (gap > r->pack_v_device_gap_max) {
+                    r->pack_v_device_gap_max = gap;
+                }
+                r->pack_v_device_samples++;
             }
             if (r->bms_responses_ok == 1) {
                 r->cell_count = b.cell_count;
@@ -255,6 +316,16 @@ static void collect(const run_t *r, metrics_t *ms)
     }
     if (r->speed_samples > 0) {
         put(ms, "speed_kmh_max", r->speed_kmh_max);
+    }
+    if (r->power_frames > 0) {
+        put(ms, "power_frames", (double)r->power_frames);
+        put(ms, "ctrl_pack_v_min", r->ctrl_pack_v_min);
+        put(ms, "ctrl_pack_v_max", r->ctrl_pack_v_max);
+        put(ms, "ctrl_current_a_min", r->ctrl_current_a_min);
+        put(ms, "ctrl_current_a_max", r->ctrl_current_a_max);
+    }
+    if (r->pack_v_device_samples > 0) {
+        put(ms, "pack_v_device_gap_max", r->pack_v_device_gap_max);
     }
     if (r->bms_responses_ok > 0) {
         put(ms, "pack_v_min", r->pack_v_min);
@@ -336,6 +407,25 @@ static void check_invariants(const char *fixture, const run_t *r)
             fail(fixture, "state of charge %.1f-%.1f %% is not a percentage",
                  r->soc_pct_min, r->soc_pct_max);
         }
+    }
+    if (r->power_frames > 0) {
+        /* This Pack is 28 lithium cells in series: 56 V flat, 118 V full.
+         * Outside that the payload offset has slipped, not the Pack. */
+        if (r->ctrl_pack_v_min < 40.0 || r->ctrl_pack_v_max > 130.0) {
+            fail(fixture, "the Controller's pack voltage %.1f-%.1f V is outside "
+                          "anything 28 lithium cells in series do",
+                 r->ctrl_pack_v_min, r->ctrl_pack_v_max);
+        }
+    }
+    /* The check that is worth more than all of the above: two devices with
+     * separate instruments on one Pack, and they have to agree. cap0007 keeps
+     * them within 0.30 V; 2 V is loose enough for the Controller's reading
+     * being up to a poll old under load, and tight enough that a slipped
+     * offset on either side cannot hide inside it. */
+    if (r->pack_v_device_samples > 0 && r->pack_v_device_gap_max > 2.0) {
+        fail(fixture, "the Controller and the BMS disagree about pack voltage "
+                      "by up to %.2f V across %ld responses",
+             r->pack_v_device_gap_max, r->pack_v_device_samples);
     }
 }
 
@@ -538,6 +628,14 @@ static void report(const wflog_hdr_t *h, const run_t *r)
         printf("  controller: rpm<=%u speed<=%.2f km/h odo=%u temp=%d C\n",
                r->rpm_max, r->speed_kmh_max, r->live.odometer_raw,
                r->live.engine_temp);
+    }
+    if (r->power_frames > 0) {
+        printf("  power: pack %.1f-%.1f V, line %.2f-%.2f A, %ld frames "
+               "(%.1f Hz), device gap <=%.2f V\n",
+               r->ctrl_pack_v_min, r->ctrl_pack_v_max, r->ctrl_current_a_min,
+               r->ctrl_current_a_max, r->power_frames,
+               r->duration_ms ? r->power_frames * 1000.0 / r->duration_ms : 0.0,
+               r->pack_v_device_gap_max);
     }
     if (r->bms_responses_ok > 0) {
         printf("  bms: pack %.1f-%.1f V, soc %.1f-%.1f %%, current %.1f-%.1f A, "

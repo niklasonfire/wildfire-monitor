@@ -14,9 +14,21 @@ consumption, and the internal resistance estimate.
 They are good at different things. The BMS answers once per second but its
 state of charge is already calibrated and already corrected against resting
 voltage — and at 0.1% resolution on a 50 Ah pack, that is 0.05 Ah, finer than
-anything downstream needs. The Controller pushes voltage and current at 35 Hz,
-which is the only source fast enough to see an acceleration transient. Polling
-the BMS faster would not fix that; it averages internally.
+anything downstream needs. The Controller pushes voltage and current at
+**5.2 Hz**, which is still the fastest source there is and the only one that
+sees an acceleration transient at all. Polling the BMS faster would not fix
+that; it averages internally.
+
+An earlier version of this decision said 35 Hz, and that was wrong by about
+seven times. 35.5 Hz is the Controller's *total* frame rate across all 55 of
+its frame types; pack voltage and line current arrive in a block of eight of
+those types, which is 244 frames in the 47.1 s of cap0007 — 5.2 Hz. The
+decision itself is unchanged: 5.2 Hz is still five times the BMS's ~1 Hz poll,
+so the Controller is still where instantaneous power comes from and the BMS is
+still where charge comes from. What changes is what can be built on it. An
+acceleration transient is resolved to roughly 200 ms, not 30 ms, so the
+internal resistance estimate from load steps has to be designed for a sample
+every fifth of a second.
 
 So the Controller's stream is integrated for short-term resolution and Anchored
 to the BMS's state of charge for long-term truth. The same pattern applies to
@@ -25,7 +37,7 @@ distance: integrated speed for resolution, Odometer as the Anchor.
 We compute from raw voltage and current rather than consuming the numbers both
 devices already offer. The Controller reports its own state of charge at 1%
 resolution and its own consumption quantised to 4 Wh/km, both by unknown and
-unverifiable methods. Raw voltage and current at 35 Hz is strictly more
+unverifiable methods. Raw voltage and current at 5.2 Hz is strictly more
 information, and it is the only route to state of health and to a range figure
 we can defend.
 

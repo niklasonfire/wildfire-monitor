@@ -50,3 +50,23 @@ wheel_ratio       70
 rate_ratio        4000
 odometer_raw      14
 gear_last         0
+
+# The power block: pack voltage and line current, from the eight frame types
+# 0x81 0x88 0x8f 0x96 0x9d 0xa4 0xab 0xb1. 244 frames in 47.1 s is 5.2 Hz -
+# eight of the 55 types, not the 35.5 Hz the whole link runs at, which is the
+# correction ADR-0003 now carries.
+power_frames      244
+ctrl_pack_v_min   105.0
+ctrl_pack_v_max   105.5
+
+# Raw -1..35 over this ride, at WF_CTRL_CURRENT_LSB_PER_A = 4. Both numbers
+# move if that constant is corrected against Ride 1, which is the point of it
+# being a constant; they are here so that a change to it is deliberate.
+ctrl_current_a_min -0.25
+ctrl_current_a_max 8.75
+
+# The strongest correctness signal in the whole fixture: the Controller and
+# the BMS measure this Pack with separate instruments and never disagree by
+# more than 0.30 V across the 34 responses. A slipped payload offset on either
+# side could not land inside that.
+pack_v_device_gap_max 0.30

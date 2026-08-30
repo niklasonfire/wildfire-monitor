@@ -2,7 +2,7 @@
 # builds the part of it that does not need a board - the pure decoding in
 # main/wfdecode - and replays recorded Captures through it.
 #
-#   make test        generate, build and replay every fixture (the one command)
+#   make test        generate, build, unit-test and replay every fixture
 #   make gen         just run the Field Table through the generator
 #   make docs        regenerate docs/field-table.md from the Field Table
 #   make fixtures    rebuild the .wfl fixtures from the checked-in dumps
@@ -37,10 +37,16 @@ GEN_STAMP = $(GEN)/.generated
 
 PURE_OBJ  = $(BUILD)/wfdecode.o $(BUILD)/wfl_read.o $(BUILD)/wf_fields.o
 REPLAY    = $(BUILD)/replay
+UNIT      = $(BUILD)/unit
 
-.PHONY: test test-replay test-scripts gen docs fixtures clean
+.PHONY: test test-unit test-replay test-scripts gen docs fixtures clean
 
-test: test-replay test-scripts
+test: test-unit test-replay test-scripts
+
+# The decoding a recorded ride cannot reach, driven with synthesised bytes
+# instead. See tests/host/unit.c.
+test-unit: $(UNIT)
+	$(UNIT)
 
 test-replay: $(REPLAY)
 	$(REPLAY) $(FIXTURES)
@@ -71,6 +77,12 @@ $(BUILD)/%.o: $(WFDECODE)/%.c $(GEN_STAMP) | $(BUILD)
 $(REPLAY): tests/host/replay.c $(PURE_OBJ) | $(BUILD)
 	$(CC) $(HOST_STD) $(WARN) $(OPT) -I$(WFDECODE) -I$(GEN) \
 	    tests/host/replay.c $(PURE_OBJ) -o $@
+
+# Built with PURE_STD, not HOST_STD: it links nothing but main/wfdecode, so it
+# holds that seam to the same C99-and-nothing-else rule the firmware needs.
+$(UNIT): tests/host/unit.c $(PURE_OBJ) | $(BUILD)
+	$(CC) $(PURE_STD) $(WARN) $(OPT) -I$(WFDECODE) -I$(GEN) \
+	    tests/host/unit.c $(PURE_OBJ) -o $@
 
 # The dumps are the only surviving copy of these rides; the .wfl next to them
 # is rebuilt from that text, never edited by hand.

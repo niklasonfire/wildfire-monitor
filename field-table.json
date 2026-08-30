@@ -70,14 +70,28 @@
       "dump_fn": "wf_ctrl_fields_dump",
       "key_name": "frame type, payload byte offset",
       "endian": "le",
-      "note": "The Controller talks unprompted and cycles through 55 frame types, so the types arrive at wildly different rates - `0xb0` at the link's full ~35.5 Hz, `0xaf`, `0xb5`, `0xb3` and `0x94` far slower. Each group below therefore carries its own \"seen at least once\" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.",
+      "note": "The Controller talks unprompted and cycles through all 55 frame types in order, so the link's ~35.5 Hz is shared out evenly: cap0007 carries 1674 frames in 47.1 s, and every one of the 55 types appears 30 or 31 times, which is ~0.65 Hz each. A field therefore updates as often as the block of types carrying it is wide - once per cycle if it lives at one type, eight times per cycle for the power block below. Each group carries its own \"seen at least once\" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.",
+      "constants": [
+        {
+          "name": "WF_CTRL_CURRENT_LSB_PER_A",
+          "value": 4,
+          "note": "How many raw counts of `line_current_a` make one amp, and the single most consequential unmeasured number in this project - ADR-0003 makes it the gain on every watt-hour ever counted, so its error propagates undiminished into range. **Two candidates, 19 % apart, and this table has picked neither.** Upstream sources say 4 LSB per amp; a regression of our own Controller current against the BMS's says 4.77. cap0007 cannot decide between them: its peak of 35 raw is 8.75 A at 4 and 7.34 A at 4.77, and the BMS read -5.1 A at that moment, but the BMS's poll lag is not removed from that comparison, so it separates nothing. The value here is 4 because it is the upstream number and because an integer divisor is exact in both a C float and a Python double, which keeps the two generated decoders agreeing digit for digit - not because it is more likely to be right. Ride 1, the calibration ride, closes this by fitting integrated current against the BMS's own State of Charge delta over a whole ride; it is tracked as issue #12. Correct it here and every decoder, the document and the live screen follow."
+        }
+      ],
       "groups": [
         {
           "frame_type": "0xb0",
           "name": "motion",
           "c_define": "WF_CTRL_TYPE_MOTION",
           "valid_flag": "b0_valid",
-          "note": "The fast one: gear, the two motion flags, the brake switch and rpm, roughly 35 times a second."
+          "note": "Gear, the two motion flags, the brake switch and rpm, once per 55-type cycle - ~0.65 Hz, not the 35 Hz an earlier version of this note claimed. Road speed is computed from this group's rpm, so speed updates at that rate too."
+        },
+        {
+          "frame_types": ["0x81", "0x88", "0x8f", "0x96", "0x9d", "0xa4", "0xab", "0xb1"],
+          "name": "power",
+          "c_define": "WF_CTRL_TYPE_POWER",
+          "valid_flag": "power_valid",
+          "note": "Pack voltage and line current, and the reason the Field Table has to be able to say \"one field, several frame types\": these eight types all carry the same twelve-byte layout, and in cap0007 all eight read the same voltage to a tenth of a volt across the whole ride. The types step by 7 except for the last, `0xab` -> `0xb1`, which steps by 6 - the block does not divide the 55-type cycle evenly, so the eight are listed rather than generated from a stride. Eight types out of 55 is eight samples per cycle: 244 frames in 47.1 s of cap0007, **5.2 Hz**. That is 8x anything else the Controller sends and ~5x the BMS's ~1 Hz poll, which is what ADR-0003's split of authority rests on - but it is not the 35 Hz that ADR was originally written with, and #17's internal-resistance estimate from load steps has to be designed for 5 Hz."
         },
         {
           "frame_type": "0xaf",
@@ -183,6 +197,36 @@
           "ctype": "uint16_t",
           "confidence": "consistent",
           "note": "Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent. cap0007 peaks at 246 rpm, which through the speed formula is 5.5 km/h, against ride notes of a 4-7 km/h parking-lot crawl. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone."
+        },
+        {
+          "name": "pack_v",
+          "group": "power",
+          "offset": 0,
+          "width": 2,
+          "endian": "le",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 0.1,
+          "unit": "V",
+          "ctype": "float",
+          "confidence": "consistent",
+          "note": "Pack voltage as the Controller measures it - the same quantity the BMS reports in register 40, from a second instrument on the same Pack, which is what makes this the best-corroborated entry in the whole table. Across cap0007 all eight types of the power block read 105.0-105.5 V, and the BMS's own `pack_v` reads 105.1-105.5 V over the same 47 s. Compared response by response, the two devices are never further apart than 0.30 V and average 0.09 V; `make test` asserts that gap stays under 2 V for any Capture that carries both, so a slipped offset on either side shows up as a device disagreement rather than as a plausible number. Consistent rather than proven all the same: two devices agreeing is not a meter, and no meter has been on this Pack."
+        },
+        {
+          "name": "line_current_a",
+          "group": "power",
+          "offset": 4,
+          "width": 2,
+          "endian": "le",
+          "signed": true,
+          "mask": null,
+          "shift": 0,
+          "divide_by": "WF_CTRL_CURRENT_LSB_PER_A",
+          "unit": "A",
+          "ctype": "float",
+          "confidence": "consistent",
+          "note": "Line current, signed, positive while the Pack is being drawn from. Across cap0007 the raw value runs -1..35, which is -0.25..8.75 A at the constant as it stands, and it tracks the ride: flat zero while parked, rising through 19, 27, 35 as the bike pulls away and falling back as it coasts. **The sign is inverted relative to the BMS.** At the moment the Controller peaks at +35 the BMS reads -5.1 A, and the BMS's own note calls positive discharge - so exactly one of the two is the wrong way round and this table does not yet know which. The Controller's polarity is the one shown on the live screen, because reading positive under load is what a rider expects; #12 settles which convention is right at the same time as it settles the scale. **The scale is genuinely open** - see `WF_CTRL_CURRENT_LSB_PER_A`, which is where both candidates and the 19 % between them are written down. Consistent means the shape of this signal matches the ride, not that its gain is known."
         },
         {
           "name": "wheel_ratio",
@@ -327,6 +371,10 @@
         {
           "name": "phase_current",
           "note": "24-bit big-endian under a square root. Not decoded today in either language, and ADR-0002 says it stays hand-written when it is, rather than growing the table a syntax for it."
+        },
+        {
+          "name": "payload bytes 2-3 and 6-11 of the power block",
+          "note": "The eight types of the power block carry more than pack voltage and line current. Bytes 8-9 and 10-11 are the pair the appendix below describes as the only thing moving in a parked Capture, idling at -1/-2 and 0/0xffff; phase current is one of the things in here, and is listed separately. Nothing in this range is assigned."
         },
         {
           "name": "payload bytes 8-9 and 10-11 of type 0xb0",
@@ -557,7 +605,7 @@
   "appendices": [
     {
       "title": "Correction to docs/capture.md and README.md",
-      "body": "Both documents say the only fields that move in a parked Capture are payload bytes 8-9 and 10-11 of the eight live frame types, idling at -1/-2 and 0/0xffff. That observation still stands as a description of what was captured, but the conclusion drawn from it needed correcting: **cur_rpm lives at payload bytes 6-7 of type `0xb0`, not 8-9/10-11.** Parked, rpm is 0, which is byte-identical to the 47 truly static types and so did not register as \"live\" in that Capture at all. It is not that rpm is one of the unexplained moving fields; it is that a stationary bike cannot distinguish \"live but currently zero\" from \"static\".\n\nThe same explains why `0xaf`, `0xb5`, `0xb3`, `0x94` and `0x8b` never showed up in the \"every 7th type is live\" pattern: wheel configuration, temperatures and the Odometer all change far too slowly for a short parked Capture to tell them apart from the genuinely static types. They are live telemetry, just not on that timescale."
+      "body": "Both documents say the only fields that move in a parked Capture are payload bytes 8-9 and 10-11 of the eight live frame types, idling at -1/-2 and 0/0xffff. That observation still stands as a description of what was captured, but the conclusion drawn from it needed correcting: **cur_rpm lives at payload bytes 6-7 of type `0xb0`, not 8-9/10-11.** Parked, rpm is 0, which is byte-identical to the 47 truly static types and so did not register as \"live\" in that Capture at all. It is not that rpm is one of the unexplained moving fields; it is that a stationary bike cannot distinguish \"live but currently zero\" from \"static\".\n\nThe same explains why `0xaf`, `0xb5`, `0xb3`, `0x94` and `0x8b` never showed up in the \"every 7th type is live\" pattern: wheel configuration, temperatures and the Odometer all change far too slowly for a short parked Capture to tell them apart from the genuinely static types. They are live telemetry, just not on that timescale.\n\nThose \"eight live frame types\" now have a name: they are the `power` group, `0x81 0x88 0x8f 0x96 0x9d 0xa4 0xab 0xb1`, and payload bytes 0-1 and 4-5 of each are pack voltage and line current. Parked, voltage is steady and current is zero, so neither registered as moving in that Capture either - the same blind spot, for the same reason."
     },
     {
       "title": "The BMS `a5` command set - not in the Field Table",

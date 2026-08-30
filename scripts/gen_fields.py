@@ -65,8 +65,21 @@ def load(path):
     for dev in table["devices"]:
         groups = dev.get("groups", [])
         for g in groups:
-            g["key"] = g.get("frame_type", g.get("name"))
+            # A group is one frame type, or - where the Controller repeats the
+            # same twelve bytes across a block of types - several. `frame_types`
+            # is what stops one field having to be written out once per type.
+            if "frame_types" in g:
+                g["types"] = [int(t, 0) for t in g["frame_types"]]
+                g["key"] = g["name"]
+            elif "frame_type" in g:
+                g["types"] = [int(g["frame_type"], 0)]
+                g["key"] = g["frame_type"]
+            else:
+                g["types"] = []
+                g["key"] = g["name"]
         default_group = groups[0]["key"] if len(groups) == 1 else None
+
+        constants = {c["name"]: c for c in dev.get("constants", [])}
 
         for f in dev["fields"]:
             f["device"] = dev["id"]
@@ -92,9 +105,23 @@ def load(path):
             f.setdefault("mask", None)
             f.setdefault("shift", 0)
             f.setdefault("bias", 0)
-            f.setdefault("scale", 1)
             f.setdefault("unit", "")
             f.setdefault("note", "")
+            # `divide_by` names one of the device's constants and takes the
+            # scale from it, so a factor nobody has measured yet is a single
+            # named number in one place - visible in both generated decoders
+            # and in the document - rather than a bare 0.25 buried in a row.
+            f["divisor_name"] = f.get("divide_by")
+            if f["divisor_name"] is not None:
+                if "scale" in f:
+                    raise SystemExit(f"{f['name']}: both scale and divide_by; "
+                                     f"the constant is the scale")
+                if f["divisor_name"] not in constants:
+                    raise SystemExit(f"{f['name']}: divide_by names "
+                                     f"{f['divisor_name']}, which is not one of "
+                                     f"{dev['name']}'s constants")
+                f["scale"] = 1.0 / float(constants[f["divisor_name"]]["value"])
+            f.setdefault("scale", 1)
             f["decimals"] = decimals_for(f["scale"])
             f["divisor"] = divisor_for(f["scale"])
             if f["ctype"] == "bool" and (f["mask"] is None or f["scale"] != 1):
@@ -191,7 +218,9 @@ def c_value(f, src, index=None):
         if f["bias"]:
             sign = "-" if f["bias"] < 0 else "+"
             expr = f"({expr} {sign} {abs(f['bias'])}.0f)"
-        if f["divisor"] is not None:
+        if f["divisor_name"] is not None:
+            expr = f"{expr} / (float){f['divisor_name']}"
+        elif f["divisor"] is not None:
             expr = f"{expr} / {f['divisor']}.0f"
         elif f["scale"] != 1:
             expr = f"{expr} * {f['scale']}f"
@@ -230,6 +259,8 @@ def py_value(f, src, index=None):
     if f["bias"]:
         sign = "-" if f["bias"] < 0 else "+"
         raw = f"({raw} {sign} {abs(f['bias'])})"
+    if f["divisor_name"] is not None:
+        return f"{raw} / {f['divisor_name']}"
     if f["divisor"] is not None:
         return f"{raw} / {f['divisor']}"
     if f["scale"] != 1:
@@ -247,8 +278,11 @@ def c_struct(dev):
         out.append("")
     for g in dev["groups"]:
         if g.get("valid_flag"):
+            seen = ("frame type %s" % g["key"] if len(g["types"]) == 1
+                    else "any of the %s block's %d frame types"
+                         % (g["name"], len(g["types"])))
             out.append(f"    bool     {g['valid_flag']};"
-                       f"      /* frame type {g['key']} seen at least once */")
+                       f"      /* {seen} seen at least once */")
         for f in fields_of(dev, g["key"]):
             arr = f"[{f['count_define']}]" if f["count"] > 1 else ""
             out.append(f"    {f['ctype']:<9}{f['name']}{arr};")
@@ -267,15 +301,34 @@ def c_member(m):
     return f"{m['ctype']:<9}{m['name']}{arr};"
 
 
-def c_field_row(f):
+def types_array(g):
+    """The C identifier holding one group's frame types."""
+    return g["c_define"].lower() if g.get("c_define") else None
+
+
+def c_cases(g):
+    """The switch labels for one group: the named constant where the group is
+    one frame type, and the literal types where it is a block of them - which
+    is why the block's types are also exported as an array."""
+    if len(g["types"]) == 1:
+        return [f"    case {g['c_define']}:"]
+    return ["    /* the %s block, %s */" % (g["name"], g["c_define"])] + \
+           ["    case 0x%02x:" % t for t in g["types"]]
+
+
+def c_field_row(f, group):
     mask = "0" if f["mask"] is None else f"0x{f['mask']:02x}"
-    ftype = f["group"] if f["device"] == "controller" else "0"
+    if f["device"] == "controller":
+        types, n_types = types_array(group), len(group["types"])
+    else:
+        types, n_types = "NULL", 0
     conf = f"WF_CONF_{f['confidence'].upper()}"
-    return ("    { %-20s %-8s WF_DEV_%s, %s, %d, %d, %d, %s, %s, %s, %d, %d, "
-            "%s, %d, %s }," % (
+    return ("    { %-20s %-8s WF_DEV_%s, %s, %d,\n"
+            "      %d, %d, %d, %s, %s, %s, %d, %d, %s, %d, %s }," % (
                 '"%s",' % f["name"], '"%s",' % f["unit"],
                 "CONTROLLER" if f["device"] == "controller" else "BMS",
-                ftype, f["key"], f["width"], f["count"],
+                types, n_types,
+                f["key"], f["width"], f["count"],
                 "true" if f["endian"] == "be" else "false",
                 "true" if f["signed"] else "false",
                 mask, f["shift"], f["bias"], repr(float(f["scale"])),
@@ -316,7 +369,14 @@ def emit_c(table, out_dir):
     h.append("    const char     *name;")
     h.append("    const char     *unit;")
     h.append("    wf_device_t     device;")
-    h.append("    uint8_t         frame_type;  /* Controller only; 0 for the BMS */")
+    h.append("    /* Every Controller frame type the field appears at, and how")
+    h.append("     * many: most fields live at one, but the Controller repeats")
+    h.append("     * the same twelve bytes across a block of types, and a field")
+    h.append("     * there is one entry with several types rather than several")
+    h.append("     * entries. NULL and 0 for the BMS, which is keyed by")
+    h.append("     * register index instead. */")
+    h.append("    const uint8_t  *frame_types;")
+    h.append("    uint8_t         frame_type_count;")
     h.append("    uint16_t        key;         /* payload byte offset, or register index */")
     h.append("    uint8_t         width;       /* bytes read, or registers read */")
     h.append("    uint16_t        count;       /* 1, or the length of an array field */")
@@ -342,8 +402,17 @@ def emit_c(table, out_dir):
         h.append(f"/* ------------------------------------------- {dev['name']} */")
         h.append("")
         for g in dev["groups"]:
-            if g.get("c_define"):
+            if not g.get("c_define"):
+                continue
+            if len(g["types"]) == 1:
                 h.append(f"#define {g['c_define']:<24} {g['key']}")
+            else:
+                # A block of types carrying one payload layout. The count is a
+                # macro so the array can be sized by it; the array itself is
+                # what the field table rows point at.
+                h.append(f"#define {g['c_define'] + '_COUNT':<24} {len(g['types'])}")
+                h.append(f"extern const uint8_t {types_array(g)}"
+                         f"[{g['c_define']}_COUNT];")
         for c in dev.get("constants", []):
             h.append(f"#define {c['name']:<24} {c['value']}")
         for f in dev["fields"]:
@@ -412,12 +481,31 @@ def emit_c(table, out_dir):
     c.append("}")
     c.append("")
 
+    # The frame types each Controller group covers, as data the field table
+    # rows point at. A single-type group's array is file-static because nothing
+    # outside needs it; a block's is exported, because a caller that wants the
+    # eight types of the power block has nowhere else to read them from.
+    c.append("/* --------------------- which frame types carry which group */")
+    c.append("")
+    for g in ctrl["groups"]:
+        if not g.get("c_define"):
+            continue
+        arr = types_array(g)
+        types = ", ".join("0x%02x" % t for t in g["types"])
+        if len(g["types"]) == 1:
+            c.append(f"static const uint8_t {arr}[1] = {{ {types} }};")
+        else:
+            c.append(f"const uint8_t {arr}[{g['c_define']}_COUNT] = "
+                     f"{{\n    {types}\n}};")
+    c.append("")
+
     for dev in (ctrl, bms):
         p = prefix(dev)
+        by_key = {g["key"]: g for g in dev["groups"]}
         c.append(f"const wf_field_t {p.lower()}_field_table"
                  f"[{p}_FIELD_COUNT] = {{")
         for f in dev["fields"]:
-            c.append(c_field_row(f))
+            c.append(c_field_row(f, by_key[f["group"]]))
         c.append("};")
         c.append("")
 
@@ -430,7 +518,7 @@ def emit_c(table, out_dir):
     c.append("    }")
     c.append("    switch (type) {")
     for g in ctrl["groups"]:
-        c.append(f"    case {g['c_define']}:")
+        c.extend(c_cases(g))
         for f in fields_of(ctrl, g["key"]):
             c.append(f"        live->{f['name']} = {c_value(f, 'p')};")
         if g.get("valid_flag"):
@@ -476,7 +564,7 @@ def emit_c(table, out_dir):
     c.append("{")
     c.append("    switch (type) {")
     for g in ctrl["groups"]:
-        c.append(f"    case {g['c_define']}:")
+        c.extend(c_cases(g))
         for f in fields_of(ctrl, g["key"]):
             c.append(f'        sink(ctx, "{f["name"]}", (double)live->{f["name"]},'
                      f" {f['decimals']});")
@@ -524,6 +612,13 @@ def wrap_list(items, width, indent):
 
 # -------------------------------------------------------------- the Python
 
+def py_dispatch(g):
+    """`== WF_CTRL_TYPE_MOTION` for a group of one frame type, `in
+    WF_CTRL_TYPE_POWER` for a block of them - the C switch labels the same
+    types, so the two decoders cannot dispatch differently."""
+    return ("== " if len(g["types"]) == 1 else "in ") + g["c_define"]
+
+
 def emit_py(table, out_dir):
     ctrl = dev_by_id(table, "controller")
     bms = dev_by_id(table, "bms")
@@ -542,8 +637,13 @@ def emit_py(table, out_dir):
             if f["count"] > 1:
                 o.append(f"{f['count_define']} = {f['count']}")
         for g in dev["groups"]:
-            if g.get("c_define"):
+            if not g.get("c_define"):
+                continue
+            if len(g["types"]) == 1:
                 o.append(f"{g['c_define']} = {g['key']}")
+            else:
+                types = ", ".join("0x%02x" % t for t in g["types"])
+                o.append(f"{g['c_define']} = ({types})")
     o.append(f"WF_BMS_REG_NEEDED = {reg_needed(bms)}")
     o.append("")
     o.append("")
@@ -586,7 +686,7 @@ def emit_py(table, out_dir):
     for g in ctrl["groups"]:
         kw = "if" if first else "elif"
         first = False
-        o.append(f"    {kw} ftype == {g['c_define']}:")
+        o.append(f"    {kw} ftype {py_dispatch(g)}:")
         for f in fields_of(ctrl, g["key"]):
             o.append(f'        live["{f["name"]}"] = {py_value(f, "p")}')
         if g.get("valid_flag"):
@@ -619,7 +719,7 @@ def emit_py(table, out_dir):
     for g in ctrl["groups"]:
         kw = "if" if first else "elif"
         first = False
-        o.append(f"    {kw} ftype == {g['c_define']}:")
+        o.append(f"    {kw} ftype {py_dispatch(g)}:")
         o.append("        return [")
         for f in fields_of(ctrl, g["key"]):
             o.append(f'            ("{f["name"]}", live["{f["name"]}"],'
@@ -672,7 +772,9 @@ def md_field_table(dev):
         steps = []
         if f["bias"]:
             steps.append("%+d" % f["bias"])
-        if f["scale"] != 1:
+        if f["divisor_name"] is not None:
+            steps.append("/ `%s`" % f["divisor_name"])
+        elif f["scale"] != 1:
             steps.append("x %g" % f["scale"])
         scale = ", then ".join(steps) if steps else "-"
         rows.append("| `%s` | %s | %s | %s | %s | %s | %s | %s | `%s` | %s |" % (
@@ -718,8 +820,19 @@ def emit_doc(table, path):
             o.append("| Frame type | Group | What it carries |")
             o.append("| --- | --- | --- |")
             for g in dev["groups"]:
-                o.append("| `%s` | %s | %s |" % (g["key"], g["name"], g["note"]))
+                types = ", ".join("`0x%02x`" % t for t in g["types"])
+                o.append("| %s | %s | %s |" % (types, g["name"], g["note"]))
             o.append("")
+        if dev.get("constants"):
+            o.append("### Constants")
+            o.append("")
+            o.append("Numbers the decoding needs that are not a field: each is "
+                     "declared once here, generated into both decoders under "
+                     "the name below, and corrected in one place.")
+            o.append("")
+            for c in dev["constants"]:
+                o.append("**`%s`** = %s - %s" % (c["name"], c["value"], c["note"]))
+                o.append("")
         o.append("### Fields")
         o.append("")
         o.append(md_field_table(dev))
@@ -727,7 +840,9 @@ def emit_doc(table, path):
         o.append("Read a value as `(((raw & mask) >> shift) + bias) * scale`, "
                  "sign-extended before the bias where the Signed column says "
                  "so. A `-` in the Bias/scale column means the raw number is "
-                 "the value.")
+                 "the value; a `/ NAME` there means the scale is one over the "
+                 "constant of that name above, which is how a factor nobody "
+                 "has measured yet stays a single number in a single place.")
         o.append("")
         o.append("### What each field is, and how far it is trusted")
         o.append("")
