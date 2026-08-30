@@ -53,6 +53,49 @@
  * after wf_est_init(), when there is no integrated value to preserve. After
  * that, never.
  *
+ * ---------------------------------------------------------------------------
+ * Distance, which is the same shape again
+ * ---------------------------------------------------------------------------
+ *
+ * A third quantity is integrated, and it is here rather than beside the
+ * estimator because Consumption and Range are Remaining Energy divided by it -
+ * a distance the replay harness cannot reproduce is a Range the replay harness
+ * cannot reproduce.
+ *
+ *   Distance        metres travelled since wf_est_init(), from integral v dt
+ *
+ * Its Anchor is the Odometer, per ADR-0003 and for exactly the reasons the BMS
+ * anchors charge: road speed has resolution the Odometer has not - it arrives
+ * with the motion block at ~5.2 Hz, against one Odometer count per hundred
+ * metres - and it drifts, because it is rpm times a wheel circumference and a
+ * gearing constant, none of which is measured. The Odometer is coarse and it
+ * wraps but it does not drift.
+ *
+ * The fusion is the same first-order pull, with one addition: the step a
+ * motion frame takes is `speed * dt + (odometer - distance) * dt/TAU`, and
+ * that step is floored at zero. Distance is a quantity a rider watches
+ * accumulate, and a correction that ran it backwards - even smoothly, even by
+ * a metre - would be wrong in a way a charge figure is not. So the Odometer
+ * can slow distance to a standstill and never reverse it: an over-reading
+ * speed is absorbed by the figure sitting still until the Odometer catches up.
+ *
+ * The one assignment, again, is the acquisition. The first Odometer reading
+ * sets the Anchor equal to whatever distance already is, so acquiring costs
+ * nothing; from there the Anchor moves by wrap-safe count differences
+ * (wf_ctrl_odo_delta_metres) and never by an absolute reading. That is what
+ * makes a wrap a non-event - 65535 to 0 is one count, not a trip backwards -
+ * and what makes a Controller link that dropped for two minutes come back
+ * carrying the metres it covered, in the Odometer's own account, without
+ * double-counting them.
+ *
+ * Before the wheel geometry has arrived (frame type 0xaf, without which
+ * `speed_valid` is false) nothing is integrated from speed: an unknown speed
+ * is not assumed to be zero, it is simply not integrated. The Odometer's pull
+ * still runs, so distance in that window is the Odometer alone, smoothed - a
+ * hundred-metre staircase turned into something continuous. `distance_valid`
+ * is true as soon as either source has spoken and false before that, because
+ * a confident 0 m from a link that has never come up is worse than a dash.
+ *
  * WARNING, and it is the big one: every watt-hour below is scaled by
  * WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 % - upstream says 4 LSB
  * per amp, regression against the BMS says 4.77. That uncertainty propagates
@@ -138,10 +181,32 @@
  * DT_MAX_MS       the longest interval a single integration step may cover.
  *                 A link that dropped for a minute must not book a minute of
  *                 the last current it happened to see.
+ * DIST_TAU_S      how fast distance is pulled toward the Odometer. A fifth of
+ *                 the charge Anchor's, and the trade-off is worth writing out
+ *                 because it is the whole of why this number is 60 and not 6
+ *                 or 600.
+ *
+ *                 Long is what stops a tick showing. The Odometer moves in
+ *                 hundred-metre steps, so the pull's target is a staircase and
+ *                 not a noisy reading; one step adds `100 * dt/TAU` to the very
+ *                 next frame, which at 60 s and 5.2 Hz is 0.33 m against the
+ *                 ~2 m a frame covers at 36 km/h. Invisible. At 6 s it would
+ *                 be 3.3 m - larger than the step itself, which is a tick you
+ *                 could watch.
+ *
+ *                 Short is what stops the drift accumulating. A first-order
+ *                 tracker settles TAU times the rate error away from its
+ *                 target, and the target itself sits up to one count below the
+ *                 truth, so the error against the ground is about
+ *                 `TAU * speed_error - 50 m`. At 60 s a 20 % speed error at
+ *                 36 km/h lands 63 m out: inside one Odometer count, which is
+ *                 all the accuracy an Odometer-Anchored figure can claim.
+ *                 tests/host/unit.c drives exactly that case.
  */
 #define WF_EST_ANCHOR_TAU_S           300.0
 #define WF_EST_ANCHOR_STALE_MS        5000u
 #define WF_EST_DT_MAX_MS              2000u
+#define WF_EST_DIST_TAU_S             60.0
 
 /* ----------------------------------------------------------- sign convention
  *
@@ -164,16 +229,40 @@
  * and no further: it is deliberately NOT treated as an Anchor, so the first
  * BMS answer after a restore still acquires. A Pack charged while the Monitor
  * was off would otherwise take a quarter of an hour to be believed.
+ *
+ * Distance is the exception, and deliberately: it is restored outright and
+ * carries on from where it was, because "how far have I ridden" has no
+ * equivalent of a Pack being charged overnight. What it does not carry is the
+ * Odometer's count. The first Odometer reading after a restore acquires
+ * against the restored distance, so ground the bike covered while the Monitor
+ * was off - the Monitor runs on its own battery and can be switched off under
+ * a rider who keeps going - is not credited to a Capture that did not see it.
+ *
+ * Version 2 added distance_m and its own validity flag, in the five bytes
+ * version 1 left reserved for exactly this. A version 1 blob is therefore
+ * migrated rather than rejected: its layout is a prefix of this one and its
+ * reserved bytes are zero by construction, so it restores its charge figures
+ * and no distance at all, which is precisely what a build that did not count
+ * metres knew. The reserve is now spent; the field after this one grows the
+ * blob, and the length check rejects the old layout at that point.
+ *
+ * The two validity flags are separate because the two figures are. A Monitor
+ * that saw the Controller but never the BMS has metres worth keeping and no
+ * charge figure at all; the Rated Capacity guard in wf_est_init() throws away
+ * a charge count and has nothing to say about a distance.
  */
-#define WF_EST_PERSIST_VERSION  1
-#define WF_EST_PERSIST_BYTES    24
+#define WF_EST_PERSIST_VERSION      2
+#define WF_EST_PERSIST_VERSION_MIN  1   /* the oldest layout still readable */
+#define WF_EST_PERSIST_BYTES        24
 
 typedef struct {
     uint16_t version;
-    bool     valid;             /* the counts below mean something */
+    bool     valid;             /* the charge counts below mean something */
     float    coulomb_ah;        /* Coulomb Count when it was saved */
     float    remaining_wh;      /* Remaining Energy when it was saved */
     float    rated_capacity_ah; /* what those were scaled against */
+    bool     distance_valid;    /* distance_m means something (version 2) */
+    float    distance_m;        /* Distance when it was saved (version 2) */
 } wf_est_persist_t;
 
 /* Writes exactly WF_EST_PERSIST_BYTES into buf, little endian, with a magic,
@@ -207,16 +296,28 @@ typedef struct {
     bool     acquired;          /* the first Anchor has been taken */
     uint32_t anchor_t_ms;
 
+    /* distance, and the Odometer that Anchors it */
+    double   distance_m;        /* metres since init, the fused figure */
+    double   odo_distance_m;    /* the Odometer's own account of the same */
+    uint16_t odo_counts;        /* the last raw count differenced against */
+    bool     odo_seen;          /* the Odometer has been acquired */
+    bool     speed_seen;        /* a road speed has been integrated */
+
     /* the clock, entirely as fed */
     uint32_t last_t_ms;         /* most recent t_ms of any feed */
     bool     last_t_valid;
     uint32_t power_t_ms;        /* t_ms of the last power sample integrated */
     bool     power_t_valid;
+    uint32_t speed_t_ms;        /* t_ms of the last motion frame integrated */
+    bool     speed_t_valid;
 
     /* provenance of the current value, and how much has gone into it */
     bool     restored;          /* seeded from persisted state, not acquired */
+    bool     distance_restored; /* distance came from persisted state */
     uint32_t power_samples;
     uint32_t anchor_samples;
+    uint32_t distance_samples;  /* motion frames that took a distance step */
+    uint32_t odo_samples;       /* Odometer readings folded into the Anchor */
 } wf_est_t;
 
 /* What the rider, the screen and the harness get to see. */
@@ -239,8 +340,22 @@ typedef struct {
     double   used_wh;           /* since init */
     double   power_w;           /* the last Controller power sample, V * I */
 
+    /* Distance. One figure in metres, and the thing Consumption and Range
+     * divide by. `distance_valid` is false until a road speed or an Odometer
+     * reading has arrived; `odo_anchored` says which of the two is holding it,
+     * because integrated speed alone drifts and the screen may want to say so.
+     * `odo_distance_m` is the Odometer's own account of the same journey,
+     * exposed so a harness can assert the two agree to within the Odometer's
+     * hundred-metre quantisation. */
+    bool     distance_valid;
+    bool     odo_anchored;
+    double   distance_m;
+    double   odo_distance_m;
+
     uint32_t power_samples;
     uint32_t anchor_samples;
+    uint32_t distance_samples;
+    uint32_t odo_samples;
 } wf_est_out_t;
 
 /* Zeroes e and, when restored is non-NULL and valid, seeds the counts from it.
@@ -249,13 +364,20 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored);
 
 /* Folds one decoded Controller frame in.
  *
- * frame_type is the frame's own type byte. The estimator integrates on the
- * power block's eight types and only those, because those are the only ones
- * that carry a fresh pack voltage and line current - so the integration steps
- * are the ~5.2 Hz the Pack is actually sampled at rather than the 35 Hz the
- * link runs at, and the step boundaries do not depend on which unrelated frame
- * happened to arrive in between. Which types those are comes from the Field
- * Table, per ADR-0002, not from a list repeated here.
+ * frame_type is the frame's own type byte, and it decides what this does:
+ *
+ *   the power block's eight types   integrate energy and charge
+ *   the motion block's eight types  integrate distance, and pull it toward
+ *                                   the Odometer
+ *   the Odometer's type, 0x94       move the Odometer Anchor, nothing else
+ *   anything else                   note the time and return
+ *
+ * Each quantity steps only on the frames that carry a fresh reading of it, so
+ * the integration steps are the ~5.2 Hz the Pack and the wheel are actually
+ * sampled at rather than the 35 Hz the link runs at, and the step boundaries
+ * do not depend on which unrelated frame happened to arrive in between. Which
+ * types those are comes from the Field Table, per ADR-0002, not from a list
+ * repeated here.
  *
  * Short enough to run inside a spinlock, which is where the Monitor calls it
  * from - the same place it calls wf_ctrl_apply().

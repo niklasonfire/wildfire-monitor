@@ -135,6 +135,14 @@ typedef struct {
      * Pack. The acceptance criterion is that this does not diverge. */
     double   est_soc_gap_max;
     long     est_soc_gap_samples;
+    /* Distance, fused from integrated speed and the Odometer. Hashed the same
+     * way and for the same reason as the energy curve, and separately from it,
+     * because distance becomes valid the moment the Controller speaks and the
+     * energy curve waits for the BMS. */
+    uint64_t dist_hash;
+    long     dist_points;
+    double   dist_m_last, dist_odo_last;
+    double   dist_step_back_max;   /* largest backwards move, must stay 0 */
 } run_t;
 
 /* FNV-1a over the raw bytes of every point on the curve. The comparison is
@@ -159,12 +167,37 @@ static void curve_point(run_t *r, double wh)
     r->est_points++;
 }
 
+/* The same, over the distance curve. Kept apart from the energy one so that a
+ * change to either shows up as itself. */
+static void dist_point(run_t *r, double m)
+{
+    uint8_t bytes[sizeof(double)];
+    memcpy(bytes, &m, sizeof(bytes));
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        r->dist_hash ^= bytes[i];
+        r->dist_hash *= 0x100000001b3ull;
+    }
+    /* Distance is monotone by construction - the Odometer may slow it to a
+     * standstill and may not reverse it - so this is the assertion, sampled at
+     * every point the rider could have looked at the screen. */
+    double back = r->dist_m_last - m;
+    if (r->dist_points > 0 && back > r->dist_step_back_max) {
+        r->dist_step_back_max = back;
+    }
+    r->dist_m_last = m;
+    r->dist_points++;
+}
+
 /* Sampled after every record the estimator was fed, so the curve is what the
  * live screen would have shown at each of those instants. */
 static void est_sample(run_t *r)
 {
     wf_est_out_t o;
     wf_est_get(&r->est, &o);
+    if (o.distance_valid) {
+        dist_point(r, o.distance_m);
+        r->dist_odo_last = o.odo_distance_m;
+    }
     if (!o.valid) {
         return;
     }
@@ -181,6 +214,65 @@ static void est_sample(run_t *r)
     }
 }
 
+/* ------------------------------------------------- the synthesised wrap */
+
+/* `odometer_raw` reads a constant 14 through the whole of cap0007, so no
+ * Capture we hold crosses the Odometer's u16 wrap and no Capture we are likely
+ * to take soon will either - it happens once every 6553 km. The acceptance
+ * criterion is still that a wrap produces no discontinuity, so the wrap is
+ * synthesised into a real ride: every Odometer frame's count is rewritten to a
+ * ramp and the frame re-checksummed, so it goes through the same parser, the
+ * same decoder and the same estimator that a real frame does, over the real
+ * ride's timing and the real ride's speeds.
+ *
+ * The assertion is then the strongest one available. The same ramp is run
+ * twice, once from a count well clear of the wrap and once from six counts
+ * short of it, and the two distance curves have to be identical bit for bit -
+ * not close. The Anchor is built from wrap-safe count differences and never
+ * from an absolute reading, so a wrap is not an event it can notice. */
+typedef struct {
+    bool     on;
+    uint16_t start;      /* the count the ramp begins at */
+} odo_synth_t;
+
+/* One Field Table entry by name. Read rather than repeated: the Odometer's
+ * frame type and its payload offset are declared in field-table.json, and a
+ * test that hard-codes them is a second declaration to drift from the first. */
+static const wf_field_t *ctrl_field(const char *name)
+{
+    for (int i = 0; i < WF_CTRL_FIELD_COUNT; i++) {
+        if (strcmp(wf_ctrl_field_table[i].name, name) == 0) {
+            return &wf_ctrl_field_table[i];
+        }
+    }
+    fprintf(stderr, "the Field Table has no Controller field `%s`\n", name);
+    exit(2);
+}
+
+/* Rewrites one Odometer frame's count and fixes its checksum, in scratch.
+ * Returns the bytes to parse: the rewritten copy, or the original untouched. */
+static const uint8_t *synth_odo(const odo_synth_t *s, unsigned tick,
+                                const uint8_t *data, uint32_t len,
+                                uint8_t scratch[WF_CTRL_FRAME_LEN])
+{
+    static const wf_field_t *odo;
+    if (odo == NULL) {
+        odo = ctrl_field("odometer_raw");
+    }
+    if (!s->on || len != WF_CTRL_FRAME_LEN || odo->frame_type_count != 1 ||
+        data[1] != odo->frame_types[0]) {
+        return data;
+    }
+    memcpy(scratch, data, WF_CTRL_FRAME_LEN);
+    uint16_t counts = (uint16_t)(s->start + tick);
+    scratch[2 + odo->key]     = (uint8_t)(counts & 0xff);
+    scratch[2 + odo->key + 1] = (uint8_t)(counts >> 8);
+    uint16_t crc = wf_crc16(scratch, WF_CTRL_FRAME_LEN - 2, WF_CTRL_CRC_INIT);
+    scratch[14] = (uint8_t)(crc & 0xff);
+    scratch[15] = (uint8_t)(crc >> 8);
+    return scratch;
+}
+
 static void run_init(run_t *r)
 {
     memset(r, 0, sizeof(*r));
@@ -190,13 +282,14 @@ static void run_init(run_t *r)
     r->ctrl_pack_v_max = r->ctrl_current_a_max = -1e9;
     r->cell_mv_min = 0xffffu;
     r->cell_count_stable = true;
-    r->est_hash = 0xcbf29ce484222325ull;   /* FNV-1a offset basis */
+    r->est_hash = r->dist_hash = 0xcbf29ce484222325ull;   /* FNV-1a basis */
     /* Cold: a fixture carries no persisted state, so every replay of it starts
      * from the same nothing. That is half of why replays agree. */
     wf_est_init(&r->est, NULL);
 }
 
-static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
+static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
+                   const odo_synth_t *synth)
 {
     wfl_reader_t rd;
     if (!wfl_open(&rd, buf, len, hdr)) {
@@ -205,6 +298,8 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
     }
 
     run_init(r);
+    unsigned odo_tick = 0;
+    uint8_t scratch[WF_CTRL_FRAME_LEN];
 
     wfl_rec_t rec;
     while (wfl_next(&rd, &rec)) {
@@ -213,8 +308,17 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r)
         switch (rec.type) {
         case WFREC_MCU: {
             r->ctrl_records++;
+            const uint8_t *data = rec.data;
+            if (synth->on) {
+                const uint8_t *rewritten = synth_odo(synth, odo_tick, rec.data,
+                                                     rec.len, scratch);
+                if (rewritten != rec.data) {
+                    odo_tick++;
+                    data = rewritten;
+                }
+            }
             wf_ctrl_frame_t f;
-            if (!wf_ctrl_frame_parse(rec.data, rec.len, &f)) {
+            if (!wf_ctrl_frame_parse(data, rec.len, &f)) {
                 r->ctrl_frames_bad++;
                 break;
             }
@@ -432,6 +536,16 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "est_power_samples", (double)o.power_samples);
         put(ms, "est_anchor_samples", (double)o.anchor_samples);
     }
+
+    if (r->dist_points > 0) {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        put(ms, "est_dist_points", (double)r->dist_points);
+        put(ms, "est_distance_m", o.distance_m);
+        put(ms, "est_odo_distance_m", o.odo_distance_m);
+        put(ms, "est_distance_samples", (double)o.distance_samples);
+        put(ms, "est_odo_samples", (double)o.odo_samples);
+    }
 }
 
 /* ------------------------------------------------------------- assertions */
@@ -550,6 +664,36 @@ static void check_invariants(const char *fixture, const run_t *r)
     if (r->est_soc_gap_samples > 0 && r->est_soc_gap_max > 5.0) {
         fail(fixture, "the Coulomb Count drifted %.2f %% from its Anchor over "
                       "%ld samples", r->est_soc_gap_max, r->est_soc_gap_samples);
+    }
+
+    /* ---- distance ---- */
+    if (r->dist_points > 0) {
+        /* Monotone by construction. The Odometer corrects an over-reading
+         * speed by slowing distance to a standstill, never by running it
+         * backwards, so any backwards move at all is a fault and not a
+         * tolerance to widen. */
+        if (r->dist_step_back_max > 0.0) {
+            fail(fixture, "distance moved backwards by up to %.6f m",
+                 r->dist_step_back_max);
+        }
+        if (o.distance_m < 0.0) {
+            fail(fixture, "distance ended at %.1f m", o.distance_m);
+        }
+        /* The acceptance criterion: distance agrees with the Odometer's own
+         * account of the same journey to within the Odometer's quantisation.
+         * The Anchor's account is the truth floored to a whole count, so the
+         * fused figure sitting a little above it is right and not a drift;
+         * a count is the whole budget either way. */
+        double gap = o.distance_m - o.odo_distance_m;
+        if (gap < 0.0) {
+            gap = -gap;
+        }
+        if (gap > (double)WF_CTRL_ODO_METRES_PER_COUNT) {
+            fail(fixture, "distance %.1f m against the Odometer's %.1f m - "
+                          "%.1f m apart, more than its own %d m quantisation",
+                 o.distance_m, o.odo_distance_m, gap,
+                 WF_CTRL_ODO_METRES_PER_COUNT);
+        }
     }
 }
 
@@ -794,6 +938,12 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                wf_est_limp_soc_pct(), o.used_wh, o.soc_pct, o.anchor_soc_pct,
                r->est_points, (unsigned long long)r->est_hash);
     }
+    if (r->dist_points > 0) {
+        printf("  distance: %.1f m fused from %.1f m of Odometer, %ld curve "
+               "points hash %016llx\n",
+               r->dist_m_last, r->dist_odo_last, r->dist_points,
+               (unsigned long long)r->dist_hash);
+    }
 }
 
 int main(int argc, char **argv)
@@ -836,9 +986,10 @@ int main(int argc, char **argv)
             continue;
         }
 
+        const odo_synth_t off = { .on = false, .start = 0 };
         wflog_hdr_t hdr;
         run_t r;
-        replay(buf, len, &hdr, &r);
+        replay(buf, len, &hdr, &r, &off);
         report(&hdr, &r);
         if (hdr.version != WFLOG_VERSION) {
             /* Not a warning: a Capture from a format this build does not know
@@ -856,13 +1007,52 @@ int main(int argc, char **argv)
          * outside the file would show up here. */
         wflog_hdr_t hdr2;
         run_t again;
-        replay(buf, len, &hdr2, &again);
+        replay(buf, len, &hdr2, &again, &off);
         if (again.est_hash != r.est_hash || again.est_points != r.est_points) {
             fail(paths[i], "replaying it twice produced two different "
                            "Remaining Energy curves: %ld points hash %016llx, "
                            "then %ld points hash %016llx",
                  r.est_points, (unsigned long long)r.est_hash,
                  again.est_points, (unsigned long long)again.est_hash);
+        }
+        if (again.dist_hash != r.dist_hash ||
+            again.dist_points != r.dist_points) {
+            fail(paths[i], "replaying it twice produced two different distance "
+                           "curves: %ld points hash %016llx, then %ld points "
+                           "hash %016llx",
+                 r.dist_points, (unsigned long long)r.dist_hash,
+                 again.dist_points, (unsigned long long)again.dist_hash);
+        }
+
+        /* The wrap criterion. The same ride twice more, with the Odometer's
+         * count rewritten to the same ramp both times and started either side
+         * of the wrap. A wrap has to be a non-event, so the two distance
+         * curves are compared bit for bit and not within a tolerance. */
+        const odo_synth_t clear   = { .on = true, .start = 1000 };
+        const odo_synth_t wrapped = { .on = true, .start = 65530 };
+        wflog_hdr_t hdr3, hdr4;
+        run_t a, b;
+        replay(buf, len, &hdr3, &a, &clear);
+        replay(buf, len, &hdr4, &b, &wrapped);
+        if (a.dist_points == 0) {
+            fail(paths[i], "the synthesised Odometer ramp produced no distance "
+                           "at all");
+        } else if (a.dist_odo_last <= 0.0) {
+            fail(paths[i], "the synthesised Odometer ramp never advanced, so "
+                           "the wrap assertion is measuring nothing");
+        } else if (b.dist_hash != a.dist_hash ||
+                   b.dist_m_last != a.dist_m_last ||
+                   b.dist_odo_last != a.dist_odo_last) {
+            fail(paths[i], "an Odometer wrap moved distance: %.6f m from count "
+                           "1000, %.6f m from count 65530, over %.0f m of "
+                           "synthesised Odometer",
+                 a.dist_m_last, b.dist_m_last, a.dist_odo_last);
+        }
+        if (a.dist_step_back_max > 0.0 || b.dist_step_back_max > 0.0) {
+            fail(paths[i], "distance moved backwards across the synthesised "
+                           "Odometer ramp, by up to %.6f m",
+                 a.dist_step_back_max > b.dist_step_back_max
+                     ? a.dist_step_back_max : b.dist_step_back_max);
         }
 
         metrics_t ms = { .n = 0 };

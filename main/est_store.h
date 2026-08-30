@@ -24,5 +24,13 @@ bool est_store_load(wf_est_persist_t *out);
 /* Writes the saved state, replacing whatever was there. Called at the end of a
  * capture and on shutdown, not on a timer: NVS is flash, and the value this
  * bridges - the seconds between power-on and the first BMS answer - is not
- * worth a write per second of riding. */
+ * worth a write per second of riding.
+ *
+ * Distance, added in #13, is bridged by the same write and is worth more than
+ * that: a stop and a restart mid-ride carries on from the metres already
+ * counted rather than from zero. What it does not survive is a Monitor that
+ * loses power without shutting down, which reverts to the last orderly write.
+ * That is the same limitation the charge figures have always had; if a ride
+ * ever needs better, the fix is a periodic write and it costs flash wear, so
+ * it is a decision and not an oversight. */
 esp_err_t est_store_save(const wf_est_persist_t *p);

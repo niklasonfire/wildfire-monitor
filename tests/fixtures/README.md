@@ -45,5 +45,13 @@ comment. The names are the measurements `tests/host/replay.c` collects
 (`ctrl_frames_bad`, `pack_v_min`, `speed_kmh_max`, …); a name it does not
 measure is a failure, so a typo cannot assert nothing. Values that hold for
 *any* Capture - checksums verifying, cells inside lithium's voltage range,
-pack voltage matching the sum of the cells - are asserted by the runner
-itself and do not belong in a `.expect` file.
+pack voltage matching the sum of the cells, distance never running backwards -
+are asserted by the runner itself and do not belong in a `.expect` file.
+
+Every Capture is also replayed twice more with its Odometer frames rewritten
+to a synthesised count ramp, started either side of the u16 wrap, and the two
+distance curves have to come out bit-identical. No ride we hold crosses the
+wrap - it happens once every 6553 km - so this is how a real ride's timing and
+speeds get to exercise it. Nothing is written back: the rewrite happens in a
+scratch buffer on the way into the parser, and the `.wfl` on disk stays the
+bytes the devices sent (ADR-0001).

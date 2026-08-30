@@ -73,8 +73,15 @@ _Avoid_: reference, correction, ground truth
 
 ### Riding and range
 
+**Distance**:
+How far the Monitor has seen the bike travel, in metres. One figure, fused from
+two sources that are each insufficient alone: integrated speed for resolution
+between Odometer counts, the Odometer as the Anchor for truth. Not the same
+thing as the Odometer, which is the bike's own lifetime total.
+_Avoid_: trip, mileage, odometer (that is the Anchor, not this)
+
 **Consumption**:
-Energy used per unit distance, in watt-hours per kilometre. The figure that
+Energy used per unit Distance, in watt-hours per kilometre. The figure that
 converts Remaining Energy into Range.
 _Avoid_: efficiency (it is the inverse), economy, usage
 

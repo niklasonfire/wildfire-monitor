@@ -115,3 +115,27 @@ est_used_ah         0.02
 est_soc_last        66.67
 est_anchor_soc_last 66.70
 est_soc_gap_max     0.03
+
+# Distance, fused from integrated speed and the Odometer per ADR-0003.
+#
+# This ride is the plumbing check and nothing more, because its Odometer never
+# moves: `odometer_raw` reads a constant 14 for all 47 s, so the Anchor's own
+# account of this journey is 0 m and the truth is somewhere in the first
+# hundred metres. Integrating the road speed alone gives 21.9 m; the pull
+# toward a stationary Anchor takes it to 16.7 m, which is the fusion visibly
+# doing its job on a figure the Odometer cannot yet contradict. Neither number
+# is checkable against the ground - nothing here settles
+# WF_CTRL_ODO_METRES_PER_COUNT, and Ride 1 is what does.
+#
+# What is worth asserting is the rate and the count. 243 distance steps is one
+# per motion frame after the first, which is the criterion "updated at the rate
+# of the Controller's stream rather than at Odometer ticks" as a number: 31
+# Odometer frames arrived in the same 47 s. The wrap, the link drop and the
+# drift the Anchor exists to absorb are driven with synthesised streams in
+# tests/host/unit.c, and the wrap again by replaying this very file with its
+# Odometer rewritten - see the odo_synth block in tests/host/replay.c.
+est_dist_points       1687
+est_distance_m        16.71
+est_odo_distance_m    0.00
+est_distance_samples  243
+est_odo_samples       31

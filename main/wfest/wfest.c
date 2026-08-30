@@ -104,11 +104,11 @@ bool wf_est_persist_encode(const wf_est_persist_t *p, uint8_t *buf, size_t cap)
     buf[1] = PERSIST_MAGIC_1;
     put_u16(&buf[2], p->version);
     buf[4] = p->valid ? 1u : 0u;
-    /* buf[5] and buf[18..21] stay zero: room for the next field without a
-     * version bump being the only way to add one. */
+    buf[5] = p->distance_valid ? 1u : 0u;   /* version 2; zero in version 1 */
     put_f32(&buf[6],  p->coulomb_ah);
     put_f32(&buf[10], p->remaining_wh);
     put_f32(&buf[14], p->rated_capacity_ah);
+    put_f32(&buf[18], p->distance_m);       /* version 2; zero in version 1 */
     put_u16(&buf[22], wf_crc16(buf, WF_EST_PERSIST_BYTES - 2, PERSIST_CRC_INIT));
     return true;
 }
@@ -121,7 +121,13 @@ bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out
     if (buf[0] != PERSIST_MAGIC_0 || buf[1] != PERSIST_MAGIC_1) {
         return false;
     }
-    if (get_u16(&buf[2]) != WF_EST_PERSIST_VERSION) {
+    /* A version this build has never written is rejected outright; an older
+     * one it knows the layout of is migrated. Version 1 is version 2 without
+     * distance_m, in bytes it left zeroed, so the migration is to read the
+     * distance as the zero a build that did not count metres knew. */
+    uint16_t version = get_u16(&buf[2]);
+    if (version < WF_EST_PERSIST_VERSION_MIN ||
+        version > WF_EST_PERSIST_VERSION) {
         return false;
     }
     if (get_u16(&buf[22]) !=
@@ -129,11 +135,13 @@ bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out
         return false;
     }
     memset(out, 0, sizeof(*out));
-    out->version           = get_u16(&buf[2]);
+    out->version           = version;
     out->valid             = buf[4] != 0;
     out->coulomb_ah        = get_f32(&buf[6]);
     out->remaining_wh      = get_f32(&buf[10]);
     out->rated_capacity_ah = get_f32(&buf[14]);
+    out->distance_valid    = version >= 2 && buf[5] != 0;
+    out->distance_m        = version >= 2 ? get_f32(&buf[18]) : 0.0f;
     return true;
 }
 
@@ -146,8 +154,22 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
     }
     memset(e, 0, sizeof(*e));
 
-    if (restored == NULL || !restored->valid ||
-        restored->version != WF_EST_PERSIST_VERSION) {
+    if (restored == NULL ||
+        restored->version < WF_EST_PERSIST_VERSION_MIN ||
+        restored->version > WF_EST_PERSIST_VERSION) {
+        return;
+    }
+
+    /* Distance first, and on its own terms: it is metres travelled, it does
+     * not depend on the Pack model, and the Rated Capacity guard below has
+     * nothing to say about it. The comparison is written the way round that
+     * rejects a NaN as well as a negative. */
+    if (restored->distance_valid && restored->distance_m >= 0.0f) {
+        e->distance_m        = (double)restored->distance_m;
+        e->distance_restored = true;
+    }
+
+    if (!restored->valid) {
         return;
     }
     /* A count saved against a different Rated Capacity is a count of something
@@ -162,6 +184,110 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
     e->restored     = true;
 }
 
+/* ---------------------------------------------------------------- distance */
+
+/* One Odometer reading into the Anchor. Never moves distance itself, exactly
+ * as a BMS answer never moves the Coulomb Count - the pull in distance_step()
+ * is the only thing that does. */
+static void odo_fold(wf_est_t *e, const wf_ctrl_live_t *live)
+{
+    if (!live->odo_valid) {
+        return;
+    }
+    if (!e->odo_seen) {
+        /* Acquisition, and the only assignment in here. Setting the Anchor to
+         * whatever distance already is costs nothing at all - it is the
+         * Odometer agreeing to measure from here - which is what lets it
+         * acquire mid-ride, or against a distance restored from NVS, without
+         * a step. */
+        e->odo_counts     = live->odometer_raw;
+        e->odo_distance_m = e->distance_m;
+        e->odo_seen       = true;
+        e->odo_samples++;
+        return;
+    }
+
+    /* Wrap-safe u16 modular subtraction, in counts, before anything becomes a
+     * distance: 65535 to 0 is one count. Differences only, never the absolute
+     * reading, so the wrap is not a case to detect. */
+    uint16_t d_counts = wf_ctrl_odo_delta_counts(e->odo_counts,
+                                                 live->odometer_raw);
+    e->odo_counts = live->odometer_raw;
+    e->odo_samples++;
+
+    /* More than half the counter's span forward is more plausibly a reading
+     * that went backwards - which this subtraction cannot distinguish from a
+     * nearly-complete wrap, and says so in wfdecode.h. Re-base on the new
+     * reading and credit nothing: crediting it would put a 3000 km phantom
+     * trip into the Anchor and drag distance after it for the rest of the
+     * ride. Nothing on this bike covers 3276 km between two Odometer frames.
+     */
+    if (d_counts > 0x8000u) {
+        return;
+    }
+    e->odo_distance_m += (double)wf_ctrl_odo_metres(d_counts);
+}
+
+/* One motion frame: integrate road speed, then pull toward the Odometer. */
+static void distance_step(wf_est_t *e, uint32_t t_ms,
+                          const wf_ctrl_live_t *live)
+{
+    if (!e->speed_t_valid) {
+        /* Nothing to integrate over yet: the first frame only starts the
+         * clock, the same as the first power sample. */
+        e->speed_t_ms    = t_ms;
+        e->speed_t_valid = true;
+        return;
+    }
+
+    uint32_t dt_ms = t_ms - e->speed_t_ms;
+    e->speed_t_ms = t_ms;
+    if (dt_ms == 0) {
+        return;
+    }
+    if (dt_ms > WF_EST_DT_MAX_MS) {
+        /* A link that dropped for a minute must not book a minute at the last
+         * speed it happened to see. The metres actually covered during the
+         * drop come back through the Odometer instead, which is the whole
+         * point of having one. */
+        dt_ms = WF_EST_DT_MAX_MS;
+    }
+    double dt_s = (double)dt_ms / 1000.0;
+
+    double d_m = 0.0;
+    if (live->speed_valid) {
+        /* km/h to m/s. The speed itself is wf_ctrl_speed_kmh()'s and is not
+         * re-derived here; this is a unit conversion and nothing more. */
+        d_m = (double)live->cur_speed_kmh * (1000.0 / 3600.0) * dt_s;
+        if (d_m < 0.0) {
+            d_m = 0.0;
+        }
+        e->speed_seen = true;
+    }
+
+    double pull = 0.0;
+    if (e->odo_seen) {
+        double k = dt_s / WF_EST_DIST_TAU_S;
+        if (k > 1.0) {
+            k = 1.0;
+        }
+        pull = (e->odo_distance_m - e->distance_m) * k;
+    }
+
+    /* Floored at zero, which is the one place distance is not treated the way
+     * the Coulomb Count is. The correction may slow the figure to a standstill
+     * and may not reverse it: a distance that ticks backwards on the rider's
+     * screen is wrong in a way a watt-hour figure is not, and an over-reading
+     * speed is absorbed by the figure sitting still while the Odometer catches
+     * up. */
+    double step = d_m + pull;
+    if (step < 0.0) {
+        step = 0.0;
+    }
+    e->distance_m += step;
+    e->distance_samples++;
+}
+
 void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
                       const wf_ctrl_live_t *live)
 {
@@ -170,6 +296,16 @@ void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
     }
     e->last_t_ms    = t_ms;
     e->last_t_valid = true;
+
+    if (frame_type == WF_CTRL_TYPE_ODO) {
+        odo_fold(e, live);
+        return;
+    }
+    if (wf_ctrl_type_in(wf_ctrl_type_motion, WF_CTRL_TYPE_MOTION_COUNT,
+                        frame_type)) {
+        distance_step(e, t_ms, live);
+        return;
+    }
 
     if (!wf_ctrl_type_in(wf_ctrl_type_power, WF_CTRL_TYPE_POWER_COUNT,
                          frame_type) ||
@@ -293,6 +429,13 @@ void wf_est_get(const wf_est_t *e, wf_est_out_t *out)
     out->power_samples  = e->power_samples;
     out->anchor_samples = e->anchor_samples;
 
+    out->distance_valid   = e->speed_seen || e->odo_seen || e->distance_restored;
+    out->odo_anchored     = e->odo_seen;
+    out->distance_m       = e->distance_m;
+    out->odo_distance_m   = e->odo_distance_m;
+    out->distance_samples = e->distance_samples;
+    out->odo_samples      = e->odo_samples;
+
     if (e->anchor_seen && e->last_t_valid) {
         out->anchor_age_ms = e->last_t_ms - e->anchor_t_ms;
         out->anchor_fresh  = out->anchor_age_ms <= WF_EST_ANCHOR_STALE_MS;
@@ -313,4 +456,9 @@ void wf_est_save(const wf_est_t *e, wf_est_persist_t *out)
     out->valid        = e->acquired || e->restored;
     out->coulomb_ah   = (float)e->coulomb_ah;
     out->remaining_wh = (float)e->remaining_wh;
+    /* Its own flag: `valid` above is about the charge figures, which need an
+     * Anchor this Monitor may never have got, and distance needs no such
+     * thing. A ride with a Controller and no BMS still has metres to keep. */
+    out->distance_valid = e->speed_seen || e->odo_seen || e->distance_restored;
+    out->distance_m     = (float)e->distance_m;
 }

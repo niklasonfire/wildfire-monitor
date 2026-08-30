@@ -587,9 +587,15 @@ static void test_a_bms_gap_produces_no_step(void)
 /* ---- what drives an integration step ------------------------------------ */
 
 /* Only the power block's eight frame types carry a fresh pack voltage and line
- * current, so only they may take a step. Otherwise the integration interval
- * would be set by whichever of the other 47 types happened to arrive, and the
- * curve would depend on arrival timing rather than on the recorded stream. */
+ * current, so only they may take an energy step. Otherwise the integration
+ * interval would be set by whichever of the other 47 types happened to arrive,
+ * and the curve would depend on arrival timing rather than on the recorded
+ * stream.
+ *
+ * 0x83 is the interleaved noise because the Field Table assigns it nothing at
+ * all, which makes the assertion the strongest one available: the whole state,
+ * memcmp'd, not just the energy. The motion block would not do - it carries
+ * rpm, so it moves distance, and moving distance is its job. */
 static void test_only_the_power_block_integrates(void)
 {
     wf_est_t plain, noisy;
@@ -608,8 +614,7 @@ static void test_only_the_power_block_integrates(void)
         wf_est_feed_ctrl(&plain, t, wf_ctrl_type_power[0], &live);
         /* The same ride, with the 35 Hz of everything else interleaved. */
         for (uint32_t k = 1; k < 7; k++) {
-            wf_est_feed_ctrl(&noisy, t - SAMPLE_MS + k * 28u,
-                             wf_ctrl_type_motion[0], &live);
+            wf_est_feed_ctrl(&noisy, t - SAMPLE_MS + k * 28u, 0x83, &live);
         }
         wf_est_feed_ctrl(&noisy, t, wf_ctrl_type_power[0], &live);
     }
@@ -634,6 +639,352 @@ static void test_a_long_gap_is_clamped(void)
     wf_est_get(&e, &o);
     CHECK_D(o.used_ah, 50.0 * (WF_EST_DT_MAX_MS / 1000.0) / 3600.0, 1e-6,
             "charge booked for a ten-minute stall");
+}
+
+/* ---- distance ----------------------------------------------------------- */
+
+/* cap0007 reads a constant Odometer of 14 and never exceeds 5.64 km/h, so it
+ * cannot exercise a wrap, a link drop or any real distance at all. All of that
+ * is driven here, the same way the Odometer's own wrap is above.
+ *
+ * The synthesised streams below stand in for the two halves of the fusion: a
+ * motion frame every SAMPLE_MS carrying a road speed, and an Odometer frame at
+ * ODO_MS carrying a raw u16 count. Both mimic the real rates - the motion
+ * block at ~5.2 Hz and the Odometer's single type at ~0.65 Hz. */
+#define ODO_MS 1550u        /* one 55-type cycle, which is what 0x94 gets */
+
+static void feed_speed(wf_est_t *e, uint32_t t_ms, double kmh)
+{
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+    live.motion_valid  = true;
+    live.speed_valid   = true;
+    live.cur_speed_kmh = (float)kmh;
+    wf_est_feed_ctrl(e, t_ms, wf_ctrl_type_motion[0], &live);
+}
+
+/* A motion frame with no road speed in it: the wheel geometry from type 0xaf
+ * has not arrived, so wf_ctrl_apply() has left speed_valid false. */
+static void feed_no_speed(wf_est_t *e, uint32_t t_ms)
+{
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+    live.motion_valid = true;
+    wf_est_feed_ctrl(e, t_ms, wf_ctrl_type_motion[0], &live);
+}
+
+static void feed_odo(wf_est_t *e, uint32_t t_ms, uint16_t counts)
+{
+    wf_ctrl_live_t live;
+    memset(&live, 0, sizeof(live));
+    live.odo_valid    = true;
+    live.odometer_raw = counts;
+    wf_est_feed_ctrl(e, t_ms, WF_CTRL_TYPE_ODO, &live);
+}
+
+static double distance(const wf_est_t *e)
+{
+    wf_est_out_t o;
+    wf_est_get(e, &o);
+    return o.distance_m;
+}
+
+/* Nothing to show before either source has spoken. A confident 0 m from a link
+ * that has never come up is the same mistake as a confident watt-hour figure
+ * from a Pack nobody has measured. */
+static void test_no_distance_before_either_source(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(!o.distance_valid, "distance valid before any input");
+    CHECK(!o.odo_anchored, "odo anchored before any input");
+
+    /* A BMS answer is not a distance source. */
+    feed_soc(&e, 0, 50.0);
+    wf_est_get(&e, &o);
+    CHECK(!o.distance_valid, "a BMS answer made distance valid");
+}
+
+/* The resolution half of ADR-0003, on its own: with no Odometer at all,
+ * distance is the integral of road speed and nothing else, and it steps once
+ * per motion frame rather than once per Odometer tick. */
+static void test_distance_integrates_speed(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    /* 36 km/h is 10 m/s. Sixty seconds of it is 600 m. The first frame only
+     * starts the clock, so the integrated span is 0 to 60000 ms. */
+    for (uint32_t t = 0; t <= 60000u; t += SAMPLE_MS) {
+        feed_speed(&e, t, 36.0);
+    }
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.distance_valid, "distance not valid after a minute of riding");
+    CHECK(!o.odo_anchored, "distance anchored with no Odometer in the stream");
+    CHECK_D(o.distance_m, 600.0, 1e-6, "600 m at 36 km/h for a minute");
+    /* Once per motion frame: 300 steps in the minute, the first frame having
+     * only started the clock. That is the criterion "updated at the rate of
+     * the Controller's stream rather than at Odometer ticks", as a number. */
+    CHECK_U(o.distance_samples, 300, "distance steps over the minute");
+}
+
+/* The Anchor half. Road speed is fed 20 % high - it is rpm times a wheel
+ * circumference and a gearing constant, none of them measured - and the
+ * Odometer tells the truth. Unanchored, ten minutes of that is 400 m of
+ * invented distance. Anchored, the answer has to end up inside the Odometer's
+ * own hundred-metre quantisation, and it has to get there without ever
+ * stepping backwards or visibly at a tick. */
+static void test_the_odometer_corrects_drift_without_a_step(void)
+{
+    const double true_mps  = 10.0;              /* 36 km/h */
+    const double seen_kmh  = 36.0 * 1.2;        /* what the Controller claims */
+    const uint32_t end_ms  = 600000u;           /* ten minutes */
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_odo(&e, 0, 1000);                      /* acquisition, at zero */
+
+    double prev = 0.0;
+    double worst_back = 0.0;                    /* largest backwards move */
+    double worst_step = 0.0;                    /* largest single step */
+    double worst_error = 0.0;                   /* furthest from the truth */
+    for (uint32_t t = SAMPLE_MS; t <= end_ms; t += SAMPLE_MS) {
+        feed_speed(&e, t, seen_kmh);
+        double now = distance(&e);
+        double step = now - prev;
+        if (step < worst_back) {
+            worst_back = step;
+        }
+        if (step > worst_step) {
+            worst_step = step;
+        }
+        prev = now;
+
+        double true_m = true_mps * (t / 1000.0);
+        double err = now - true_m;
+        if (err < 0.0) {
+            err = -err;
+        }
+        if (err > worst_error) {
+            worst_error = err;
+        }
+        if (t % ODO_MS < SAMPLE_MS) {
+            /* The Odometer, counting real metres at a hundred to the count. */
+            feed_odo(&e, t, (uint16_t)(1000u + (unsigned)(true_m /
+                        WF_CTRL_ODO_METRES_PER_COUNT)));
+        }
+    }
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.odo_anchored, "the Odometer never acquired");
+
+    /* The criterion, against the ground rather than against the Odometer.
+     * The Odometer's own account is the truth floored to a whole count, so it
+     * is itself up to a count low and is the wrong thing to be tight against;
+     * what has to hold is that the fused figure is inside one Odometer count
+     * of the metres the bike really covered, throughout, and not only at the
+     * end. */
+    CHECK(worst_error < WF_CTRL_ODO_METRES_PER_COUNT,
+          "distance was %.0f m from the truth at its worst, more than the "
+          "Odometer's own %d m quantisation", worst_error,
+          WF_CTRL_ODO_METRES_PER_COUNT);
+    CHECK_D(o.odo_distance_m, 6000.0, 1e-9, "the Odometer's own account");
+
+    /* Never backwards, at all, ever. */
+    CHECK_D(worst_back, 0.0, 0.0, "the largest backwards move in distance");
+
+    /* And no step visible at a tick. A free-running step at 43.2 km/h is
+     * 2.4 m; if the Anchor were assigned rather than pulled, the step at the
+     * tick that closed a 400 m error would be hundreds of times that. */
+    CHECK(worst_step < 3.0,
+          "distance stepped %.3f m in one frame, against the 2.4 m free "
+          "running at this speed - that is a re-anchor, not a pull",
+          worst_step);
+
+    /* And the assertion that the test is measuring something: the same ten
+     * minutes with the Odometer withheld invents 20 % of the ride. */
+    wf_est_t loose;
+    wf_est_init(&loose, NULL);
+    for (uint32_t t = 0; t <= end_ms; t += SAMPLE_MS) {
+        feed_speed(&loose, t, seen_kmh);
+    }
+    CHECK(distance(&loose) > 7000.0,
+          "the unanchored distance only reached %.0f m, so this test is not "
+          "measuring what it claims", distance(&loose));
+}
+
+/* The acceptance criterion, and the one cap0007 cannot touch: an Odometer that
+ * wraps must change nothing at all.
+ *
+ * Two identical rides, differing only in where the counter started - one well
+ * clear of the wrap, one six counts short of it, so the second crosses 65535
+ * to 0 partway through. The Anchor is built from differences and never from an
+ * absolute reading, so the two must not merely be close: they have to be the
+ * same double, bit for bit. */
+static void test_an_odometer_wrap_changes_nothing(void)
+{
+    wf_est_t plain, wrapped;
+    wf_est_init(&plain, NULL);
+    wf_est_init(&wrapped, NULL);
+
+    unsigned tick = 0;
+    for (uint32_t t = 0; t <= 300000u; t += SAMPLE_MS) {
+        feed_speed(&plain, t, 36.0);
+        feed_speed(&wrapped, t, 36.0);
+        if (t % ODO_MS < SAMPLE_MS) {
+            feed_odo(&plain,   t, (uint16_t)(1000u + tick));
+            feed_odo(&wrapped, t, (uint16_t)(65530u + tick));
+            tick++;
+        }
+    }
+    CHECK(tick > 10, "the ride was too short to reach the wrap");
+
+    CHECK(memcmp(&plain.distance_m, &wrapped.distance_m,
+                 sizeof(plain.distance_m)) == 0,
+          "the wrapping ride produced %.9f m against %.9f m",
+          wrapped.distance_m, plain.distance_m);
+    CHECK(memcmp(&plain.odo_distance_m, &wrapped.odo_distance_m,
+                 sizeof(plain.odo_distance_m)) == 0,
+          "the wrapping ride's Odometer account is %.9f m against %.9f m",
+          wrapped.odo_distance_m, plain.odo_distance_m);
+}
+
+/* A reading that goes backwards is what the wrap-safe subtraction cannot tell
+ * from a nearly-complete wrap, so it is credited as 65535 counts - 6553 km.
+ * The estimator refuses anything past half the counter's span and re-bases
+ * instead, because nothing on this bike covers 3276 km between two frames. */
+static void test_an_odometer_that_jumps_is_not_believed(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_odo(&e, 0, 1000);
+    feed_odo(&e, ODO_MS, 1005);             /* 500 m, believed */
+    feed_odo(&e, 2 * ODO_MS, 5);            /* a leap backwards */
+    feed_odo(&e, 3 * ODO_MS, 10);           /* 500 m from the new base */
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK_D(o.odo_distance_m, 1000.0, 1e-9,
+            "the Odometer account after a reading that went backwards");
+}
+
+/* The Controller link drops for two minutes while the bike keeps riding, then
+ * comes back. Nothing may be lost - the metres covered during the drop are in
+ * the Odometer, which is exactly what a non-drifting Anchor is for - and
+ * nothing may be duplicated, which is what the dt clamp is for: two minutes at
+ * the last speed seen would be 1.2 km of invented distance. */
+static void test_a_controller_link_drop_loses_no_distance(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_odo(&e, 0, 1000);
+
+    uint32_t t = SAMPLE_MS;
+    /* A minute at 36 km/h: 600 m, six counts. */
+    for (; t <= 60000u; t += SAMPLE_MS) {
+        feed_speed(&e, t, 36.0);
+        if (t % ODO_MS < SAMPLE_MS) {
+            feed_odo(&e, t, (uint16_t)(1000u + (t / 10000u)));
+        }
+    }
+
+    /* The link goes. The bike rides on for two minutes at the same speed -
+     * another 1200 m, twelve counts - and the Monitor hears none of it. */
+    uint32_t back_ms = t + 120000u;
+
+    /* The link returns, and the first Odometer reading carries the whole gap:
+     * 60 s + 120 s at 10 m/s is 1800 m, count 1000 + 18. */
+    feed_speed(&e, back_ms, 36.0);
+    feed_odo(&e, back_ms, 1018);
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK_D(o.odo_distance_m, 1800.0, 1e-9,
+            "the Odometer account across the drop");
+    /* Nothing duplicated: the one frame that spanned the gap booked at most
+     * WF_EST_DT_MAX_MS of speed, not two minutes of it. */
+    CHECK(o.distance_m < 700.0,
+          "distance jumped to %.0f m on the first frame after the drop; two "
+          "minutes at 10 m/s would be 1200 m of it invented", o.distance_m);
+
+    /* Nothing lost: keep riding and the pull brings the whole gap back, to
+     * within the Odometer's quantisation. Five minutes at 36 km/h is 3000 m
+     * more, so 4800 m in total. */
+    uint32_t end_ms = back_ms + 300000u;
+    for (t = back_ms + SAMPLE_MS; t <= end_ms; t += SAMPLE_MS) {
+        feed_speed(&e, t, 36.0);
+        if (t % ODO_MS < SAMPLE_MS) {
+            feed_odo(&e, t, (uint16_t)(1000u + 18u +
+                        ((t - back_ms) / 10000u)));
+        }
+    }
+    wf_est_get(&e, &o);
+    CHECK_D(o.distance_m, o.odo_distance_m, WF_CTRL_ODO_METRES_PER_COUNT,
+            "distance against the Odometer five minutes after the link came "
+            "back");
+    CHECK_D(o.distance_m, 4800.0, 2.0 * WF_CTRL_ODO_METRES_PER_COUNT,
+            "distance against the 4800 m actually covered, drop included");
+}
+
+/* Speed needs the wheel geometry from type 0xaf, and until that has arrived
+ * `speed_valid` is false. An unknown speed is not integrated as zero; the
+ * Odometer carries distance on its own in that window, smoothed from a
+ * hundred-metre staircase into something continuous.
+ *
+ * What that costs is a first-order lag: with nothing but the Anchor pulling,
+ * distance trails the Odometer by roughly the time constant times the speed
+ * while the bike is moving, and catches up completely when it stops. Both
+ * halves are asserted, because the lag is the honest consequence of having no
+ * speed to integrate and not a defect to hide. */
+static void test_distance_before_the_wheel_geometry(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_odo(&e, 0, 1000);
+
+    uint32_t t = SAMPLE_MS;
+    double overshoot = 0.0;
+    for (; t <= 300000u; t += SAMPLE_MS) {
+        feed_no_speed(&e, t);
+        if (t % ODO_MS < SAMPLE_MS) {
+            feed_odo(&e, t, (uint16_t)(1000u + (t / 10000u)));
+        }
+        wf_est_out_t s;
+        wf_est_get(&e, &s);
+        if (s.distance_m - s.odo_distance_m > overshoot) {
+            overshoot = s.distance_m - s.odo_distance_m;
+        }
+    }
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.distance_valid, "no distance at all without the wheel geometry");
+    CHECK(o.odo_distance_m > 2500.0, "the Odometer account only reached %.0f m",
+          o.odo_distance_m);
+    /* Behind the Anchor, never in front of it: with no speed there is nothing
+     * that could put distance ahead of the Odometer. */
+    CHECK_D(overshoot, 0.0, 1e-9,
+            "distance ran ahead of the Odometer with no speed to integrate");
+    CHECK(o.distance_m < o.odo_distance_m,
+          "distance %.0f m did not lag the Odometer's %.0f m while moving",
+          o.distance_m, o.odo_distance_m);
+
+    /* The bike stops. The Odometer stops with it, the Controller keeps
+     * talking, and the lag closes completely. */
+    double parked_odo = o.odo_distance_m;
+    uint32_t end_ms = t + 600000u;
+    for (; t <= end_ms; t += SAMPLE_MS) {
+        feed_no_speed(&e, t);
+    }
+    wf_est_get(&e, &o);
+    CHECK_D(o.distance_m, parked_odo, 1.0,
+            "distance ten minutes after the bike stopped");
 }
 
 /* ---- determinism -------------------------------------------------------- */
@@ -751,6 +1102,120 @@ static void test_a_restored_count_is_not_an_anchor(void)
     CHECK(!o.valid, "a count from a future version was restored");
 }
 
+/* ---- distance across a power cycle -------------------------------------- */
+
+/* The acceptance criterion. Half a ride, the Monitor loses power, the state
+ * goes through NVS's bytes and comes back, and the second half carries on from
+ * where the first stopped rather than from zero.
+ *
+ * The Odometer's count is deliberately NOT persisted. The first reading after
+ * the restore acquires against the restored distance, so the bike having been
+ * ridden while the Monitor was off - it runs on its own battery and can be
+ * switched off under a rider who keeps going - is not credited to a Capture
+ * that did not see it. */
+static void test_distance_survives_a_power_cycle(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_odo(&e, 0, 1000);
+    for (uint32_t t = SAMPLE_MS; t <= 120000u; t += SAMPLE_MS) {
+        feed_speed(&e, t, 36.0);
+        if (t % ODO_MS < SAMPLE_MS) {
+            feed_odo(&e, t, (uint16_t)(1000u + (t / 10000u)));
+        }
+    }
+    double before = distance(&e);
+    CHECK(before > 1000.0, "two minutes at 36 km/h only reached %.0f m",
+          before);
+
+    /* Out through the bytes and back, exactly as est_store.c does it. */
+    wf_est_persist_t saved;
+    wf_est_save(&e, &saved);
+    CHECK(saved.distance_valid, "a ridden distance saved as invalid");
+
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)), "encode failed");
+    wf_est_persist_t back;
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &back), "decode failed");
+
+    wf_est_t after;
+    wf_est_init(&after, &back);
+    wf_est_out_t o;
+    wf_est_get(&after, &o);
+    CHECK(o.distance_valid, "distance did not survive the power cycle");
+    CHECK(!o.odo_anchored, "the Odometer count was persisted; it must not be");
+    /* A float, so the restored value is the double rounded to single. */
+    CHECK_D(o.distance_m, before, 0.05, "distance across the power cycle");
+
+    /* The bike was ridden 5 km while the Monitor was off. The Odometer
+     * acquires against the restored distance and credits none of it. */
+    feed_odo(&after, 0, 1050);
+    wf_est_get(&after, &o);
+    CHECK_D(o.odo_distance_m, o.distance_m, 1e-9,
+            "the Odometer acquired somewhere other than at the restored "
+            "distance");
+
+    /* And carries on. Another minute is 600 m more. */
+    for (uint32_t t = SAMPLE_MS; t <= 60000u; t += SAMPLE_MS) {
+        feed_speed(&after, t, 36.0);
+        if (t % ODO_MS < SAMPLE_MS) {
+            feed_odo(&after, t, (uint16_t)(1050u + (t / 10000u)));
+        }
+    }
+    wf_est_get(&after, &o);
+    CHECK_D(o.distance_m, before + 600.0, WF_CTRL_ODO_METRES_PER_COUNT,
+            "distance after another minute on the far side of the restore");
+}
+
+/* Version 1 is version 2 without distance, in bytes version 1 left zeroed. A
+ * blob from that build has to be migrated deliberately - charge figures kept,
+ * distance starting at nothing, which is what that build actually knew - and
+ * not misread as a distance of whatever those bytes happened to hold. */
+static void test_a_version_1_blob_is_migrated(void)
+{
+    /* Built by hand rather than by the encoder, because the encoder only
+     * writes the current version. This is the byte layout version 1 wrote. */
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    memset(blob, 0, sizeof(blob));
+    blob[0] = 0x57;                 /* 'W' */
+    blob[1] = 0x45;                 /* 'E' */
+    blob[2] = 1;                    /* version 1, little endian */
+    blob[4] = 1;                    /* valid */
+    float coulomb = 20.0f, remaining = 1000.0f;
+    float rated = (float)WF_EST_RATED_CAPACITY_AH;
+    memcpy(&blob[6], &coulomb, sizeof(coulomb));
+    memcpy(&blob[10], &remaining, sizeof(remaining));
+    memcpy(&blob[14], &rated, sizeof(rated));
+    uint16_t crc = wf_crc16(blob, WF_EST_PERSIST_BYTES - 2, 0xffff);
+    blob[22] = (uint8_t)(crc & 0xff);
+    blob[23] = (uint8_t)(crc >> 8);
+
+    wf_est_persist_t p;
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &p),
+          "a version 1 blob was rejected rather than migrated");
+    CHECK_U(p.version, 1, "the version the blob was written at");
+    CHECK(p.valid, "the version 1 charge figures were dropped");
+    CHECK_D(p.coulomb_ah, 20.0, 1e-6, "the migrated Coulomb Count");
+    CHECK(!p.distance_valid, "a version 1 blob claimed to carry a distance");
+
+    wf_est_t e;
+    wf_est_init(&e, &p);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.valid, "the migrated charge figures were not restored");
+    CHECK_D(o.coulomb_ah, 20.0, 1e-6, "the restored Coulomb Count");
+    CHECK(!o.distance_valid, "a version 1 blob restored a distance");
+
+    /* And the flip side: a version this build has never written is not read
+     * at all, however good its checksum is. */
+    blob[2] = WF_EST_PERSIST_VERSION + 1;
+    crc = wf_crc16(blob, WF_EST_PERSIST_BYTES - 2, 0xffff);
+    blob[22] = (uint8_t)(crc & 0xff);
+    blob[23] = (uint8_t)(crc >> 8);
+    CHECK(!wf_est_persist_decode(blob, sizeof(blob), &p),
+          "a blob from a future version decoded");
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(void)
@@ -772,9 +1237,20 @@ int main(void)
     test_a_bms_gap_produces_no_step();
     test_only_the_power_block_integrates();
     test_a_long_gap_is_clamped();
+
+    test_no_distance_before_either_source();
+    test_distance_integrates_speed();
+    test_the_odometer_corrects_drift_without_a_step();
+    test_an_odometer_wrap_changes_nothing();
+    test_an_odometer_that_jumps_is_not_believed();
+    test_a_controller_link_drop_loses_no_distance();
+    test_distance_before_the_wheel_geometry();
+
     test_the_same_input_gives_the_same_state();
     test_persisted_state_round_trips();
     test_a_restored_count_is_not_an_anchor();
+    test_distance_survives_a_power_cycle();
+    test_a_version_1_blob_is_migrated();
 
     if (failures != 0) {
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");

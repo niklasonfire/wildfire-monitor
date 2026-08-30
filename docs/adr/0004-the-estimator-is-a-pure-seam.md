@@ -4,11 +4,19 @@ status: accepted
 
 # The estimator is a pure seam and time is a parameter
 
-Everything the Monitor works out about the Pack - Remaining Energy, the Coulomb
-Count, and the Consumption, Range and State of Health figures still to come -
-is computed in `main/wfest`, a module that takes decoded fields plus persisted
-state and returns estimates. No I/O, no BLE, no display, no globals, no
-`esp_*`, no FreeRTOS, no logging, no allocation.
+Everything the Monitor works out - Remaining Energy, the Coulomb Count,
+Distance, and the Consumption, Range and State of Health figures still to come
+- is computed in `main/wfest`, a module that takes decoded fields plus
+persisted state and returns estimates. No I/O, no BLE, no display, no globals,
+no `esp_*`, no FreeRTOS, no logging, no allocation.
+
+Distance is inside that seam and not beside it, though it is about the road and
+not about the Pack. Consumption is Remaining Energy divided by Distance and
+Range follows from Consumption, so a distance the replay harness cannot
+reproduce is a Range the replay harness cannot reproduce - and a Distance
+computed somewhere with a clock in it would be exactly that. It is fused from
+two sources the same way charge is, integration Anchored to something slower
+and more trustworthy, so it is the same code shape as well as the same seam.
 
 And no clock. Every feed function takes an explicit `t_ms` from the record it
 was handed. The estimator never asks what time it is.

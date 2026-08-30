@@ -407,7 +407,9 @@ static void est_persist(void)
     portENTER_CRITICAL(&s_mux);
     wf_est_save(&s_est, &p);
     portEXIT_CRITICAL(&s_mux);
-    if (p.valid) {
+    /* Either half is worth a write on its own: a ride that saw the Controller
+     * and never the BMS has metres to keep and no charge figure at all. */
+    if (p.valid || p.distance_valid) {
         est_store_save(&p);
     }
 }
