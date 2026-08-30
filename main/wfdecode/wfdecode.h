@@ -73,6 +73,32 @@ void wf_ctrl_apply(wf_ctrl_live_t *live, const wf_ctrl_frame_t *frame);
 float wf_ctrl_speed_kmh(uint16_t rpm, uint8_t wheel_radius, uint8_t wheel_width,
                         uint8_t wheel_ratio, uint16_t rate_ratio);
 
+/* ------------------------------------------------------------- Odometer */
+
+/* Per ADR-0003 the Odometer Anchors distance: it is coarse and it wraps, but
+ * unlike integrated speed it does not drift. The Field Table keeps the raw u16
+ * count the Controller sent, because everything below has to happen in counts
+ * before it happens in metres.
+ *
+ * The scale is WF_CTRL_ODO_METRES_PER_COUNT, generated from the Field Table.
+ * It is an unverified upstream claim - Ride 1 measures it - so it is one named
+ * number in one place and these three functions are all that read it. */
+
+/* Metres covered in total, as of this reading. Wraps with the count. */
+uint32_t wf_ctrl_odo_metres(uint16_t counts);
+
+/* Counts between two readings, wrap-safe: u16 modular subtraction, so 65530 to
+ * 5 is 11 counts and not a 65525-count trip backwards. The Odometer only ever
+ * counts up, which is what makes that the right answer; the flip side is that
+ * this cannot tell a genuine step backwards from a nearly-complete wrap, so
+ * difference readings in the order they were taken and nothing else. */
+uint16_t wf_ctrl_odo_delta_counts(uint16_t from, uint16_t to);
+
+/* The same difference, in metres. At u16 the count wraps every 65536 counts,
+ * ~6553 km at 100 m each; taking this difference naively in a wider type is
+ * what would put one 6553 km phantom trip into the archive. */
+uint32_t wf_ctrl_odo_delta_metres(uint16_t from, uint16_t to);
+
 /* ------------------------------------------------------- BMS responses */
 
 #define WF_BMS_LEAD       0xd2      /* the protocol variant this unit answers on */

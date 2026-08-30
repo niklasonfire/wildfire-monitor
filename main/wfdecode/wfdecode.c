@@ -70,6 +70,26 @@ void wf_ctrl_apply(wf_ctrl_live_t *live, const wf_ctrl_frame_t *frame)
     }
 }
 
+/* -------------------------------------------------------------- Odometer */
+
+uint32_t wf_ctrl_odo_metres(uint16_t counts)
+{
+    return (uint32_t)counts * (uint32_t)WF_CTRL_ODO_METRES_PER_COUNT;
+}
+
+uint16_t wf_ctrl_odo_delta_counts(uint16_t from, uint16_t to)
+{
+    /* Promoted to int by the usual arithmetic conversions and truncated back,
+     * which is exactly the modulo-65536 difference wanted: the wrap is not a
+     * special case to detect, it is the arithmetic. */
+    return (uint16_t)(to - from);
+}
+
+uint32_t wf_ctrl_odo_delta_metres(uint16_t from, uint16_t to)
+{
+    return wf_ctrl_odo_metres(wf_ctrl_odo_delta_counts(from, to));
+}
+
 /* ------------------------------------------------------------------- BMS */
 
 static uint16_t rd_u16be(const uint8_t *p)

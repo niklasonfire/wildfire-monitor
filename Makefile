@@ -43,8 +43,9 @@ UNIT      = $(BUILD)/unit
 
 test: test-unit test-replay test-scripts
 
-# The decoding a recorded ride cannot reach, driven with synthesised bytes
-# instead. See tests/host/unit.c.
+# The decoding a recorded ride cannot reach: the Odometer wrap, which no
+# fixture we hold crosses, and the power block's offsets read out of a frame
+# built byte by byte. See tests/host/unit.c.
 test-unit: $(UNIT)
 	$(UNIT)
 

@@ -103,8 +103,8 @@ static const char *TAG = "ui";
  * voltage that has gone flat or a current stuck at zero means the ride is
  * being wasted, and a ride costs far more than a glance. The Odometer is the
  * other way round - reference material, read once at a landmark and never
- * while moving - so it is the one row demoted to scale 1, which is what makes
- * room for the two new ones. */
+ * while moving - so it is the one row demoted to scale 1, which is also what
+ * makes room for a distance in metres that runs to seven digits. */
 #define ROW_LIVE_SPEED  70          /* scale 3 */
 #define ROW_LIVE_VOLTS  98          /* scale 2 from here down... */
 #define ROW_LIVE_AMPS   116
@@ -685,8 +685,14 @@ static void draw_live(const wf_ctrl_live_t *lv)
     } else {
         FIELD(F_V6, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
     }
+    /* Metres, not counts: the calibration ride reads this at two landmarks a
+     * known distance apart to settle WF_CTRL_ODO_METRES_PER_COUNT, and a raw
+     * count is useless for that. The step is 100 m wide, so the last two
+     * digits are always zero - that is the Odometer's resolution showing, not
+     * a formatting accident. */
     if (lv->odo_valid) {
-        FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %u", lv->odometer_raw);
+        FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %" PRIu32 " M",
+              wf_ctrl_odo_metres(lv->odometer_raw));
     } else {
         FIELD(F_V7, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
     }

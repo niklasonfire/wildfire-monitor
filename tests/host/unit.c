@@ -4,11 +4,19 @@
  * tests/host/replay.c is the main test: it replays real recorded rides and
  * asserts what they have to produce. That is the right shape for almost
  * everything, and it is deliberately the only place ride facts live. But a
- * fixture can only assert what the bike actually did, and the power block
- * decoded from a frame built byte by byte is not that: cap0007 proves the
- * eight types agree with each other and with the BMS, while this proves the
- * decoder reads the offsets the Field Table declares, including a negative
- * line current, which that ride never produced.
+ * fixture can only assert what the bike actually did, and two things here are
+ * not in any Capture we have:
+ *
+ *   - the Odometer wrap. `odometer_raw` reads a constant 14 through the whole
+ *     of cap0007, so that fixture cannot distinguish wrap-safe differencing
+ *     from the naive kind that puts a 6553 km phantom trip in the archive.
+ *     Pretending it does would be worse than not testing it, so the wrap is
+ *     driven here with synthesised counts instead.
+ *
+ *   - the power block decoded from a frame built byte by byte. cap0007 proves
+ *     the eight types agree with each other and with the BMS; this proves the
+ *     decoder reads the offsets the Field Table declares, including a negative
+ *     line current, which that ride never produced.
  *
  * Same rules as the rest of main/wfdecode: pure C99, no board, no fixtures.
  */
@@ -28,6 +36,58 @@ static int failures;
             fputc('\n', stderr);                                              \
         }                                                                     \
     } while (0)
+
+#define CHECK_U(got, want, what)                                              \
+    do {                                                                      \
+        unsigned long g_ = (unsigned long)(got), w_ = (unsigned long)(want);  \
+        CHECK(g_ == w_, "%s: got %lu, expected %lu", (what), g_, w_);         \
+    } while (0)
+
+/* ------------------------------------------------------------- Odometer */
+
+static void test_odo_metres(void)
+{
+    CHECK_U(wf_ctrl_odo_metres(0), 0, "0 counts");
+    CHECK_U(wf_ctrl_odo_metres(1), WF_CTRL_ODO_METRES_PER_COUNT, "1 count");
+    /* What cap0007 actually reads, converted. */
+    CHECK_U(wf_ctrl_odo_metres(14), 14u * WF_CTRL_ODO_METRES_PER_COUNT,
+            "cap0007's 14 counts");
+    /* The last count before the wrap. At 100 m each this is the ~6553 km the
+     * Field Table's note quotes, and it has to fit in the u32 it is returned
+     * in - which it does with three orders of magnitude to spare. */
+    CHECK_U(wf_ctrl_odo_metres(65535), 65535u * WF_CTRL_ODO_METRES_PER_COUNT,
+            "the last count before the wrap");
+}
+
+static void test_odo_delta_does_not_wrap(void)
+{
+    CHECK_U(wf_ctrl_odo_delta_counts(0, 0), 0, "no movement from zero");
+    CHECK_U(wf_ctrl_odo_delta_counts(14, 14), 0, "no movement, parked");
+    CHECK_U(wf_ctrl_odo_delta_counts(10, 25), 15, "15 counts forward");
+    CHECK_U(wf_ctrl_odo_delta_metres(10, 25), 15u * WF_CTRL_ODO_METRES_PER_COUNT,
+            "15 counts forward, in metres");
+}
+
+/* The whole point of the helper. A trip that straddles the u16 wrap is a short
+ * trip, not a 6553 km one - and every one of these is a difference the naive
+ * subtraction gets catastrophically wrong. */
+static void test_odo_delta_across_the_wrap(void)
+{
+    CHECK_U(wf_ctrl_odo_delta_counts(65535, 0), 1, "one count over the wrap");
+    CHECK_U(wf_ctrl_odo_delta_counts(65530, 5), 11, "11 counts over the wrap");
+    CHECK_U(wf_ctrl_odo_delta_metres(65530, 5), 11u * WF_CTRL_ODO_METRES_PER_COUNT,
+            "11 counts over the wrap, in metres");
+    /* A whole lap of the counter reads as no movement, which is the one thing
+     * a u16 Odometer genuinely cannot tell you. 6553 km between two readings
+     * is not a case any ride produces; it is recorded here so that the limit
+     * is written down rather than discovered. */
+    CHECK_U(wf_ctrl_odo_delta_counts(1234, 1234), 0, "a full lap of the counter");
+    /* And the flip side, also deliberate: a reading that went backwards is
+     * indistinguishable from an almost-complete wrap. Callers difference
+     * samples in the order they were taken; nothing here can rescue them if
+     * they do not. */
+    CHECK_U(wf_ctrl_odo_delta_counts(5, 4), 65535, "a step backwards");
+}
 
 /* --------------------------------------------------------- the power block */
 
@@ -138,6 +198,9 @@ static void test_a_type_outside_the_block_changes_nothing(void)
 
 int main(void)
 {
+    test_odo_metres();
+    test_odo_delta_does_not_wrap();
+    test_odo_delta_across_the_wrap();
     test_power_block_decodes_at_every_type();
     test_line_current_is_signed();
     test_a_type_outside_the_block_changes_nothing();
@@ -146,6 +209,6 @@ int main(void)
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");
         return 1;
     }
-    printf("unit: the power block, all assertions hold\n");
+    printf("unit: odometer wrap and the power block, all assertions hold\n");
     return 0;
 }

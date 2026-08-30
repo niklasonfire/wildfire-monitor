@@ -76,6 +76,11 @@
           "name": "WF_CTRL_CURRENT_LSB_PER_A",
           "value": 4,
           "note": "How many raw counts of `line_current_a` make one amp, and the single most consequential unmeasured number in this project - ADR-0003 makes it the gain on every watt-hour ever counted, so its error propagates undiminished into range. **Two candidates, 19 % apart, and this table has picked neither.** Upstream sources say 4 LSB per amp; a regression of our own Controller current against the BMS's says 4.77. cap0007 cannot decide between them: its peak of 35 raw is 8.75 A at 4 and 7.34 A at 4.77, and the BMS read -5.1 A at that moment, but the BMS's poll lag is not removed from that comparison, so it separates nothing. The value here is 4 because it is the upstream number and because an integer divisor is exact in both a C float and a Python double, which keeps the two generated decoders agreeing digit for digit - not because it is more likely to be right. Ride 1, the calibration ride, closes this by fitting integrated current against the BMS's own State of Charge delta over a whole ride; it is tracked as issue #12. Correct it here and every decoder, the document and the live screen follow."
+        },
+        {
+          "name": "WF_CTRL_ODO_METRES_PER_COUNT",
+          "value": 100,
+          "note": "Metres per count of `odometer_raw`. This is blackTeaDisp's \"roughly one count per 100 m\" and nobody has checked it: no ride of known length has been put against it, which is why `odometer_raw` sits at trusted. Ride 1 measures it by reading the Odometer at two landmarks a known distance apart; correct it here and the live screen and everything built on `wf_ctrl_odo_metres()` follow. It is deliberately not the field's own scale: the Field Table keeps `odometer_raw` as the raw count the Controller sent, because at u16 the count wraps and a wrap has to be differenced in counts before it is turned into a distance."
         }
       ],
       "groups": [
@@ -346,7 +351,7 @@
           "unit": "",
           "ctype": "uint16_t",
           "confidence": "trusted",
-          "note": "Cumulative distance, incremented roughly once per 100 m according to blackTeaDisp. cap0007 ends at 14, and 1.4 km is far more than a 47 s parking-lot crawl covers, so this is a running total from earlier riding rather than a per-Capture counter. The 100 m step is unverified: settling it needs a ride of known length."
+          "note": "Cumulative distance, in counts, kept exactly as the Controller sent it. cap0007 reads a constant 14 for the whole ride, and 1.4 km is far more than a 47 s parking-lot crawl covers, so this is a running total from earlier riding rather than a per-Capture counter - and a fixture that never moves cannot exercise the wrap, which is why the wrap is unit-tested against synthesised values instead. The metre conversion is `WF_CTRL_ODO_METRES_PER_COUNT`, an unverified upstream claim, and it is applied on the way to the screen rather than here: at u16 the count wraps every 65536 counts, ~6553 km at 100 m, and a difference across that wrap has to be taken in counts before it becomes a distance or the archive gains one 6553 km phantom trip. `wf_ctrl_odo_delta_counts()` is the wrap-safe subtraction; per ADR-0003 this is what Anchors distance, so #13 differences it rather than the raw number."
         }
       ],
       "hand_written": [

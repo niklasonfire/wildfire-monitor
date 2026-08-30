@@ -625,8 +625,9 @@ static void report(const wflog_hdr_t *h, const run_t *r)
            r->bms_responses_bad, r->event_records, r->marker_records,
            r->telem_records, r->imu_records, r->duration_ms / 1000.0);
     if (r->ctrl_frames_ok > 0) {
-        printf("  controller: rpm<=%u speed<=%.2f km/h odo=%u temp=%d C\n",
+        printf("  controller: rpm<=%u speed<=%.2f km/h odo=%u (%u m) temp=%d C\n",
                r->rpm_max, r->speed_kmh_max, r->live.odometer_raw,
+               (unsigned)wf_ctrl_odo_metres(r->live.odometer_raw),
                r->live.engine_temp);
     }
     if (r->power_frames > 0) {
