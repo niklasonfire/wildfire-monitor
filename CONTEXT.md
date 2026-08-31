@@ -134,3 +134,18 @@ _Avoid_: protocol spec, field map, decoder
 How well a Field Table entry is established: taken on trust from elsewhere,
 consistent with our own Captures, or proven against an independent measurement.
 _Avoid_: certainty, status, reliability
+
+### Modes
+
+**Readout Mode**:
+The Monitor stops listening, puts up its own access point, and serves the
+Captures over HTTP so a phone or a laptop can pull them off. Bluetooth is down
+throughout, so the only way back to capturing is a reboot.
+_Avoid_: download mode, webdump, AP mode, dump mode
+
+**Update Mode**:
+The Monitor stops listening, joins a hotspot it knows, and installs a
+published firmware into its spare app slot. Shares Readout Mode's shape — one
+radio at a time, entered from the menu, left by a reboot — and, like it, is
+refused while a Capture is running.
+_Avoid_: OTA mode, upgrade mode, flashing
