@@ -40,8 +40,11 @@ uint16_t wf_crc16(const uint8_t *data, size_t len, uint16_t init);
 
 /* ------------------------------------------------------ Controller frames */
 
-#define WF_CTRL_FRAME_LEN    16         /* aa <type> <12 payload> crc_lo crc_hi */
-#define WF_CTRL_PAYLOAD_LEN  12
+/* WF_CTRL_PAYLOAD_LEN comes from the Field Table with the fields, because it
+ * is the bound every field's offset is checked against - see the constant's
+ * note. The frame length is this envelope's own and is written in terms of it:
+ * lead, type, payload, two checksum bytes. */
+#define WF_CTRL_FRAME_LEN    (2 + WF_CTRL_PAYLOAD_LEN + 2)
 #define WF_CTRL_LEAD         0xaa
 #define WF_CTRL_CRC_INIT     0x7f3c     /* the Controller's own seed */
 

@@ -127,7 +127,103 @@ def load(path):
             if f["ctype"] == "bool" and (f["mask"] is None or f["scale"] != 1):
                 raise SystemExit(f"{f['name']}: a bool field needs a mask and "
                                  f"no scale")
+        check_device(dev, constants)
     return table
+
+
+def constant(constants, name, dev):
+    """A device constant the generator itself needs, by name."""
+    if name not in constants:
+        raise SystemExit(f"{dev['name']}: no {name} constant, and the "
+                         f"generator needs it to know what it may read")
+    return int(constants[name]["value"])
+
+
+def check_device(dev, constants):
+    """Refuse a table this generator cannot generate correctly.
+
+    ADR-0002 makes this file the single source of both decoders, and a source
+    of truth that will silently emit a read past the end of a frame is not one.
+    Every rule here is something one of the emitters below assumes and none of
+    them checks: what fits in the buffer, what the value expressions can
+    actually express, and what the two languages can agree on.
+
+    Every failure is a SystemExit naming the field, because the only person who
+    ever sees one is editing field-table.json at that moment.
+    """
+    if dev["id"] == "controller":
+        limit_name = "WF_CTRL_PAYLOAD_LEN"
+        unit = "payload byte"
+    else:
+        limit_name = "WF_BMS_MAX_REGS"
+        unit = "register"
+    limit = constant(constants, limit_name, dev)
+
+    for f in dev["fields"]:
+        name = f["name"]
+        if f["count"] < 1 or f["width"] < 1:
+            raise SystemExit(f"{name}: width {f['width']} and count "
+                             f"{f['count']} - both are counts of something and "
+                             f"neither may be zero")
+
+        # What one element of the field spans, and where the field ends. A
+        # Controller field is `width` bytes into a fixed-length payload; a BMS
+        # field is `count` registers, one per element, which is why width is
+        # not free there - c_read() and py_extract() both read exactly one
+        # register and a wider declaration would decode only half the value.
+        if f["device"] == "bms":
+            if f["width"] != 1:
+                raise SystemExit(
+                    f"{name}: width {f['width']} on a BMS field. The decoders "
+                    f"read one register per element, so a 32-bit value has to "
+                    f"be declared as the pair of registers it is and combined "
+                    f"by hand - see ADR-0002 on what stays hand-written")
+            end = f["key"] + f["count"]
+        else:
+            if f["width"] not in (1, 2):
+                raise SystemExit(
+                    f"{name}: width {f['width']} on a Controller field, and "
+                    f"the generated readers are byte and u16 only")
+            end = f["key"] + f["width"] * f["count"]
+        if end > limit:
+            raise SystemExit(
+                f"{name}: reads up to {unit} {end - 1}, past {limit_name} = "
+                f"{limit}. The generated decoder would read off the end of "
+                f"the frame")
+
+        bits = 8 * (f["width"] if f["device"] != "bms" else 2)
+        if f["mask"] is not None and f["mask"] >> bits:
+            raise SystemExit(f"{name}: mask 0x{f['mask']:x} does not fit the "
+                             f"{bits} bits the field reads")
+        if f["shift"] >= bits:
+            raise SystemExit(f"{name}: shift {f['shift']} off the end of the "
+                             f"{bits} bits the field reads")
+
+        # And what the value expressions can say. c_value()'s integer branch
+        # emits a bias and a cast and nothing else, while py_value() emits a
+        # bias and a narrowing - so a scale on an integer member is a thing one
+        # of them would apply and the other would drop, silently, and it is
+        # refused here rather than generated. A scaled value is a float member.
+        if f["ctype"] not in ("bool", "float") and f["ctype"] not in NARROW:
+            raise SystemExit(
+                f"{name}: ctype {f['ctype']}, which the generator has no "
+                f"narrowing for - add it to NARROW or declare the member "
+                f"float")
+        if f["ctype"] not in ("bool", "float") and f["scale"] != 1:
+            scale = (f"divide_by {f['divisor_name']}"
+                     if f["divisor_name"] is not None else f"scale {f['scale']}")
+            raise SystemExit(
+                f"{name}: {scale} on a {f['ctype']} member. A scaled value is "
+                f"not an integer - declare the member float, or move the "
+                f"factor to the reader")
+
+    if dev["id"] == "bms":
+        needed = reg_needed(dev)
+        if needed > limit:
+            raise SystemExit(
+                f"{dev['name']}: the fields need {needed} registers and "
+                f"{limit_name} is {limit}, so every response would be "
+                f"rejected as too short")
 
 
 def decimals_for(scale):

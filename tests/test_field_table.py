@@ -195,6 +195,142 @@ class BothDecodersNarrowTheSameWay(unittest.TestCase):
                 self.check("controller", live, what)
 
 
+class TheGeneratorRefusesATableItCannotGenerate(unittest.TestCase):
+    """The generator is the single source of both decoders, and a source of
+    truth that will happily emit a read past the end of a frame is not one.
+
+    Nothing else can catch these. A Controller field at offset 11 with width 2
+    generates `wf_rd_u16le(&p[11])` against a twelve-byte payload, which is a
+    read one byte off the end that compiles cleanly, runs, and produces a
+    number; a BMS field declared two registers wide decodes only its high half.
+    The Field Table is edited by hand, so the check has to be at the point of
+    generation.
+
+    Each case mutates a copy of the real table, so it is always the table as it
+    stands that is being pushed over the edge rather than a fabricated one that
+    might not resemble it.
+    """
+
+    def setUp(self):
+        with open(TABLE, encoding="utf-8") as f:
+            self.table = json.load(f)
+
+    def device(self, dev_id):
+        for d in self.table["devices"]:
+            if d["id"] == dev_id:
+                return d
+        self.fail("no device %s in the table" % dev_id)
+
+    def constant(self, dev_id, name):
+        for c in self.device(dev_id)["constants"]:
+            if c["name"] == name:
+                return int(c["value"])
+        self.fail("%s has no %s constant" % (dev_id, name))
+
+    def field(self, dev_id, name=None):
+        """A field to spoil: the named one, or the device's first."""
+        for f in self.device(dev_id)["fields"]:
+            if name is None or f["name"] == name:
+                return f
+        self.fail("no field %s on %s" % (name, dev_id))
+
+    def generate(self):
+        """Runs the generator over the mutated table. Returns (rc, stderr)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "field-table.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.table, f)
+            done = subprocess.run(
+                [sys.executable, GENERATOR, path, "--c-dir", tmp,
+                 "--py-dir", tmp, "--doc", os.path.join(tmp, "doc.md")],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return done.returncode, done.stdout
+
+    def refused(self, why):
+        rc, out = self.generate()
+        self.assertNotEqual(rc, 0,
+                            "the generator accepted a table that %s, and "
+                            "generated a decoder from it:\n%s" % (why, out))
+        return out
+
+    def test_the_unmutated_table_still_generates(self):
+        # Otherwise every case below could be passing for the wrong reason.
+        rc, out = self.generate()
+        self.assertEqual(rc, 0, "the table as committed no longer "
+                                "generates:\n%s" % out)
+
+    def test_a_controller_field_may_not_read_past_the_payload(self):
+        payload = self.constant("controller", "WF_CTRL_PAYLOAD_LEN")
+        f = self.field("controller")
+        f["offset"] = payload - 1
+        f["width"] = 2
+        f["ctype"] = "uint16_t"
+        out = self.refused("reads a u16 from the last byte of the payload")
+        self.assertIn(f["name"], out)
+
+    def test_a_bms_field_may_not_read_past_the_last_register(self):
+        top = self.constant("bms", "WF_BMS_MAX_REGS")
+        f = self.field("bms")
+        f["register"] = top
+        out = self.refused("reads a register past WF_BMS_MAX_REGS")
+        self.assertIn(f["name"], out)
+
+    def test_the_fields_may_not_need_more_registers_than_the_poll_asks_for(self):
+        # The subtler half of the same rule: every field is inside the frame,
+        # and yet WF_BMS_REG_NEEDED is above what the decoder will accept, so
+        # every response is rejected as too short and nothing decodes at all.
+        dev = self.device("bms")
+        for c in dev["constants"]:
+            if c["name"] == "WF_BMS_MAX_REGS":
+                c["value"] = 8
+        self.refused("needs more registers than WF_BMS_MAX_REGS")
+
+    def test_a_bms_field_is_one_register_per_element(self):
+        f = self.field("bms")
+        f["width"] = 2
+        out = self.refused("declares a two-register BMS field, which the "
+                           "decoders would read only the high half of")
+        self.assertIn(f["name"], out)
+
+    def test_an_integer_member_may_not_carry_a_scale(self):
+        # c_value()'s integer branch emits a cast and no scale; py_value()'s
+        # emits a narrowing and no scale. A scale here is a factor that would
+        # reach neither decoder, or - before both were written to the same
+        # shape - exactly one of them.
+        f = self.field("bms")
+        f["ctype"] = "uint16_t"
+        f["scale"] = 0.1
+        out = self.refused("puts a scale on an integer member")
+        self.assertIn(f["name"], out)
+
+    def test_an_integer_member_may_not_carry_a_divisor(self):
+        f = self.field("bms")
+        f["ctype"] = "uint16_t"
+        f.pop("scale", None)
+        f["divide_by"] = self.device("bms")["constants"][0]["name"]
+        out = self.refused("divides an integer member by a constant")
+        self.assertIn(f["name"], out)
+
+    def test_a_member_the_generator_cannot_narrow_is_refused(self):
+        f = self.field("bms")
+        f["ctype"] = "uint64_t"
+        out = self.refused("declares a ctype the generator cannot narrow")
+        self.assertIn(f["name"], out)
+
+    def test_a_mask_or_shift_off_the_end_of_the_value_is_refused(self):
+        f = self.field("controller")
+        f["width"] = 1
+        f["mask"] = 0xffff
+        self.assertIn(f["name"], self.refused("masks past the byte it reads"))
+
+        self.setUp()
+        f = self.field("controller")
+        f["width"] = 1
+        f["mask"] = 0x0f
+        f["shift"] = 8
+        self.assertIn(f["name"], self.refused("shifts past the byte it reads"))
+
+
 class DocumentationIsGenerated(unittest.TestCase):
     """The third artefact. It is committed so that it can be read on the way
     past, which means it is the one that can go stale."""
