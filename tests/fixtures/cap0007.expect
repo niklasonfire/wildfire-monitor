@@ -1,0 +1,271 @@
+# What replaying cap0007.wfl has to produce. See cap0007.md for the ride.
+#
+# `name value`, compared to within +/-0.05 - half a display digit, which is the
+# precision docs/field-table.md quotes its values to. A name this harness
+# does not measure is a failure, so a typo here cannot quietly assert nothing.
+
+# Records, as counted in captures/cap0007_dump.log.
+ctrl_records      1674
+bms_records       34
+event_records     8
+marker_records    0
+telem_records     10
+imu_records       942
+dropped           0
+
+# Every Controller frame's checksum verifies (init 0x7f3c, residue 0), and
+# every BMS answer is a well-formed 129-byte 0xd2 response.
+ctrl_frames_ok    1674
+ctrl_frames_bad   0
+bms_responses_ok  34
+bms_responses_bad 0
+
+# BMS, per the Field Table's register map: the Pack sat at 105.1-105.5 V
+# and the State of Charge did not move off 66.7 % in 47 s of crawling.
+pack_v_min        105.1
+pack_v_max        105.5
+soc_pct_min       66.7
+soc_pct_max       66.7
+cell_count        28
+cell_mv_min       3750
+cell_mv_max       3772
+
+# Three readings of the same Pack that have to agree, checked per response:
+# the sum of the 28 Cells against the pack voltage register, the highest and
+# lowest Cell registers against the Cell array, and the two redundant
+# cell-count registers against each other.
+cell_sum_mismatch     0
+cell_extreme_mismatch 0
+cell_count_disagree   0
+
+# Rated Capacity, still derived rather than read. Register 48 is the charge
+# left in the Pack, and dividing it by the State of Charge is the only route
+# to a nameplate figure the Monitor has: 33.3 Ah at 66.7 % is 49.93 Ah here,
+# and cap0006's 33.4 Ah at 66.8 % is 50.00 Ah. Two rides, two register pairs,
+# one 50 Ah Pack - which is why register 48 is decoded and Rated Capacity is
+# not a field. The register that would make it one is above this poll's window
+# and has never been read; see docs/field-table.md.
+remaining_ah_min      33.3
+remaining_ah_max      33.3
+rated_ah_min          49.93
+rated_ah_max          49.93
+
+# The two redundant registers, pinned as identities rather than as values.
+# Both are exactly derivable from fields already decoded, and that is the
+# whole evidence for what they are, so the test is the derivation itself:
+# register 56 must equal cell_max_mv - cell_min_mv, and register 57 must equal
+# pack_v x |current_a| truncated, in every response. They are decoded because
+# they cost nothing and they cross-check four other registers; nothing may be
+# built on them, because they carry no information of their own.
+cell_delta_mv_max     12
+power_w_max           536
+cell_delta_redundant_mismatch 0
+power_redundant_mismatch      0
+
+# Controller. The ride never left walking pace, so the decoded speed has to
+# stay in the 4-7 km/h the notes record; 5.64 km/h is the peak of this one.
+# The wheel geometry from type 0xaf is what that speed is computed from, so it
+# is pinned too - a slip there would move every speed in the ride.
+#
+# Both of these moved in #13 and the movement is the fix, not a regression:
+# the motion block is eight frame types and the Field Table declared one, so
+# rpm was read at 0.64 Hz and the fastest moment of the ride - 253 rpm - fell
+# on one of the seven that were being ignored. speed_samples is the rate
+# itself: 237 fresh road speeds over 47 s rather than 30. Not the block's full
+# 244, because speed needs the wheel geometry from type 0xaf too and the first
+# seven motion frames of the ride arrived before it did.
+speed_kmh_max     5.64
+speed_samples     237
+rpm_max           253
+wheel_radius      12
+wheel_width       120
+wheel_ratio       70
+rate_ratio        4000
+odometer_raw      14
+gear_last         0
+
+# The power block: pack voltage and line current, from the eight frame types
+# 0x81 0x88 0x8f 0x96 0x9d 0xa4 0xab 0xb1. 244 frames in 47.1 s is 5.2 Hz -
+# eight of the 55 types, not the 35.5 Hz the whole link runs at, which is the
+# correction ADR-0003 now carries.
+power_frames      244
+ctrl_pack_v_min   105.0
+ctrl_pack_v_max   105.5
+
+# Raw -1..35 over this ride, at WF_CTRL_CURRENT_LSB_PER_A = 4. Both numbers
+# move if that constant is corrected against Ride 1, which is the point of it
+# being a constant; they are here so that a change to it is deliberate.
+ctrl_current_a_min -0.25
+ctrl_current_a_max 8.75
+
+# The strongest correctness signal in the whole fixture: the Controller and
+# the BMS measure this Pack with separate instruments and never disagree by
+# more than 0.30 V across the 34 responses. A slipped payload offset on either
+# side could not land inside that.
+pack_v_device_gap_max 0.30
+
+# The estimation seam, main/wfest. Every figure here is provisional twice
+# over: it is scaled by WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 %
+# until Ride 1 settles it, and it counts down to a Limp Point of 84.0 V that
+# is assumed rather than measured. They are pinned so that a change to either
+# is deliberate and shows up as a diff, not so that they are believed.
+#
+# 34 BMS answers, 244 power-block frames: the same counts the decode above
+# asserts, which is the plumbing check - the estimator saw everything the
+# decoder saw and nothing else. The curve has a point per record either of
+# them was fed, and starts at the first BMS answer because before that there
+# is no Anchor and so nothing to show.
+est_points          1694
+est_power_samples   244
+est_anchor_samples  34
+
+# The ride: 47 s of crawling took 1.73 Wh out of the Pack, so Remaining
+# Energy fell 1.6 Wh from where the 66.7 % Anchor put it. The maximum is the
+# first point, before anything was drawn; the minimum is not the last, because
+# the line current dips to -0.25 A near the end and that little of the energy
+# comes back - which is the sign convention showing up in a real ride.
+est_wh_first        2729.04
+est_wh_last         2727.42
+est_wh_min          2727.38
+est_wh_max          2729.04
+est_used_wh         1.73
+est_used_ah         0.02
+
+# The Anchor holding. The BMS never moved off 66.7 %, the Coulomb Count
+# integrated 0.016 Ah out of the Pack, and the gap between them never reached
+# a thirtieth of a percent. This ride cannot show the Anchor pulling a real
+# drift back - its State of Charge does not move and its current barely does -
+# so that is driven with synthesised streams in tests/host/unit.c instead.
+est_soc_last        66.67
+est_anchor_soc_last 66.70
+est_soc_gap_max     0.03
+
+# Distance, fused from integrated speed and the Odometer per ADR-0003.
+#
+# This ride is the plumbing check and nothing more, because its Odometer never
+# moves: `odometer_raw` reads a constant 14 for all 47 s, so the Anchor's own
+# account of this journey is 0 m and the truth is somewhere in the first
+# hundred metres. Integrating the road speed alone gives 21.9 m; the pull
+# toward a stationary Anchor takes it to 16.7 m, which is the fusion visibly
+# doing its job on a figure the Odometer cannot yet contradict. Neither number
+# is checkable against the ground - nothing here settles
+# WF_CTRL_ODO_METRES_PER_COUNT, and Ride 1 is what does.
+#
+# What is worth asserting is the rate and the count. 243 distance steps is one
+# per motion frame after the first, which is the criterion "updated at the rate
+# of the Controller's stream rather than at Odometer ticks" as a number: 31
+# Odometer frames arrived in the same 47 s. The wrap, the link drop and the
+# drift the Anchor exists to absorb are driven with synthesised streams in
+# tests/host/unit.c, and the wrap again by replaying this very file with its
+# Odometer rewritten - see the odo_synth block in tests/host/replay.c.
+est_dist_points       1687
+est_distance_m        16.71
+est_odo_distance_m    0.00
+est_distance_samples  243
+est_odo_samples       31
+
+# Consumption, and the fact worth pinning here is that this ride produces no
+# Consumption figure at all. 16.7 m is a sixth of one Odometer count and a
+# sixtieth of the WF_EST_CONS_WINDOW_M window, and the bike is stationary for
+# the first eight seconds of it - so neither denominator clears its guard and
+# est_cons_source stays 0. That is the stationary-bike criterion showing up on
+# a real ride rather than a synthesised one: if a future change ever divides
+# 1.73 Wh by these metres, this number moves off 0 and says so.
+#
+#   0  no figure   1  the persisted all-time average   2  the rolling window
+#
+# The two totals are the ratio Consumption would be, held separately so that
+# the all-time average improves across rides instead of being overwritten by
+# the last one. On an unbroken replay of a Monitor with no saved state they
+# have to equal the ride's own drawn energy and fused distance exactly, which
+# tests/host/replay.c asserts as an invariant; they are repeated here so that
+# a change to either shows up as a diff in this file too.
+est_cons_source       0
+est_alltime_m         16.71
+est_alltime_wh        1.73
+
+# Range, and the same honest zero for the same reason: Range is Remaining
+# Energy divided by Consumption, this ride produces no Consumption, so it
+# produces no Range and the estimator declines the division rather than
+# dividing 2727 Wh by nearly nothing. The source is Consumption's own -
+#
+#   0  no figure   1  from the all-time average   2  from the rolling window
+#
+# - so this number cannot move off 0 while est_cons_source is 0, and if it ever
+# does, one of the two guards has gone. That is the whole of what a 16.7 m ride
+# can say about Range. Everything behavioural about it - the fall of a
+# kilometre per kilometre ridden, the drop on the motorway, the figure being
+# there in the first kilometre off the persisted average, the power cycle -
+# is driven with synthesised riding in tests/host/unit.c, because a fixture
+# that never produces the figure cannot assert anything about it without
+# pretending to.
+est_range_source      0
+
+# The advice - "you would get this much further at this speed" - and a third
+# honest zero, for a reason one level further back than the two above.
+#
+# The other zeros here are about this ride: 16.7 m is not a kilometre, so there
+# is no Consumption and so no Range. This one is about the archive. The advice
+# is a counterfactual off the fitted speed curve, scripts/fit_consumption.py
+# refused to fit one over an archive holding 47 s of crawling, and so
+# WF_FIT_FITTED is 0 and wf_est_consumption_at_speed() produces nothing at any
+# speed. No Capture this build can be given can put this row on the screen -
+# not a low Pack, not a motorway, not a rider who would benefit from it.
+#
+# That is the correct behaviour and it is asserted rather than assumed:
+# tests/host/replay.c fails any Capture that produces advice while FITTED is 0,
+# and tests/host/unit.c drives the behaviour itself against a curve it
+# synthesises. When the calibration ride (issue #6) lands and the header
+# carries a real fit, this number can move off 0 on a ride that earns it, and
+# the diff will say which ride.
+est_advice_shown      0
+
+# Internal Resistance, and the honest zero again. This ride's line current runs
+# -0.25..8.75 A over 47 s, so its largest load step is 9 A against the 21 A
+# WF_EST_IR_MIN_DI_A demands - and that threshold is not a preference, it is
+# what the 0.1 V voltage quantisation costs on a Pack of tens of milliohms. So
+# no pair of samples in this Capture is a load step: nothing is measured,
+# nothing is refused, and the Limp Point does not move a millivolt off its
+# provisional 84.0 V.
+#
+# Which is what makes every estimate above unchanged by issue #17. A ride with
+# hard launches in it moves these three and takes watt-hours off the figures
+# with them; this one cannot, and that is the fact being pinned.
+#
+#   est_ir_steps      load steps accepted and averaged in
+#   est_ir_rejected   sharp enough to try, refused for want of an Anchor or
+#                     for implying a resistance no Pack has
+#   est_sag_v_max     the most the Limp Point ever moved, over the whole ride
+est_ir_steps          0
+est_ir_rejected       0
+est_sag_v_max         0.00
+
+# The weakest Cell, and this is the half of issue #18's acceptance criterion
+# that comes off a real ride rather than a synthesised one: replaying a healthy
+# Pack produces neither the clamp nor the warning.
+#
+# This Pack is healthy and it is the only real Pack data this repository holds.
+# Its lowest Cell runs 3-7 mV under its average in all 34 responses, and the
+# running mean over them settles at 4.24 mV - against a WF_EST_CELL_DEADBAND_V
+# of 13.2 mV, which is the imbalance already inside the Pack model, because
+# WF_EST_PACK_V_AT_REF was measured on this very Pack. So the band is zero, the
+# reserve is exactly zero, and every energy figure above is the figure it was
+# before this existed. That is why est_wh_first and its neighbours did not move.
+#
+# The other half - a Cell 300 mV under the rest of its Pack producing both the
+# clamp and the warning - is this same file replayed with Cell 7 rewritten and
+# re-checksummed; see the cell_synth block in tests/host/replay.c. It is not in
+# this file because it is not what this ride did.
+#
+# The divergence warning is a ratio and not a voltage: the gap below the lowest
+# Cell against the fan-out of the 27 above it. Over these 34 responses that
+# ratio runs 0.00-0.33 and settles at 0.07, against the 2.0 the warning fires
+# at. A Pack fanning out at low charge multiplies both halves of that ratio and
+# leaves it where it is, which is the whole reason the threshold is written
+# this way; wfest.h works it through.
+est_cell_samples      34
+est_cell_rejected     0
+est_cell_spread_mv    4.24
+est_cell_clamped      0
+est_cell_diverged     0
+est_cell_reserve_wh   0.00

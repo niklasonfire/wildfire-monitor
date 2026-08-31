@@ -86,7 +86,91 @@ All 709 frames of `captures/mcu_frames.log` pass this.
 ## What is still missing
 
 Parked, only payload bytes 8..9 and 10..11 of the eight live frame types move,
-and they sit at -1/-2 and 0/0xffff - idle noise. Assigning physical meaning to
-any field needs a capture taken **while riding**, which the host-driven flow
-above cannot deliver, because it needs a PC on the serial link. See
-`docs/standalone-capture.md`.
+and they sit at -1/-2 and 0/0xffff - idle noise. That is still true as a
+description of a parked capture, but it does not mean these are the only
+telemetry fields: `cur_rpm` lives at payload bytes 6..7 of all eight of those
+types - they are the `motion` block - and simply reads 0 while parked,
+indistinguishable from a static field. See `docs/field-table.md` for the Field
+Table, the Confidence of each entry and what it's sourced from. Bytes
+8..9/10..11 of the motion block remain genuinely unassigned. Assigning
+meaning to a field from scratch still needs a capture taken **while riding**,
+which the host-driven flow above cannot deliver, because it needs a PC on the
+serial link. That is what the standalone capture below is for.
+
+## Standalone capture
+
+The flow above needs `./wf.sh` on the other end of the USB cable, so it cannot
+follow the bike. The standalone capture runs on the Monitor alone: it connects
+to both devices by itself, writes a Capture to flash as a `.wfl` file, and is
+driven from the console only before and after the ride.
+
+```
+cap status | scan | idle | rec | stop | mark [text]
+caps                 # list the Captures on flash
+capdump <seq>        # print one over the console
+caprm <seq>|all      # delete
+wifi on              # Wi-Fi readout mode, for pulling files off without a cable
+```
+
+`cap rec` starts recording and `cap stop` ends it; `cap mark` drops a Marker at
+the moment a deliberate manoeuvre starts or ends, which is what separates an
+experiment from a blob of frames. A Capture holds only what the two devices
+said - never anything the Monitor worked out from it, per ADR-0001 - so it can
+be re-decoded whenever the Field Table improves.
+
+Afterwards, off the bike:
+
+```bash
+./scripts/wfl.py cap0007.wfl              # tagged one-line records
+./scripts/wfl.py cap0007.wfl --fields     # every decoded field, per record
+```
+
+## The BMS poll is wider than anything we have recorded
+
+Every Capture in this repository was taken while the poll asked for **62**
+registers, and that is the only width this BMS has ever been seen to answer.
+The poll now asks for **125**, which is as many as one answer can carry: the
+reply to a read of `n` registers is `5 + 2n` bytes, a Capture record's payload
+length is a `uint8_t`, and `5 + 2 x 125` is 255 exactly. Registers 62-124 have
+therefore never been read by anything, and nothing in that range is in the
+Field Table. Rated Capacity and the cycle count are believed to be up there,
+and until one Capture comes back containing them, State of Health is not
+measurable at all.
+
+**What to do, in order of how cheap it is.** The first is a bench session with
+the ignition on and no riding at all:
+
+```bash
+./wf.sh --reset --capture captures/daly_wide.log \
+        'scan 8@15' 'connect name DL@30' 'discover@40' 'daly probe@40'
+```
+
+`daly probe` now fires `d2 03 0000 007d` (the wide read the ride will use) and
+`d2 03 007d 007d` (the block above it) alongside the four requests it always
+sent. Three outcomes, and each one is worth knowing:
+
+* a 255-byte answer to `d2_wide` - the ride will record registers 62-124, so
+  go and take the ride;
+* an exception frame, or silence - the BMS does not serve that block, the
+  capture will fall back to 62 registers on its own after five seconds, and
+  finding the real width is a matter of bisecting with
+  `daly read 0xd2 0 <count>`;
+* an answer to `d2_above` as well - there is more above register 124 than one
+  request can carry, and a second poll at a second address is worth building.
+
+Then the ride. **Two Captures separated by a full charge** is what actually
+closes it: a register that does not move within either ride but is one higher
+in the second is the cycle count, and a register near 500 that does not move at
+all is Rated Capacity in 0.1 Ah - `remaining_ah / (soc_pct / 100)` says to
+expect 50.0 Ah, and the check is that the read value and the derived one agree.
+A single parked Capture cannot say either thing, because over 47 s almost
+everything is constant.
+
+While the charger is plugged in, take a third short Capture. That one settles
+register 47 and the four switch-state registers 50, 52, 53 and 54, which are
+constant in everything we hold and therefore indistinguishable from each other;
+see "Not decoded" in `docs/field-table.md`.
+
+Each Capture records the width it actually used, in the `bms subscribed ...
+regs=N` event, so a Capture that came back narrow says whether that was asked
+for or fallen back to.
