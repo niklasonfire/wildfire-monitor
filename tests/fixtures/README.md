@@ -48,6 +48,16 @@ measure is a failure, so a typo cannot assert nothing. Values that hold for
 pack voltage matching the sum of the cells, distance never running backwards -
 are asserted by the runner itself and do not belong in a `.expect` file.
 
+Every Capture is replayed once more with one Cell of every BMS response
+rewritten 300 mV under the rest of its Pack, and re-checksummed - the whole Cell
+block is recomputed with it, so the highest, lowest, average and delta registers
+still describe the array and the response is one a BMS could have sent. Every
+Pack recorded here is healthy, which is what proves half of #18's criterion (a
+healthy Pack produces neither the Range clamp nor the divergence warning) and is
+exactly why the other half has to be synthesised. The rewritten run is held to
+the same invariants as the real one, so a synthesis that produced an impossible
+Pack fails rather than passing.
+
 Every Capture is also replayed twice more with its Odometer frames rewritten
 to a synthesised count ramp, started either side of the u16 wrap, and the two
 distance curves have to come out bit-identical. No ride we hold crosses the

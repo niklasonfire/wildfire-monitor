@@ -156,7 +156,10 @@ static const char *TAG = "ui";
  * The character cell is 6*scale wide, so the budget is 7 columns at scale 3,
  * 11 at scale 2 and 22 at scale 1. "~91KM*" is 6 of the 7 and cannot need more
  * than 7: WF_EST_RANGE_MIN_CONS_WH_PER_KM bounds Range at about 917 km, so the
- * figure is three digits at the very worst. "~128 WH/KM*" is exactly 11.
+ * figure is three digits at the very worst - "~917KM!" is the widest thing this
+ * row can hold and it is exactly 7, which is also why the weakest Cell's "!"
+ * takes the "*"'s place rather than sitting beside it; draw_live() says why
+ * nothing is lost by that. "~128 WH/KM*" is exactly 11.
  * "ODO 6553500 M ~4585WH" is 21 of the 22, at the Odometer's largest possible
  * reading and a full Pack - and it is one field and not two, so a shrinking
  * Odometer cannot leave debris beside a figure drawn at a fixed left edge. */
@@ -762,11 +765,44 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * rather than putting 40000 KM on the handlebars. */
     if (!est->range_valid) {
         FIELD(F_V1, 2, ROW_LIVE_HERO, 3, COL_DIM, "%s", "-- KM");
-    } else if (est->consumption_windowed) {
-        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, est->anchored ? COL_HINT : COL_DIM,
-              "~%.0fKM", est->range_km);
     } else {
-        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, COL_DIM, "~%.0fKM*", est->range_km);
+        /* The weakest Cell, and it gets no number of its own. A Pack ends its
+         * ride on its worst Cell, so when that Cell is what is holding this
+         * figure down the figure has to say so - a clamped Range that looks
+         * identical to an unclamped one hides the reason it dropped - and it
+         * has to say so without putting a second number on a 135 px panel at
+         * speed. So it is a mark and a colour, which is what this row already
+         * uses for everything else it has to say.
+         *
+         *   ~91KM     the Pack-average figure, as before.
+         *   ~91KM!    the weakest Cell is holding it down. Amber.
+         *   ~91KM!    in red: that Cell has left the other 27 behind - the
+         *             divergence warning, and the word is in the hint band.
+         *
+         * The "!" takes the "*"'s place when both apply, because seven columns
+         * at scale 3 is what the panel has and three digits of Range can want
+         * six of them. Nothing is lost by it: the star's other end is on the
+         * Consumption row directly below, which keeps its own, so "this came
+         * from the all-time average" is still on the panel to be read.
+         *
+         * Amber and not red for the clamp on its own, because a Pack whose
+         * lowest Cell has drifted past the deadband is doing something normal
+         * near the bottom of its charge and the rider is being told why the
+         * number moved, not that anything is wrong. Red is reserved for the
+         * Cell that is diverging, which is a Pack with a fault in it. */
+        uint16_t col = COL_DIM;
+
+        if (est->cell_diverged) {
+            col = DISP_RED;
+        } else if (est->cell_clamped) {
+            col = DISP_ORANGE;
+        } else if (est->consumption_windowed && est->anchored) {
+            col = COL_HINT;
+        }
+        const char *mark = est->cell_clamped ? "!"
+                         : est->consumption_windowed ? "" : "*";
+
+        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, col, "~%.0fKM%s", est->range_km, mark);
     }
 
     /* Consumption, in watt-hours per kilometre, and again the display only
@@ -850,13 +886,29 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
         snprintf(wh_txt, sizeof(wh_txt), "-- WH");
     }
     FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s %s", odo_txt, wh_txt);
-    /* The two marks on this screen, explained: the tilde says the figure is
-     * provisional, the star says it was worked out from the all-time average
-     * and not from the last kilometre - which is one fact about two rows, the
-     * Range and the Consumption it came from, and so is one legend and not
-     * two. 19 columns of the 22 scale 1 gives us, so it
-     * still fits without shrinking the button hint beside it. */
-    draw_hint("PWR:BACK ~PROV *AVG");
+    /* The hint band is the legend for the marks above it, and which legend is
+     * worth showing depends on what the hero row is saying.
+     *
+     * Ordinarily it explains the two ordinary marks: the tilde says the figure
+     * is provisional, the star says it was worked out from the all-time
+     * average and not from the last kilometre - one fact about two rows, the
+     * Range and the Consumption it came from, so one legend and not two.
+     *
+     * When the weakest Cell is holding Range down it explains that instead, in
+     * words, because that is the thing the rider does not already know and the
+     * one that changes what they should do about it. The ordinary marks lose
+     * their legend for as long as it lasts and are still readable off the
+     * Consumption row below.
+     *
+     * 19, 19 and 22 columns of the 22 scale 1 gives us, so all three fit
+     * without shrinking the button hint beside them. */
+    if (est->cell_diverged) {
+        draw_hint("PWR:BACK !CELL FALLING");
+    } else if (est->cell_clamped) {
+        draw_hint("PWR:BACK !WEAK CELL");
+    } else {
+        draw_hint("PWR:BACK ~PROV *AVG");
+    }
 }
 
 /* ---- message screen ----------------------------------------------------- */

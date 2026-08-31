@@ -68,6 +68,17 @@ double wf_est_sag_reserve_wh(double sag_v)
     return ah * (WF_EST_LIMP_POINT_V + sag_v / 2.0);
 }
 
+double wf_est_cell_band_v(double spread_v)
+{
+    /* Written the way round that rejects a NaN as well as a spread inside the
+     * deadband: a healthy Pack's imbalance is already in the line the Pack
+     * model was fitted to, and is not charged to the rider a second time. */
+    if (!(spread_v > WF_EST_CELL_DEADBAND_V)) {
+        return 0.0;
+    }
+    return WF_EST_PACK_CELLS * (spread_v - WF_EST_CELL_DEADBAND_V);
+}
+
 static double anchor_coulomb_ah(double soc_pct)
 {
     return (soc_pct / 100.0) * WF_EST_RATED_CAPACITY_AH;
@@ -461,6 +472,97 @@ static void sag_step(wf_est_t *e, uint32_t t_ms, double volts, double amps)
     e->ir_prev_valid = true;
 }
 
+/* -------------------------------------------------------- the weakest Cell
+ *
+ * One BMS response's Cell block, and the question asked of it first is whether
+ * it describes a 28-Cell lithium Pack at all. It is the same shape of question
+ * ir_fold() asks of a load step and it is refused the same way - the block is
+ * dropped whole, the previous reading stands, and the refusal is counted:
+ *
+ *   not this Pack       a cell count that is not WF_EST_PACK_CELLS. A response
+ *                       that decoded but carries a zero-filled array fails
+ *                       here or on the next rule, and either way produces no
+ *                       clamp rather than a Pack of dead Cells.
+ *   not a lithium Cell  any Cell outside WF_EST_CELL_MIN_MV..MAX_MV. This is
+ *                       the rule that catches the zero fill and the 6 V
+ *                       "Cell", and it is the same 2.0-4.5 V bound
+ *                       tests/host/replay.c holds every Capture to.
+ *   registers disagree  an average that is not between the array's own lowest
+ *                       and highest Cell. The average is the BMS's own answer
+ *                       and the array is what checks it; two registers that
+ *                       cannot both be true are not a Pack.
+ *   too far gone        a spread past WF_EST_CELL_MAX_SPREAD_V, where a dying
+ *                       Cell and a slipped register map stop being
+ *                       distinguishable. Refusing is what keeps Range at the
+ *                       unclamped estimate instead of at zero.
+ *
+ * What survives is folded into three running means whose weight is capped, so
+ * an imbalance that has been watched for a few answers stops moving with any
+ * one of them - and one millivolt of movement on a 1 mV quantised register
+ * cannot walk the rider's Range. Indexed by answers and not by time, so there
+ * is no second clock and no second time constant.
+ */
+static void cell_fold(wf_est_t *e, const wf_bms_t *bms)
+{
+    /* The Pack model's Cell count has to fit the decoder's array, or the loop
+     * below would read past it. Compile-time, because it is a fact about two
+     * constants and not about a Pack. */
+    typedef char wfest_cells_fit[(WF_EST_PACK_CELLS <= WF_BMS_MAX_CELLS)
+                                 ? 1 : -1];
+    (void)sizeof(wfest_cells_fit);
+
+    if (bms->cell_count != WF_EST_PACK_CELLS) {
+        e->cell_rejected++;
+        return;
+    }
+
+    /* The lowest, the second-lowest and the highest, in one pass. The
+     * second-lowest is what the Pack's own fan-out is measured against, and it
+     * is the reason the highest and lowest registers are not simply read: they
+     * do not carry it. */
+    uint16_t lo = 0xffffu, lo2 = 0xffffu, hi = 0;
+    for (int i = 0; i < WF_EST_PACK_CELLS; i++) {
+        uint16_t mv = bms->cell_mv[i];
+        if (mv < WF_EST_CELL_MIN_MV || mv > WF_EST_CELL_MAX_MV) {
+            e->cell_rejected++;
+            return;
+        }
+        if (mv < lo) {
+            lo2 = lo;
+            lo  = mv;
+        } else if (mv < lo2) {
+            lo2 = mv;
+        }
+        if (mv > hi) {
+            hi = mv;
+        }
+    }
+
+    uint16_t avg = bms->avg_cell_mv;
+    if (avg < lo || avg > hi) {
+        e->cell_rejected++;
+        return;
+    }
+    double spread = (double)(avg - lo) / 1000.0;
+    if (spread > WF_EST_CELL_MAX_SPREAD_V) {
+        e->cell_rejected++;
+        return;
+    }
+    double gap  = (double)(lo2 - lo) / 1000.0;
+    double body = (double)(hi - lo2) / 1000.0;
+
+    if (e->cell_weight < WF_EST_CELL_SAMPLES_MAX) {
+        e->cell_weight++;
+    }
+    double k = 1.0 / (double)e->cell_weight;
+    e->cell_spread_v += (spread - e->cell_spread_v) * k;
+    e->cell_gap_v    += (gap    - e->cell_gap_v)    * k;
+    e->cell_body_v   += (body   - e->cell_body_v)   * k;
+    e->cell_min_mv    = lo;
+    e->cell_avg_mv    = avg;
+    e->cell_samples++;
+}
+
 /* ---------------------------------------------------------------- distance */
 
 /* One Odometer reading into the Anchor. Never moves distance itself, exactly
@@ -691,6 +793,12 @@ void wf_est_feed_bms(wf_est_t *e, uint32_t t_ms, const wf_bms_t *bms)
     e->last_t_ms    = t_ms;
     e->last_t_valid = true;
 
+    /* The Cell block first, and independently of the State of Charge below:
+     * they are different registers with different failure modes, and an
+     * imbalance is still worth knowing about from a response whose State of
+     * Charge did not survive its own plausibility check. */
+    cell_fold(e, bms);
+
     double soc = (double)bms->soc_pct;
     if (!(soc >= 0.0) || soc > 100.0) {
         /* Not a percentage, so not an Anchor. The replay harness asserts the
@@ -752,19 +860,72 @@ void wf_est_get(const wf_est_t *e, wf_est_out_t *out)
     out->ir_rejected  = e->ir_rejected;
     out->ir_soc_pct   = e->ir_soc_pct;
     out->load_a       = e->load_a;
+    /* The Controller's own line, and the Cells do not move it: it cuts on Pack
+     * voltage and has never heard of a Cell. What the weakest Cell moves is
+     * when the *Pack* gets there, which is `cell_band_v` below and a different
+     * mechanism - the BMS's own per-Cell protection - reached first. */
     out->limp_point_v = WF_EST_LIMP_POINT_V + out->sag_v;
+
+    /* The weakest Cell. Read time, exactly as Sag is, and for the same reason:
+     * the integration and the Anchor count down to the fixed 84.0 V line, so
+     * no accumulator is ever re-based because a Cell moved and a change to
+     * this model cannot corrupt a Coulomb Count.
+     *
+     * With no plausible Cell block ever seen, every figure here stays exactly
+     * zero and Range is the Pack-average estimate untouched - the same "no
+     * invented number" rule the Internal Resistance follows, and what makes a
+     * Monitor that has never heard from the BMS's Cell registers behave
+     * exactly as it did before this existed. */
+    if (e->cell_weight > 0) {
+        out->cell_valid    = true;
+        out->cell_min_mv   = e->cell_min_mv;
+        out->cell_avg_mv   = e->cell_avg_mv;
+        out->cell_spread_v = e->cell_spread_v;
+        out->cell_band_v   = wf_est_cell_band_v(e->cell_spread_v);
+        /* Binding and costing a watt-hour are the same condition, which is
+         * what lets main/ui.c mark the row exactly when the clamp is what is
+         * holding the number down. */
+        out->cell_clamped  = out->cell_band_v > 0.0;
+        /* The warning, and it is a ratio rather than a voltage: the gap below
+         * the lowest Cell against the fan-out of the 27 above it. Both are
+         * multiplied by the local steepness of the discharge curve, so the
+         * steepness - the whole of why divergence widens as the Pack empties -
+         * cancels, and a healthy Pack at low charge reads what it read at high
+         * charge. The clamp has to be binding as well, so a Pack whose Cells
+         * sit within a few millivolts of each other cannot raise an alarm
+         * because one of them is a millivolt lower than the rest. */
+        out->cell_diverged = out->cell_clamped &&
+                             e->cell_gap_v >=
+                                 WF_EST_CELL_OUTLIER_K * e->cell_body_v;
+    }
+    out->cell_samples  = e->cell_samples;
+    out->cell_rejected = e->cell_rejected;
 
     /* Clamped at zero for the rider. Past the Limp Point there is no model
      * here worth showing a number from - issue #8 measures what actually
      * happens down there - and "0 Wh" is the honest thing to say meanwhile.
      * The unclamped value stays in the state for the harness to look at.
      *
-     * The Sag reserve comes off here and nowhere else. The integrated figure
-     * counts down to the resting Limp Point; what the rider has left is that
-     * minus the band between the resting Limp Point and the one their right
-     * wrist is currently holding. With no measured resistance the reserve is
-     * exactly zero and this is the figure it always was. */
-    double rem = e->remaining_wh - wf_est_sag_reserve_wh(out->sag_v);
+     * The two reserves come off here and nowhere else, and they come off as
+     * one band rather than as two subtractions: the band carries the mean
+     * voltage its charge would have been delivered at, so it is nonlinear in
+     * its own width and reserve(a) + reserve(b) is not reserve(a + b). What
+     * the rider has left is the integrated figure minus the band between the
+     * resting Limp Point and the point their throttle and their worst Cell
+     * between them have actually put it at.
+     *
+     * `remaining_pack_wh` is the same figure with the Cell band left out - the
+     * Pack-average estimate - so that "Range takes the lower of the two" is
+     * readable off the pair rather than asserted in prose. The Cell band is
+     * never negative, so the subtraction *is* the minimum. */
+    double sag_reserve   = wf_est_sag_reserve_wh(out->sag_v);
+    double total_reserve = wf_est_sag_reserve_wh(out->sag_v + out->cell_band_v);
+    out->cell_reserve_wh = total_reserve - sag_reserve;
+
+    double pack_rem = e->remaining_wh - sag_reserve;
+    out->remaining_pack_wh = pack_rem > 0.0 ? pack_rem : 0.0;
+
+    double rem = e->remaining_wh - total_reserve;
     out->remaining_wh = rem > 0.0 ? rem : 0.0;
 
     out->coulomb_ah     = e->coulomb_ah;

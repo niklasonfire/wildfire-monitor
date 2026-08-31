@@ -179,6 +179,14 @@ typedef struct {
      * Pack looked like that day, which is what issue #21 will compare across
      * months. */
     double   sag_v_max;
+    /* The weakest Cell, and the Range it holds down. cap0007 is a healthy Pack
+     * - 3 to 7 mV between its lowest Cell and its average in all 34 responses
+     * - so what it pins is a clamp that never binds and a warning that never
+     * fires, which is one half of the acceptance criterion taken off a real
+     * ride rather than a synthesised one. The other half is the same file
+     * replayed with one Cell rewritten; see cell_synth_t below. */
+    bool     cell_clamp_seen, cell_diverge_seen;
+    double   cell_reserve_wh_max;
     long     range_points;
     double   range_km_first, range_km_last;
     double   range_km_prev;
@@ -240,6 +248,15 @@ static void est_sample(run_t *r)
     wf_est_get(&r->est, &o);
     if (o.sag_v > r->sag_v_max) {
         r->sag_v_max = o.sag_v;
+    }
+    if (o.cell_clamped) {
+        r->cell_clamp_seen = true;
+    }
+    if (o.cell_diverged) {
+        r->cell_diverge_seen = true;
+    }
+    if (o.cell_reserve_wh > r->cell_reserve_wh_max) {
+        r->cell_reserve_wh_max = o.cell_reserve_wh;
     }
     if (o.distance_valid) {
         dist_point(r, o.distance_m);
@@ -333,6 +350,98 @@ static const uint8_t *synth_odo(const odo_synth_t *s, unsigned tick,
     return scratch;
 }
 
+/* ------------------------------------------------- the synthesised weak Cell
+ *
+ * Every Pack this repository has recorded is healthy: cap0007's lowest Cell
+ * runs 3 to 7 mV under its average through all 34 responses, which is what a
+ * good Pack looks like and is exactly why that ride proves the "produces
+ * neither" half of the criterion for free. The other half needs a Pack with a
+ * Cell going, and there is no such recording - so one Cell of a real ride is
+ * rewritten on the way into the parser, the same trick and the same scratch
+ * buffer the Odometer ramp above uses, and nothing is written back to the
+ * .wfl (ADR-0001).
+ *
+ * A rewritten response has to stay a *possible* Pack or the test is measuring
+ * an impossible one. So the whole Cell block is recomputed after the edit -
+ * register 43 the highest Cell, 44 the lowest, 55 the truncated mean, 56 the
+ * redundant delta - and the response is re-checksummed with the BMS's own
+ * Modbus CRC. Every identity tests/host/replay.c asserts on a real Capture is
+ * then asserted on the synthesised one too, by running the same
+ * check_invariants() over it: a synthesis that broke one would be caught
+ * rather than believed.
+ *
+ * Register 40, the Pack voltage, is deliberately left alone. It is a separate
+ * instrument reading a moment apart - the cell-sum invariant allows the two a
+ * volt, and CELL_SYNTH_DROP_MV is well inside that - and rewriting it would
+ * break register 57's identity against pack voltage times current, which has
+ * nothing to do with Cells and is worth keeping asserted.
+ */
+#define CELL_SYNTH_INDEX    7u      /* which Cell goes */
+#define CELL_SYNTH_DROP_MV  300u    /* how far under the rest of its Pack */
+
+typedef struct {
+    bool     on;
+    unsigned index;
+    unsigned drop_mv;
+} cell_synth_t;
+
+#define BMS_MAX_FRAME  256
+
+static uint16_t bms_reg(const uint8_t *f, unsigned i)
+{
+    return (uint16_t)(((uint16_t)f[3 + 2 * i] << 8) | f[4 + 2 * i]);
+}
+
+static void bms_set_reg(uint8_t *f, unsigned i, uint16_t v)
+{
+    f[3 + 2 * i] = (uint8_t)(v >> 8);
+    f[4 + 2 * i] = (uint8_t)(v & 0xff);
+}
+
+/* Rewrites one BMS response's Cell block and fixes everything downstream of
+ * it, in scratch. Returns the bytes to decode: the rewritten copy, or the
+ * original untouched. */
+static const uint8_t *synth_cells(const cell_synth_t *s, const uint8_t *data,
+                                  uint32_t len, uint8_t scratch[BMS_MAX_FRAME])
+{
+    if (!s->on || len < 5 || len > BMS_MAX_FRAME || data[0] != WF_BMS_LEAD ||
+        data[1] != WF_BMS_FUNC_READ) {
+        return data;
+    }
+    unsigned n_reg = data[2] / 2u;
+    if ((unsigned)len != 5u + 2u * n_reg || n_reg < WF_BMS_REG_NEEDED ||
+        s->index >= WF_BMS_MAX_CELLS) {
+        return data;
+    }
+    memcpy(scratch, data, len);
+
+    uint16_t was = bms_reg(scratch, s->index);
+    if (was <= s->drop_mv) {
+        return data;
+    }
+    bms_set_reg(scratch, s->index, (uint16_t)(was - s->drop_mv));
+
+    /* The three registers that describe the array have to keep describing it,
+     * or the Pack is one no BMS could report. */
+    unsigned lo = 0xffffu, hi = 0;
+    unsigned long sum = 0;
+    for (unsigned i = 0; i < WF_BMS_MAX_CELLS; i++) {
+        unsigned mv = bms_reg(scratch, i);
+        if (mv < lo) lo = mv;
+        if (mv > hi) hi = mv;
+        sum += mv;
+    }
+    bms_set_reg(scratch, 43, (uint16_t)hi);
+    bms_set_reg(scratch, 44, (uint16_t)lo);
+    bms_set_reg(scratch, 55, (uint16_t)(sum / WF_BMS_MAX_CELLS));
+    bms_set_reg(scratch, 56, (uint16_t)(hi - lo));
+
+    uint16_t crc = wf_crc16(scratch, (size_t)len - 2, WF_BMS_CRC_INIT);
+    scratch[len - 2] = (uint8_t)(crc & 0xff);
+    scratch[len - 1] = (uint8_t)(crc >> 8);
+    return scratch;
+}
+
 static void run_init(run_t *r)
 {
     memset(r, 0, sizeof(*r));
@@ -382,7 +491,8 @@ static void power_cycle(run_t *r)
 /* cycle_at is the record index to simulate a power cycle before, or 0 for a
  * run with no break in it. */
 static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
-                   const odo_synth_t *synth, long cycle_at)
+                   const odo_synth_t *synth, const cell_synth_t *cells,
+                   long cycle_at)
 {
     wfl_reader_t rd;
     if (!wfl_open(&rd, buf, len, hdr)) {
@@ -393,6 +503,7 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
     run_init(r);
     unsigned odo_tick = 0;
     uint8_t scratch[WF_CTRL_FRAME_LEN];
+    uint8_t bms_scratch[BMS_MAX_FRAME];
 
     wfl_rec_t rec;
     while (wfl_next(&rd, &rec)) {
@@ -464,7 +575,9 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
         case WFREC_BMS: {
             r->bms_records++;
             wf_bms_t b;
-            if (!wf_bms_decode(rec.data, rec.len, &b)) {
+            const uint8_t *bd = synth_cells(cells, rec.data, rec.len,
+                                            bms_scratch);
+            if (!wf_bms_decode(bd, rec.len, &b)) {
                 r->bms_responses_bad++;
                 break;
             }
@@ -695,6 +808,25 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "est_ir_steps", (double)o.ir_steps);
         put(ms, "est_ir_rejected", (double)o.ir_rejected);
         put(ms, "est_sag_v_max", r->sag_v_max);
+        /* The weakest Cell, unconditional for the same reason: "this Pack is
+         * healthy and its lowest Cell costs the rider nothing" is the fact a
+         * good ride is worth pinning, and if a future change ever charges
+         * cap0007 for its own 4 mV of imbalance these move off zero and say
+         * so.
+         *
+         *   est_cell_samples    Cell blocks believed - one per BMS answer
+         *   est_cell_rejected   Cell blocks refused as not a 28-Cell Pack
+         *   est_cell_spread_mv  the lowest Cell under the average, averaged
+         *   est_cell_clamped    the clamp bound at any point of the ride
+         *   est_cell_diverged   the divergence warning fired at any point
+         *   est_cell_reserve_wh the most the weakest Cell ever cost
+         */
+        put(ms, "est_cell_samples", (double)o.cell_samples);
+        put(ms, "est_cell_rejected", (double)o.cell_rejected);
+        put(ms, "est_cell_spread_mv", o.cell_spread_v * 1000.0);
+        put(ms, "est_cell_clamped", r->cell_clamp_seen ? 1.0 : 0.0);
+        put(ms, "est_cell_diverged", r->cell_diverge_seen ? 1.0 : 0.0);
+        put(ms, "est_cell_reserve_wh", r->cell_reserve_wh_max);
         if (o.ir_valid) {
             put(ms, "est_ir_ohm", o.ir_ohm);
             put(ms, "est_ir_weight", (double)o.ir_weight);
@@ -931,6 +1063,80 @@ static void check_invariants(const char *fixture, const run_t *r)
         fail(fixture, "the Limp Point is %.6f V against the %.6f V its own Sag "
                       "implies", o.limp_point_v,
              WF_EST_LIMP_POINT_V + o.sag_v);
+    }
+
+    /* ---- the weakest Cell ----
+     *
+     * The same shape of invariant as everything else here: the clamp either
+     * bound under its own rule or did not happen at all, and there is no third
+     * state in which watt-hours went missing that no rule took.
+     *
+     * A Pack that was never read has to leave Range exactly where it was. That
+     * is the "a missing per-Cell reading does not clamp Range to zero" rule as
+     * arithmetic, and it is what makes every figure on a ride whose BMS never
+     * answered identical to what it was before any of this existed. */
+    if (!o.cell_valid) {
+        if (o.cell_spread_v != 0.0 || o.cell_band_v != 0.0 ||
+            o.cell_reserve_wh != 0.0 || o.cell_clamped || o.cell_diverged) {
+            fail(fixture, "no Cell reading was believed, and yet the weakest "
+                          "Cell took %.3f Wh off Range on %.6f V of spread",
+                 o.cell_reserve_wh, o.cell_spread_v);
+        }
+    } else {
+        /* A Cell the estimator believed has to be a Cell: the same 2.0-4.5 V
+         * bound the raw array is held to above. */
+        if (o.cell_min_mv < WF_EST_CELL_MIN_MV ||
+            o.cell_avg_mv > WF_EST_CELL_MAX_MV ||
+            o.cell_min_mv > o.cell_avg_mv) {
+            fail(fixture, "the estimator believed a lowest Cell of %u mV "
+                          "against an average of %u mV", o.cell_min_mv,
+                 o.cell_avg_mv);
+        }
+        if (o.cell_spread_v < 0.0 ||
+            o.cell_spread_v > WF_EST_CELL_MAX_SPREAD_V) {
+            fail(fixture, "a Cell spread of %.3f V got past the %.3f V bound "
+                          "the estimator refuses outside of", o.cell_spread_v,
+                 WF_EST_CELL_MAX_SPREAD_V);
+        }
+    }
+    /* The band is the spread's own, and the clamp binds exactly when the band
+     * is not zero - which is what lets main/ui.c mark the row when it binds
+     * and only then. */
+    if (o.cell_band_v != wf_est_cell_band_v(o.cell_spread_v)) {
+        fail(fixture, "a Cell band of %.6f V against the %.6f V a spread of "
+                      "%.6f V implies", o.cell_band_v,
+             wf_est_cell_band_v(o.cell_spread_v), o.cell_spread_v);
+    }
+    if (o.cell_clamped != (o.cell_band_v > 0.0)) {
+        fail(fixture, "the clamp %s while the Cell band is %.6f V",
+             o.cell_clamped ? "binds" : "does not bind", o.cell_band_v);
+    }
+    if (o.cell_diverged && !o.cell_clamped) {
+        fail(fixture, "a divergence warning on a clamp that is not binding");
+    }
+    /* Range takes the lower of the two, and the reserve is the difference: the
+     * criterion as arithmetic rather than as prose. Both figures are clamped
+     * at zero for the rider, so the identity is only asserted above it. */
+    if (o.remaining_wh > o.remaining_pack_wh) {
+        fail(fixture, "the Cell clamp raised Remaining Energy from %.6f Wh to "
+                      "%.6f Wh", o.remaining_pack_wh, o.remaining_wh);
+    }
+    if (o.cell_reserve_wh < 0.0) {
+        fail(fixture, "the weakest Cell gave the rider %.3f Wh back",
+             -o.cell_reserve_wh);
+    }
+    if (o.remaining_wh > 0.0) {
+        double implied = o.remaining_pack_wh - o.cell_reserve_wh;
+        double slip = implied - o.remaining_wh;
+        if (slip < 0.0) {
+            slip = -slip;
+        }
+        if (slip > 1e-6 * (1.0 + o.remaining_wh)) {
+            fail(fixture, "%.6f Wh of Pack-average estimate less %.6f Wh of "
+                          "Cell reserve is %.6f Wh, not the %.6f Wh Range was "
+                          "divided from", o.remaining_pack_wh,
+                 o.cell_reserve_wh, implied, o.remaining_wh);
+        }
     }
 
     /* ---- distance ---- */
@@ -1317,6 +1523,28 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                    "%.1f V\n", WF_EST_IR_MIN_DI_A, WF_EST_LIMP_POINT_V);
         }
     }
+    {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        if (!o.cell_valid) {
+            printf("  cells: none believed (%u refused), so the weakest Cell "
+                   "holds Range down by nothing\n", o.cell_rejected);
+        } else if (!r->cell_clamp_seen) {
+            printf("  cells: lowest %u mV under an average of %u mV, %.1f mV "
+                   "of spread inside the %.1f mV the Pack model already has - "
+                   "no clamp, no warning\n", o.cell_min_mv, o.cell_avg_mv,
+                   o.cell_spread_v * 1000.0,
+                   WF_EST_CELL_DEADBAND_V * 1000.0);
+        } else {
+            printf("  cells: lowest %u mV under an average of %u mV, %.1f mV "
+                   "of spread past the %.1f mV deadband - %.2f V of band, "
+                   "<=%.1f Wh given up%s\n", o.cell_min_mv, o.cell_avg_mv,
+                   o.cell_spread_v * 1000.0,
+                   WF_EST_CELL_DEADBAND_V * 1000.0, o.cell_band_v,
+                   r->cell_reserve_wh_max,
+                   r->cell_diverge_seen ? ", DIVERGING" : "");
+        }
+    }
     if (r->dist_points > 0) {
         printf("  distance: %.1f m fused from %.1f m of Odometer, %ld curve "
                "points hash %016llx\n",
@@ -1391,10 +1619,11 @@ int main(int argc, char **argv)
             continue;
         }
 
-        const odo_synth_t off = { .on = false, .start = 0 };
+        const odo_synth_t  off      = { .on = false, .start = 0 };
+        const cell_synth_t no_weak  = { .on = false, .index = 0, .drop_mv = 0 };
         wflog_hdr_t hdr;
         run_t r;
-        replay(buf, len, &hdr, &r, &off, 0);
+        replay(buf, len, &hdr, &r, &off, &no_weak, 0);
         report(&hdr, &r);
         if (hdr.version != WFLOG_VERSION) {
             /* Not a warning: a Capture from a format this build does not know
@@ -1412,7 +1641,7 @@ int main(int argc, char **argv)
          * outside the file would show up here. */
         wflog_hdr_t hdr2;
         run_t again;
-        replay(buf, len, &hdr2, &again, &off, 0);
+        replay(buf, len, &hdr2, &again, &off, &no_weak, 0);
         if (again.est_hash != r.est_hash || again.est_points != r.est_points) {
             fail(paths[i], "replaying it twice produced two different "
                            "Remaining Energy curves: %ld points hash %016llx, "
@@ -1437,8 +1666,8 @@ int main(int argc, char **argv)
         const odo_synth_t wrapped = { .on = true, .start = 65530 };
         wflog_hdr_t hdr3, hdr4;
         run_t a, b;
-        replay(buf, len, &hdr3, &a, &clear, 0);
-        replay(buf, len, &hdr4, &b, &wrapped, 0);
+        replay(buf, len, &hdr3, &a, &clear, &no_weak, 0);
+        replay(buf, len, &hdr4, &b, &wrapped, &no_weak, 0);
         if (a.dist_points == 0) {
             fail(paths[i], "the synthesised Odometer ramp produced no distance "
                            "at all");
@@ -1458,6 +1687,80 @@ int main(int argc, char **argv)
                            "Odometer ramp, by up to %.6f m",
                  a.dist_step_back_max > b.dist_step_back_max
                      ? a.dist_step_back_max : b.dist_step_back_max);
+        }
+
+        /* The weak-Cell criterion, and it is the half of it a real Capture
+         * cannot supply: every Pack this repository has recorded is healthy.
+         * So the same ride is replayed once more with Cell 7 rewritten
+         * CELL_SYNTH_DROP_MV under the rest of its Pack, re-checksummed, and
+         * put through the same parser, the same decoder and the same estimator
+         * over the real ride's timing.
+         *
+         * The unmodified run is the control and it carries the other half:
+         * replaying a healthy Pack has to produce neither the clamp nor the
+         * warning, and cap0007's 3-7 mV of imbalance is a healthy Pack. */
+        const cell_synth_t weak = { .on = true, .index = CELL_SYNTH_INDEX,
+                                    .drop_mv = CELL_SYNTH_DROP_MV };
+        wflog_hdr_t hdr6;
+        run_t sick;
+        replay(buf, len, &hdr6, &sick, &off, &weak, 0);
+        if (r.bms_responses_ok == 0) {
+            /* Nothing to rewrite: a Capture with no BMS in it says nothing
+             * about Cells either way, which is honest and not a failure. */
+        } else if (sick.bms_responses_ok != r.bms_responses_ok) {
+            fail(paths[i], "the synthesised weak Cell broke %ld of %ld BMS "
+                           "responses, so the rewrite is not a Pack a BMS "
+                           "could have reported",
+                 r.bms_responses_ok - sick.bms_responses_ok,
+                 r.bms_responses_ok);
+        } else {
+            wf_est_out_t good, bad;
+            wf_est_get(&r.est, &good);
+            wf_est_get(&sick.est, &bad);
+
+            /* The healthy half. */
+            if (r.cell_clamp_seen || r.cell_diverge_seen) {
+                fail(paths[i], "a healthy Pack clamped Range or raised the "
+                               "divergence warning: %.1f mV of spread against "
+                               "a %.1f mV deadband",
+                     good.cell_spread_v * 1000.0,
+                     WF_EST_CELL_DEADBAND_V * 1000.0);
+            }
+            if (good.cell_reserve_wh != 0.0 ||
+                good.remaining_wh != good.remaining_pack_wh) {
+                fail(paths[i], "a healthy Pack gave up %.3f Wh to its own "
+                               "weakest Cell", good.cell_reserve_wh);
+            }
+            /* The weak half, and the guard that says the synthesis did
+             * something - the same guard the Odometer ramp carries. */
+            if (bad.cell_rejected != 0) {
+                fail(paths[i], "the synthesised weak Cell was refused %u times "
+                               "as implausible, so it is not being measured",
+                     bad.cell_rejected);
+            }
+            if (!sick.cell_clamp_seen) {
+                fail(paths[i], "a Cell %u mV under its Pack did not clamp "
+                               "Range at all", CELL_SYNTH_DROP_MV);
+            }
+            if (!sick.cell_diverge_seen) {
+                fail(paths[i], "a Cell %u mV under its Pack raised no "
+                               "divergence warning", CELL_SYNTH_DROP_MV);
+            }
+            if (!(bad.remaining_wh < good.remaining_wh)) {
+                fail(paths[i], "the weak Cell left Remaining Energy at %.3f Wh "
+                               "against the healthy Pack's %.3f Wh",
+                     bad.remaining_wh, good.remaining_wh);
+            }
+            /* And the Pack-average estimate underneath it did not move: the
+             * clamp is applied at read time and nothing integrated was
+             * re-based, which is #17's discipline held to. */
+            if (bad.remaining_pack_wh != good.remaining_pack_wh) {
+                fail(paths[i], "the weak Cell moved the Pack-average estimate "
+                               "from %.6f Wh to %.6f Wh - something integrated "
+                               "was re-based on a Cell reading",
+                     good.remaining_pack_wh, bad.remaining_pack_wh);
+            }
+            check_invariants(paths[i], &sick);
         }
 
         /* The power-cycle criterion. The same ride again with the Monitor
@@ -1485,7 +1788,7 @@ int main(int argc, char **argv)
          * a Monitor which quietly forgot its window would fail it. */
         wflog_hdr_t hdr5;
         run_t cyc;
-        replay(buf, len, &hdr5, &cyc, &off, r.records / 2);
+        replay(buf, len, &hdr5, &cyc, &off, &no_weak, r.records / 2);
         if (!cyc.cycled) {
             fail(paths[i], "the simulated power cycle never happened, so the "
                            "continuity assertion is measuring nothing");

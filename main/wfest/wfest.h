@@ -306,6 +306,118 @@
  * its own.
  *
  * ---------------------------------------------------------------------------
+ * The weakest Cell, which is what actually ends the ride
+ * ---------------------------------------------------------------------------
+ *
+ *   Cell spread     how far the lowest Cell sits below the Pack average, in
+ *                   volts per Cell
+ *   Cell band       what that puts on the Limp Point, in Pack volts
+ *   Cell reserve    the watt-hours the rider gives up because of it
+ *
+ * Everything above this line treats the Pack as its average. It is not: it is
+ * 28 Cells in series and it stops on the weakest of them. WF_EST_LIMP_POINT_V
+ * is 28 x 3.00 V, so the Pack reaches the Limp Point when the *average* Cell
+ * reaches 3.00 V - and by then the lowest Cell has been under 3.00 V for a
+ * while. A Range built on the average is optimistic by exactly that, and the
+ * sicker the Pack the more optimistic it is.
+ *
+ * WHAT THE MINIMUM CELL IMPLIES, and the assumption in it. The 28 Cells are
+ * taken to follow one curve, offset from each other: the lowest Cell is the
+ * average Cell shifted down by the spread, and it therefore reaches its own
+ * 3.00 V when the average reaches 3.00 V plus the spread - that is, when the
+ * Pack reaches WF_EST_LIMP_POINT_V plus 28 spreads. So the whole of the
+ * minimum-Cell estimate is one more band of volts above the Limp Point, of
+ * exactly the shape Sag already puts there, and it is computed by the same
+ * wf_est_sag_reserve_wh().
+ *
+ * 28 identical Cells in series is the assumption, and it is precisely the
+ * assumption a weak Cell violates - a Cell that is losing capacity does not
+ * merely sit lower on the same curve, it has a shorter one. That is why this
+ * is a clamp and not a replacement: it says "no more than this", which is the
+ * direction that cannot strand a rider, and it says nothing about how much
+ * further the shortfall goes.
+ *
+ * THE DIFFERENCE AND NOT THE VALUE. The spread is `avg_cell_mv - cell_min_mv`
+ * and never the lowest Cell's absolute reading, and that is what makes it
+ * usable at all. Cell voltages sag under load exactly as the Pack's does - at
+ * 150 A a Cell reads a quarter of a volt low, which taken absolutely would
+ * wipe a third off the Range every time the rider opened the throttle. Sag is
+ * common to all 28 Cells, so it cancels out of the difference and what is left
+ * is imbalance. (A weak Cell's own extra resistance does not cancel, and shows
+ * as the spread widening under load - which is real, and is the weak Cell
+ * genuinely reaching the Limp Point first when the rider pulls hard.)
+ *
+ * THE DEADBAND, which is why a healthy Pack pays nothing. WF_EST_PACK_V_AT_REF
+ * was measured on cap0007 - a Pack whose lowest Cell ran 3 to 7 mV under its
+ * average through all 34 responses - so the 84.0 V line already has a normal
+ * Pack's imbalance inside it. Charging the rider for that again would be
+ * double-counting it, the same mistake as subtracting the crawl below the Limp
+ * Point twice. So only imbalance past WF_EST_CELL_DEADBAND_V is new
+ * information, and only that is charged. A healthy Pack produces a reserve of
+ * exactly zero, and cap0007's pinned figures are the figures they were.
+ *
+ * That also makes the clamp continuous rather than a switch: at the deadband
+ * the reserve is zero and it grows smoothly from there, so nothing steps onto
+ * the rider's screen at the moment a Cell crosses a threshold. The clamp is
+ * visible to the rider exactly when it binds, because "binds" and "costs a
+ * watt-hour" are the same condition; main/ui.c marks the hero row.
+ *
+ * THE WARNING, and the one thing it must not do. Divergence widens on its own
+ * as the Pack empties: the Cells' charge offsets are fixed, the curve steepens
+ * at the bottom, so the same imbalance in amp-hours shows as a wider and wider
+ * spread in millivolts. A threshold in millivolts therefore fires on every
+ * healthy Pack at low charge, the rider learns to ignore it, and it is worth
+ * nothing on the day it matters.
+ *
+ * So the warning's threshold is not in millivolts at all. It is a ratio
+ * between two spreads measured on the same Pack in the same response:
+ *
+ *   the gap below the lowest Cell   its second-lowest Cell minus its lowest
+ *   the Pack's own fan-out          its highest Cell minus its second-lowest
+ *
+ * and the warning is that the first is at least WF_EST_CELL_OUTLIER_K times
+ * the second. Whatever the local steepness of the discharge curve is, it
+ * multiplies both of those, and it cancels out of their ratio - which is
+ * exactly the physics that would otherwise defeat a fixed threshold, turned
+ * into the reason this one holds. A healthy Pack at 10 % fans out; all 28
+ * Cells fan out together, so the ratio is where it was at 90 %. A failing Cell
+ * leaves the other 27 behind, and only the numerator grows.
+ *
+ * cap0007 is the evidence for the value. Over its 34 responses that ratio runs
+ * 0.00 to 0.33, and the warning fires at 2.0 - six times the widest thing a
+ * healthy Pack was ever seen to do. It is not a round number chosen to look
+ * reasonable; it is the measured spread of a good Pack with a factor of six on
+ * it, and a longer ride down to low charge is what would tighten it.
+ *
+ * The warning also requires the clamp to be binding at all, so a Pack whose 28
+ * Cells sit within 3 mV of each other cannot raise an alarm because one of
+ * them is 1 mV lower than the rest. Two failing Cells side by side defeat the
+ * ratio - they raise the denominator together - and that is a real limitation
+ * and not a case this can catch from one response.
+ *
+ * WHAT IS NOT BELIEVED. A response whose Cell block is not a plausible 28-Cell
+ * Pack is refused whole, the previous reading stands, and `cell_rejected`
+ * counts it - a Monitor producing nothing but rejections is a decode problem
+ * and not a quiet zero. Refused: a cell count that is not
+ * WF_EST_PACK_CELLS, any Cell outside WF_EST_CELL_MIN_MV..MAX_MV (which a
+ * zero-filled array and a 6 V "Cell" both fail), an average register outside
+ * the array's own extremes, and a spread past WF_EST_CELL_MAX_SPREAD_V, where
+ * a dying Cell and a slipped register map can no longer be told apart. A
+ * dropped BMS response is not even a rejection: the last plausible reading
+ * stands, because imbalance is a fact about the Pack and not about the link.
+ * In every one of those cases Range degrades to the unclamped Pack-average
+ * estimate - never to zero.
+ *
+ * The three spreads are running means over the last WF_EST_CELL_SAMPLES_MAX
+ * BMS answers rather than the last one alone, which is the same smoothing
+ * discipline as everywhere else here: one millivolt of movement on a 1 mV
+ * quantised register would otherwise be worth a tenth of a kilometre of Range,
+ * twice what a bucket of road takes off it. Indexed by answers and not by
+ * time, so it needs no clock of its own. The mean is not persisted - the
+ * imbalance is re-acquired from the first BMS answer after a power cycle, in
+ * about a second, the same as the load average behind Sag.
+ *
+ * ---------------------------------------------------------------------------
  * WARNING: the 19 %, and which way it goes in each figure
  * ---------------------------------------------------------------------------
  *
@@ -608,6 +720,47 @@
 #define WF_EST_IR_CONFIDENT_SAMPLES  8u
 #define WF_EST_SAG_TAU_S             20.0
 
+/* ------------------------------------------------- the weakest Cell's limits
+ *
+ * The prose is in the header comment above; these are the five numbers it
+ * settles, and none of them is a second Limp Point - the per-Cell one is
+ * WF_EST_LIMP_POINT_V divided by WF_EST_PACK_CELLS and is written that way.
+ *
+ * MIN_MV / MAX_MV   what a lithium Cell can read at all, the same 2.0-4.5 V
+ *                   bound tests/host/replay.c holds every Capture to. A
+ *                   zero-filled array fails the floor and a 6 V "Cell" fails
+ *                   the ceiling, which is the whole of the implausible-reading
+ *                   rule.
+ * DEADBAND_PCT      the imbalance already inside the Pack model, as percent of
+ *                   Pack. One percent is 13.2 mV per Cell on the line above -
+ *                   twice the widest imbalance cap0007 showed, and worth about
+ *                   42 Wh, which is where the hero row's "%.0f" would start to
+ *                   move. Below it the reserve is exactly zero.
+ * MAX_SPREAD_V      where a dying Cell stops being distinguishable from a
+ *                   slipped register. Half a volt below the Pack average is
+ *                   14 V of band, a tenth of the Pack, and a Cell that far
+ *                   down would have tripped the BMS's own protection long
+ *                   before a rider read it here. Past this the response is
+ *                   refused and Range is the unclamped figure, which is what
+ *                   "a missing or implausible reading must not clamp Range to
+ *                   zero" requires.
+ * OUTLIER_K         the divergence warning, as a ratio and deliberately not as
+ *                   a voltage. See the header comment: cap0007's healthy Pack
+ *                   runs 0.00-0.33 and this is 2.0.
+ * SAMPLES_MAX       the weight cap on the running mean over BMS answers, about
+ *                   sixteen seconds at the ~1 Hz poll.
+ */
+#define WF_EST_CELL_MIN_MV           2000u
+#define WF_EST_CELL_MAX_MV           4500u
+#define WF_EST_CELL_LIMP_V           (WF_EST_LIMP_POINT_V / WF_EST_PACK_CELLS)
+#define WF_EST_CELL_DEADBAND_PCT     1.0
+#define WF_EST_CELL_DEADBAND_V       (WF_EST_CELL_DEADBAND_PCT * \
+                                      WF_EST_PACK_V_PER_SOC_PCT / \
+                                      WF_EST_PACK_CELLS)
+#define WF_EST_CELL_MAX_SPREAD_V     0.5
+#define WF_EST_CELL_OUTLIER_K        2.0
+#define WF_EST_CELL_SAMPLES_MAX      16u
+
 /* ----------------------------------------------------------- sign convention
  *
  * Positive current is discharge - the Controller's own convention, kept
@@ -789,6 +942,21 @@ typedef struct {
     double   load_a;            /* the load Sag is taken at, averaged */
     bool     load_valid;
 
+    /* The weakest Cell, from the BMS's per-Cell registers. Three spreads and
+     * not one, because two different questions are asked of them: how much the
+     * lowest Cell costs (against the average) and whether it has left the Pack
+     * behind (against the Pack's own fan-out). All three are running means over
+     * BMS answers, weighted by cell_weight and capped, so one millivolt of
+     * movement on a quantised register cannot move the rider's Range. */
+    double   cell_spread_v;     /* average Cell minus lowest Cell */
+    double   cell_gap_v;        /* second-lowest Cell minus lowest Cell */
+    double   cell_body_v;       /* highest Cell minus second-lowest Cell */
+    uint16_t cell_min_mv;       /* the last plausible reading, as it arrived */
+    uint16_t cell_avg_mv;
+    uint32_t cell_weight;       /* answers in the means, capped at SAMPLES_MAX */
+    uint32_t cell_samples;      /* plausible Cell blocks folded in */
+    uint32_t cell_rejected;     /* Cell blocks refused as not a 28-Cell Pack */
+
     /* the clock, entirely as fed */
     uint32_t last_t_ms;         /* most recent t_ms of any feed */
     bool     last_t_valid;
@@ -911,6 +1079,46 @@ typedef struct {
     double   sag_v;
     double   limp_point_v;
 
+    /* The weakest Cell, and the Range it holds down.
+     *
+     * `remaining_pack_wh` is the Pack-average estimate - Sag-corrected, and
+     * with no Cell clamp on it. `remaining_wh` above is the clamped figure, so
+     * the acceptance criterion "Range takes the lower of the Pack-average
+     * estimate and the minimum-Cell estimate" is readable straight off the
+     * pair, and the two are equal on a Pack whose imbalance is inside the
+     * deadband.
+     *
+     * `cell_valid` is false until a plausible 28-Cell block has arrived, and
+     * then every figure here is exactly zero and Range is the Pack-average
+     * estimate untouched - the same "no invented number" rule the Internal
+     * Resistance follows.
+     *
+     * `cell_clamped` is the clamp binding, which is the same thing as the
+     * reserve being worth a watt-hour: it is true exactly when the spread has
+     * passed WF_EST_CELL_DEADBAND_V, and main/ui.c marks the hero row so a
+     * clamped Range cannot look like an unclamped one.
+     *
+     * `cell_diverged` is the warning: the lowest Cell has left the other 27
+     * behind by WF_EST_CELL_OUTLIER_K times the Pack's own fan-out, while the
+     * clamp is binding. A ratio and not a voltage, so it does not fire on a
+     * healthy Pack at low charge; the header comment works that through.
+     *
+     * `cell_rejected` counts Cell blocks refused as not a 28-Cell Pack, so a
+     * decode that has silently stopped producing them is visible rather than
+     * looking like a Pack with no imbalance. */
+    bool     cell_valid;
+    bool     cell_clamped;
+    bool     cell_diverged;
+    uint16_t cell_min_mv;
+    uint16_t cell_avg_mv;
+    double   cell_spread_v;     /* average Cell minus lowest Cell */
+    double   cell_band_v;       /* what that puts on the Limp Point, past the
+                                 * deadband, in Pack volts */
+    double   cell_reserve_wh;   /* the watt-hours it costs */
+    double   remaining_pack_wh; /* Remaining Energy before the Cell clamp */
+    uint32_t cell_samples;
+    uint32_t cell_rejected;
+
     uint32_t power_samples;
     uint32_t anchor_samples;
     uint32_t distance_samples;
@@ -946,10 +1154,16 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored);
 void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
                       const wf_ctrl_live_t *live);
 
-/* Folds one decoded BMS response in. Takes the State of Charge and nothing
- * else: the BMS's pack voltage and current are not consumed here (ADR-0003),
- * and neither is any energy figure it offers. Updates the Anchor; it does not
- * itself move the integrated values, except on the one acquisition. */
+/* Folds one decoded BMS response in. Two things come out of it and no others:
+ * the State of Charge, which is the Anchor, and the per-Cell voltages, which
+ * are the only place the Monitor can learn that the Pack is not its average.
+ * The BMS's pack voltage and current are not consumed here (ADR-0003), and
+ * neither is any energy figure it offers, nor register 56, which is redundant.
+ *
+ * Neither moves an integrated value: the Anchor is a pull applied on the next
+ * power frame - except on the one acquisition - and the Cell spread is applied
+ * at read time in wf_est_get(), exactly as Sag is, so no accumulator is ever
+ * re-based on a Cell reading. */
 void wf_est_feed_bms(wf_est_t *e, uint32_t t_ms, const wf_bms_t *bms);
 
 /* The estimates. Pure: no clock, so the Anchor's age is measured against the
@@ -979,9 +1193,29 @@ double wf_est_limp_soc_pct(void);
  * physics with the noise taken out of it. */
 double wf_est_pack_v_at_soc(double soc_pct);
 
-/* The watt-hours lying between the Limp Point and one Sag above it: the energy
- * a rider gives up by holding the load that produces that Sag, and the whole
- * of the Sag model.
+/* The Pack volts the weakest Cell puts on the Limp Point, given how far it
+ * sits below the Pack average: 28 times the spread past
+ * WF_EST_CELL_DEADBAND_V, and zero at or inside the deadband. The imbalance
+ * inside the deadband is already in the Pack model, which was measured on a
+ * Pack that had some - charging the rider for it twice is the same mistake as
+ * subtracting the crawl twice.
+ *
+ * Zero for a NaN and for a negative spread as well, which is a lowest Cell
+ * above its own Pack average and so a decode that has gone wrong. */
+double wf_est_cell_band_v(double spread_v);
+
+/* The watt-hours lying between the Limp Point and a band of volts above it:
+ * the energy a rider gives up because the Pack cannot be taken down to the
+ * Limp Point after all.
+ *
+ * Two things put a band there and they add: Sag, which is the load the rider
+ * is holding, and the weakest Cell, which is wf_est_cell_band_v() above. The
+ * band is nonlinear in its own width - it carries the mean voltage the charge
+ * would have come out at - so the two are summed and this is called once
+ * rather than called twice and added.
+ *
+ * The name is Sag's because Sag was here first; the model is a band of volts
+ * and knows nothing about where the volts came from.
  *
  * On the straight line above, the charge in a band of the Pack depends only on
  * how many volts wide the band is, so this is a function of Sag alone and not

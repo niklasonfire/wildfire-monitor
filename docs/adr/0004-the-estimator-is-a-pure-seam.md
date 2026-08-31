@@ -31,6 +31,14 @@ still sagging their Pack. It stays replayable all the same: its step is
 the recorded stream and not of when anything was read. It is what lets the Limp
 Point move with riding style without moving with individual frames.
 
+The weakest Cell's divergence is in the seam on the same terms and is indexed a
+third way again: by BMS answers, because a Cell imbalance is a fact the BMS
+states once per poll and nothing else observes at all. Answers, not seconds, so
+it needs no clock; answers, not metres, so a Pack that is standing still is
+still being watched. It stays replayable for the same reason the other two do -
+its step is one per record in the file - and it is applied at read time like
+Sag, so no accumulator is ever re-based because a Cell moved.
+
 Range is in the seam too, and it is the one figure there that holds no state of
 its own: it is Remaining Energy divided by Consumption, computed where both
 already are, guarded by a floor on the divisor. That is deliberate rather than

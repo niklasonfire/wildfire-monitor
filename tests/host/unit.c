@@ -2897,6 +2897,387 @@ static void test_internal_resistance_improves_across_rides(void)
     CHECK_D(o.ir_ohm, 0.050, 0.004, "the mean over both rides");
 }
 
+/* ---------------------------------------------------- the weakest Cell -----
+ *
+ * cap0007 is a healthy Pack and it is the only real Pack data this repository
+ * holds: 28 Cells, 3 to 7 mV between the lowest and the average, in all 34
+ * responses. So it proves one half of the criterion for free - a healthy Pack
+ * produces neither a clamp nor a warning - and every other case has to be
+ * synthesised, here and in tests/host/replay.c, where the same healthy ride is
+ * replayed with one Cell rewritten.
+ *
+ * The synthesis is a Pack as the BMS reports one: 28 Cells fanned out linearly
+ * across `fan_mv`, with the lowest of them pulled a further `weak_mv` down. The
+ * two knobs are the two things that have to be told apart -
+ *
+ *   fan_mv    what a healthy Pack does, and it widens as the Pack empties.
+ *   weak_mv   what one failing Cell does, and it does not.
+ *
+ * - and every test below is some combination of the two.
+ */
+#define CELL_BASE_MV  3763      /* cap0007's own lowest Cell */
+
+/* One BMS answer carrying a whole Cell block. The average register is the
+ * truncated mean and the extreme registers are the array's own extremes, which
+ * is what the real BMS reports and what tests/host/replay.c asserts on every
+ * Capture - a synthesised Pack that broke those identities would be an
+ * impossible one. */
+static void feed_cells(wf_est_t *e, uint32_t t_ms, double soc_pct,
+                       int base_mv, int fan_mv, int weak_mv)
+{
+    wf_bms_t b;
+    memset(&b, 0, sizeof(b));
+    b.soc_pct    = (float)soc_pct;
+    b.cell_count = WF_EST_PACK_CELLS;
+
+    long sum = 0;
+    unsigned lo = 0xffffu, hi = 0;
+    for (int i = 0; i < WF_EST_PACK_CELLS; i++) {
+        /* Linear across the fan, so the second-lowest sits just above the
+         * lowest and the Pack's own spread is `fan_mv` wide however wide that
+         * is - which is the whole point of the low-charge test below. */
+        double step = (double)(i * fan_mv) / (double)(WF_EST_PACK_CELLS - 1);
+        int mv = base_mv + (int)(step + 0.5);
+        if (i == 0) {
+            mv -= weak_mv;
+        }
+        b.cell_mv[i] = (uint16_t)mv;
+        sum += mv;
+        if ((unsigned)mv < lo) lo = (unsigned)mv;
+        if ((unsigned)mv > hi) hi = (unsigned)mv;
+    }
+    b.avg_cell_mv   = (uint16_t)(sum / WF_EST_PACK_CELLS);
+    b.cell_min_mv   = (uint16_t)lo;
+    b.cell_max_mv   = (uint16_t)hi;
+    b.cell_delta_mv = (uint16_t)(hi - lo);
+    wf_est_feed_bms(e, t_ms, &b);
+}
+
+/* ride_watched(), with a BMS answer carrying that Cell block every POLL_MS -
+ * which is the ~1 Hz the real poll runs at. */
+static uint32_t ride_pack(wf_est_t *e, range_watch_t *w, uint32_t t0_ms,
+                          double metres, double kmh, double amps,
+                          double soc_pct, int fan_mv, int weak_mv)
+{
+    double per_tick = kmh * (1000.0 / 3600.0) * ((double)SAMPLE_MS / 1000.0);
+    long ticks = (long)(metres / per_tick + 0.5);
+    uint32_t t = t0_ms;
+
+    feed_cells(e, t, soc_pct, CELL_BASE_MV, fan_mv, weak_mv);
+    feed_ride(e, t, kmh, amps);
+    if (w != NULL) {
+        range_watch(w, e);
+    }
+    for (long i = 0; i < ticks; i++) {
+        t += SAMPLE_MS;
+        if (t % POLL_MS < SAMPLE_MS) {
+            feed_cells(e, t, soc_pct, CELL_BASE_MV, fan_mv, weak_mv);
+        }
+        feed_ride(e, t, kmh, amps);
+        if (w != NULL) {
+            range_watch(w, e);
+        }
+    }
+    return t;
+}
+
+/* The ticket's first behaviour: Range takes the lower of the Pack-average
+ * estimate and the minimum-Cell estimate.
+ *
+ * A twin, because the alternative - comparing a Range against its own past -
+ * would be measuring the ride as well as the Cell. Two Monitors, the same
+ * riding, the same State of Charge, and the only difference between them is
+ * one Cell 100 mV under the rest of its Pack. */
+static void test_the_weakest_cell_clamps_range(void)
+{
+    const double kmh = 36.0, cost = 30.0;
+    const double amps = amps_for(cost, kmh);
+
+    wf_est_t healthy, weak;
+    wf_est_init(&healthy, NULL);
+    wf_est_init(&weak, NULL);
+    ride_pack(&healthy, NULL, 0, 2.0 * WF_EST_CONS_WINDOW_M, kmh, amps,
+              RANGE_SOC, 8, 0);
+    ride_pack(&weak, NULL, 0, 2.0 * WF_EST_CONS_WINDOW_M, kmh, amps,
+              RANGE_SOC, 8, 100);
+
+    wf_est_out_t h, k;
+    wf_est_get(&healthy, &h);
+    wf_est_get(&weak, &k);
+
+    CHECK(h.range_valid && k.range_valid, "neither twin produced a Range");
+    CHECK(h.cell_valid && k.cell_valid,
+          "the Cell block never reached the estimator");
+    CHECK_U(h.cell_rejected, 0, "Cell blocks the healthy twin refused");
+    CHECK_U(k.cell_rejected, 0, "Cell blocks the weak twin refused");
+
+    /* The healthy Pack pays nothing at all, and it is exactly nothing rather
+     * than nearly nothing: cap0007's own imbalance is inside the line the Pack
+     * model was fitted to, so charging for it would be counting it twice. */
+    CHECK(!h.cell_clamped, "a healthy Pack's 4 mV of imbalance clamped Range");
+    CHECK(!h.cell_diverged, "a healthy Pack raised the divergence warning");
+    CHECK(h.cell_reserve_wh == 0.0, "a healthy Pack gave up %.6f Wh",
+          h.cell_reserve_wh);
+    CHECK(h.remaining_wh == h.remaining_pack_wh,
+          "a healthy Pack's Range is not the Pack-average estimate: %.6f Wh "
+          "against %.6f Wh", h.remaining_wh, h.remaining_pack_wh);
+
+    /* The weak one clamps, and says so. */
+    CHECK(k.cell_clamped, "a Cell 100 mV under its Pack did not clamp Range");
+    CHECK(k.cell_diverged, "a Cell 100 mV under its Pack raised no warning");
+    CHECK(k.cell_reserve_wh > 200.0,
+          "a Cell 100 mV under its Pack cost only %.1f Wh", k.cell_reserve_wh);
+
+    /* "Takes the lower of the two", as arithmetic rather than as prose: the
+     * clamped figure is the Pack-average one less the reserve, exactly. */
+    CHECK_D(k.remaining_wh, k.remaining_pack_wh - k.cell_reserve_wh, 1e-9,
+            "the clamped figure against the Pack-average one less the reserve");
+    CHECK(k.remaining_wh < k.remaining_pack_wh,
+          "the clamp did not lower anything");
+
+    /* And it is the model and not a fudge: the reserve is the band the spread
+     * implies, run through the same function Sag's reserve goes through. */
+    CHECK_D(k.cell_band_v, wf_est_cell_band_v(k.cell_spread_v), 1e-12,
+            "the Cell band against the spread it came from");
+    CHECK_D(k.cell_reserve_wh, wf_est_sag_reserve_wh(k.cell_band_v), 1e-9,
+            "the reserve against the band it came from");
+
+    /* What the rider sees. Both twins are riding identically, so the whole of
+     * the difference in Range is the weakest Cell. */
+    CHECK(k.range_km < h.range_km * 0.95,
+          "the weak twin ended at %.2f km against the healthy twin's %.2f km, "
+          "which is not a clamp", k.range_km, h.range_km);
+    CHECK_D(k.range_km * k.consumption_wh_per_km, k.remaining_wh, 1e-6,
+            "Range times Consumption against the clamped Remaining Energy");
+}
+
+/* The hard half of the ticket, and the one a fixed millivolt threshold gets
+ * wrong: divergence widens on its own as the Pack empties.
+ *
+ * Three Packs at 15 % State of Charge, which is a Pack near the bottom of its
+ * useful range:
+ *
+ *   healthy and fanned out   28 Cells spread over 60 mV, which is what a good
+ *                            Pack looks like down there. The clamp binds -
+ *                            correctly, the lowest Cell really will end the
+ *                            ride first - and the warning does not.
+ *   one failing Cell         the same 60 mV of total spread, but it is one
+ *                            Cell that has left the other 27 behind. Same
+ *                            millivolts, opposite verdict.
+ *   healthy and tight        the same Pack at 66.7 %, where it has not fanned
+ *                            out yet, as the control.
+ *
+ * The first two are the whole criterion. A threshold in millivolts cannot
+ * separate them, because they have the same millivolts. */
+static void test_a_healthy_pack_at_low_charge_does_not_warn(void)
+{
+    const double low = 15.0;
+
+    wf_est_t fanned, failing, tight;
+    wf_est_init(&fanned, NULL);
+    wf_est_init(&failing, NULL);
+    wf_est_init(&tight, NULL);
+    /* Six seconds of answers each, so the running means have settled. */
+    for (uint32_t t = 0; t <= 6000u; t += POLL_MS) {
+        feed_cells(&fanned, t, low, CELL_BASE_MV, 60, 0);
+        feed_cells(&failing, t, low, CELL_BASE_MV, 8, 55);
+        feed_cells(&tight, t, RANGE_SOC, CELL_BASE_MV, 8, 0);
+    }
+
+    wf_est_out_t f, x, c;
+    wf_est_get(&fanned, &f);
+    wf_est_get(&failing, &x);
+    wf_est_get(&tight, &c);
+
+    /* The two low-charge Packs have to be genuinely comparable in millivolts,
+     * or this test is not measuring the thing it claims. */
+    CHECK(f.cell_spread_v > 0.02 && x.cell_spread_v > 0.02,
+          "the two Packs spread %.1f mV and %.1f mV, too little for either to "
+          "be near a threshold", f.cell_spread_v * 1000.0,
+          x.cell_spread_v * 1000.0);
+    CHECK(x.cell_spread_v < 2.5 * f.cell_spread_v,
+          "the failing Pack spreads %.1f mV against the healthy one's %.1f mV "
+          "- far enough apart that a millivolt threshold would have separated "
+          "them, so this is not the case the warning is for",
+          x.cell_spread_v * 1000.0, f.cell_spread_v * 1000.0);
+
+    /* The healthy Pack at low charge: clamped, because its lowest Cell really
+     * does end the ride before its average does, and not warned about. */
+    CHECK(f.cell_clamped,
+          "a Pack fanned out over 60 mV did not clamp Range at all");
+    CHECK(!f.cell_diverged,
+          "a healthy Pack at %.0f %% raised the divergence warning - which is "
+          "the warning firing on every ride and being ignored", low);
+
+    /* The same millivolts in one Cell, and it is the warning. */
+    CHECK(x.cell_clamped, "a failing Cell did not clamp Range");
+    CHECK(x.cell_diverged,
+          "a Cell that has left the other 27 behind raised no warning");
+
+    /* And the control: the same healthy Pack higher up, where it has not
+     * fanned out, does neither. */
+    CHECK(!c.cell_clamped && !c.cell_diverged,
+          "a tight healthy Pack at %.1f %% clamped or warned", RANGE_SOC);
+}
+
+/* "A missing or implausible per-Cell reading must not clamp Range to zero."
+ *
+ * Five ways for the Cell registers to be worthless, and in every one of them
+ * Range has to degrade to the unclamped Pack-average estimate. The assertion
+ * is the same shape as the Consumption guards': no clamp happened at all,
+ * rather than a clamp that happened and produced something small. */
+static void test_bad_cell_readings_do_not_clamp_range(void)
+{
+    const double kmh = 36.0, amps = amps_for(30.0, kmh);
+
+    /* 1. A BMS that answers with a State of Charge and nothing else - which is
+     *    every synthesised stream in this file, and is also a zero-filled Cell
+     *    array. No Cell block ever arrived, so there is no clamp and no
+     *    invented one. */
+    wf_est_t none;
+    wf_est_init(&none, NULL);
+    feed_soc(&none, 0, RANGE_SOC);
+    ride(&none, 0, 2.0 * WF_EST_CONS_WINDOW_M, kmh, amps);
+
+    wf_est_out_t o;
+    wf_est_get(&none, &o);
+    CHECK(o.range_valid && o.range_km > 50.0,
+          "the unclamped ride produced %.2f km, so this test has nothing to "
+          "compare against", o.range_km);
+    CHECK(!o.cell_valid, "a Cell reading appeared out of a zero-filled array");
+    CHECK(!o.cell_clamped && !o.cell_diverged, "a clamp with no Cell data");
+    CHECK(o.cell_reserve_wh == 0.0, "%.6f Wh given up for no Cell data",
+          o.cell_reserve_wh);
+    CHECK(o.remaining_wh == o.remaining_pack_wh,
+          "Range moved without a Cell reading behind it");
+    double unclamped_km = o.range_km;
+
+    /* 2-4. Three responses that are not a 28-Cell lithium Pack. Each is
+     *      refused whole and counted, and none of them clamps anything. */
+    wf_est_t bad;
+    wf_est_init(&bad, NULL);
+    feed_soc(&bad, 0, RANGE_SOC);
+
+    wf_bms_t b;
+    /* A zero-filled array with the right count: 0 mV is not a lithium Cell. */
+    memset(&b, 0, sizeof(b));
+    b.soc_pct    = (float)RANGE_SOC;
+    b.cell_count = WF_EST_PACK_CELLS;
+    wf_est_feed_bms(&bad, 0, &b);
+    /* A 6 V "Cell", which no lithium chemistry does. */
+    memset(&b, 0, sizeof(b));
+    b.soc_pct    = (float)RANGE_SOC;
+    b.cell_count = WF_EST_PACK_CELLS;
+    for (int i = 0; i < WF_EST_PACK_CELLS; i++) {
+        b.cell_mv[i] = 3763;
+    }
+    b.cell_mv[7]    = 6000;
+    b.avg_cell_mv   = 3843;
+    wf_est_feed_bms(&bad, 1000, &b);
+    /* A Pack of 27 Cells: not the Pack this model is of. */
+    memset(&b, 0, sizeof(b));
+    b.soc_pct    = (float)RANGE_SOC;
+    b.cell_count = WF_EST_PACK_CELLS - 1;
+    for (int i = 0; i < WF_EST_PACK_CELLS; i++) {
+        b.cell_mv[i] = 3763;
+    }
+    b.avg_cell_mv = 3763;
+    wf_est_feed_bms(&bad, 2000, &b);
+
+    wf_est_get(&bad, &o);
+    /* Four and not three: the feed_soc() that opened this estimator is a BMS
+     * answer whose Cell array is zero-filled and whose count is zero, which is
+     * the first way of all to not be a 28-Cell Pack. Every synthesised stream
+     * in this file is that response, which is why none of them clamps. */
+    CHECK_U(o.cell_rejected, 4, "Cell blocks refused");
+    CHECK_U(o.cell_samples, 0, "Cell blocks believed");
+    CHECK(!o.cell_valid && !o.cell_clamped, "an implausible Pack clamped Range");
+
+    ride(&bad, 3000, 2.0 * WF_EST_CONS_WINDOW_M, kmh, amps);
+    wf_est_get(&bad, &o);
+    CHECK(o.range_valid, "three refused responses left the rider with no Range");
+    CHECK(o.range_km > 0.0, "three refused responses stranded Range at zero");
+    /* The proof that no clamp happened is the identity and not the kilometres:
+     * the two twins were Anchored at different instants, so their Ranges differ
+     * in the last decimal for reasons that have nothing to do with a Cell. */
+    CHECK(o.remaining_wh == o.remaining_pack_wh,
+          "the refused responses moved Remaining Energy off the Pack-average "
+          "estimate: %.9f Wh against %.9f Wh", o.remaining_wh,
+          o.remaining_pack_wh);
+    CHECK_D(o.range_km, unclamped_km, 0.01,
+            "the refused responses moved Range off the unclamped estimate");
+
+    /* 5. A Cell half a volt under its Pack, which is where a dying Cell and a
+     *    slipped register map stop being distinguishable. Refused, and the
+     *    good reading before it stands - which is the point: the rider keeps
+     *    the clamp they had rather than losing it or being taken to zero. */
+    wf_est_t drop;
+    wf_est_init(&drop, NULL);
+    for (uint32_t t = 0; t <= 4000u; t += POLL_MS) {
+        feed_cells(&drop, t, RANGE_SOC, CELL_BASE_MV, 8, 60);
+    }
+    wf_est_get(&drop, &o);
+    CHECK(o.cell_clamped, "the 60 mV Cell did not clamp, so the reading this "
+                          "test needs to survive was never taken");
+    double held_reserve = o.cell_reserve_wh;
+    uint16_t held_min   = o.cell_min_mv;
+
+    feed_cells(&drop, 5000u, RANGE_SOC, CELL_BASE_MV, 8, 900);
+    wf_est_get(&drop, &o);
+    CHECK_U(o.cell_rejected, 1, "responses refused for an impossible spread");
+    CHECK_D(o.cell_reserve_wh, held_reserve, 1e-12,
+            "an impossible spread moved the reserve");
+    CHECK_U(o.cell_min_mv, held_min, "the lowest Cell the estimator believes");
+    CHECK(o.remaining_wh > 0.0,
+          "a Cell 900 mV low took Remaining Energy to zero, which is the "
+          "rider stranded on a decode fault");
+
+    /* And a dropped response is not even a rejection: imbalance is a fact
+     *  about the Pack, not about the link, so nothing moves. */
+    ride(&drop, 6000u, 500.0, kmh, amps);
+    wf_est_get(&drop, &o);
+    CHECK_U(o.cell_rejected, 1, "riding on with no BMS answer refused a block");
+    CHECK_D(o.cell_reserve_wh, held_reserve, 1e-12,
+            "a gap in the BMS stream moved the Cell reserve");
+}
+
+/* #16's and #17's criterion once more, with a weak Cell in the Pack: under
+ * steady riding Range is monotone non-increasing, sampled at every frame, on
+ * the raw double, and still exactly zero rises rather than a tolerance.
+ *
+ * It holds for the same reason the Sag model's does. The spread is a running
+ * mean over BMS answers; under a steady Pack the first answer assigns it and
+ * every later one pulls it toward itself by nothing, so the reserve is a
+ * constant, and a constant subtracted from a falling numerator falls. */
+static void test_range_is_monotone_with_a_weak_cell(void)
+{
+    const double kmh = 36.0, cost = 30.0;
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    range_watch_t w;
+    memset(&w, 0, sizeof(w));
+    ride_pack(&e, &w, 0, 10.0 * WF_EST_CONS_WINDOW_M, kmh,
+              amps_for(cost, kmh), RANGE_SOC, 8, 100);
+
+    CHECK(w.samples > 4000, "only %ld samples to assert monotonicity on",
+          w.samples);
+    CHECK(w.up_max == 0.0,
+          "Range rose by %.9f km during a steady ride on a Pack with a weak "
+          "Cell", w.up_max);
+    CHECK_D(w.km_up_max, 0.0, 0.0,
+            "the kilometre figure ticked up during a steady ride");
+
+    /* And the clamp really was on, so the zero above is a property of the
+     * model and not of a model that did nothing. */
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.cell_clamped && o.cell_diverged,
+          "the weak Cell was not clamping over the ten kilometres this "
+          "monotonicity was asserted on");
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(void)
@@ -2950,6 +3331,11 @@ int main(void)
     test_sag_moves_range_with_sustained_load_only();
     test_range_is_monotone_with_a_sagging_pack();
     test_internal_resistance_improves_across_rides();
+
+    test_the_weakest_cell_clamps_range();
+    test_a_healthy_pack_at_low_charge_does_not_warn();
+    test_bad_cell_readings_do_not_clamp_range();
+    test_range_is_monotone_with_a_weak_cell();
 
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();

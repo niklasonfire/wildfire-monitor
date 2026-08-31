@@ -220,3 +220,33 @@ est_range_source      0
 est_ir_steps          0
 est_ir_rejected       0
 est_sag_v_max         0.00
+
+# The weakest Cell, and this is the half of issue #18's acceptance criterion
+# that comes off a real ride rather than a synthesised one: replaying a healthy
+# Pack produces neither the clamp nor the warning.
+#
+# This Pack is healthy and it is the only real Pack data this repository holds.
+# Its lowest Cell runs 3-7 mV under its average in all 34 responses, and the
+# running mean over them settles at 4.24 mV - against a WF_EST_CELL_DEADBAND_V
+# of 13.2 mV, which is the imbalance already inside the Pack model, because
+# WF_EST_PACK_V_AT_REF was measured on this very Pack. So the band is zero, the
+# reserve is exactly zero, and every energy figure above is the figure it was
+# before this existed. That is why est_wh_first and its neighbours did not move.
+#
+# The other half - a Cell 300 mV under the rest of its Pack producing both the
+# clamp and the warning - is this same file replayed with Cell 7 rewritten and
+# re-checksummed; see the cell_synth block in tests/host/replay.c. It is not in
+# this file because it is not what this ride did.
+#
+# The divergence warning is a ratio and not a voltage: the gap below the lowest
+# Cell against the fan-out of the 27 above it. Over these 34 responses that
+# ratio runs 0.00-0.33 and settles at 0.07, against the 2.0 the warning fires
+# at. A Pack fanning out at low charge multiplies both halves of that ratio and
+# leaves it where it is, which is the whole reason the threshold is written
+# this way; wfest.h works it through.
+est_cell_samples      34
+est_cell_rejected     0
+est_cell_spread_mv    4.24
+est_cell_clamped      0
+est_cell_diverged     0
+est_cell_reserve_wh   0.00
