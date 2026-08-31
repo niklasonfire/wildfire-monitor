@@ -231,6 +231,24 @@ the board before flashing it.** A partition table cannot be replaced over the
 air, so that flash is the cable this whole arrangement exists to be the last
 of.
 
+## Publishing a release
+
+Update mode reads a manifest published on a GitHub release of this repository,
+and `scripts/release.sh` is what makes one:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+./scripts/release.sh v0.2.0
+```
+
+It builds in the usual container, writes a four-field manifest - `version`,
+`url`, `size`, `sha256` - and attaches both files to the release, so the
+newest one is always at `releases/latest/download/manifest.json`. It refuses
+to publish from a dirty tree, from a commit the tag does not sit on, or when
+the image's own version is not the tag, because there is no CI between the
+editor and the bike. `--dry-run` stops before publishing. See
+`docs/release.md` and ADR-0006.
+
 ## Board pins (M5StickC PLUS2)
 
 | Pin | Function |
