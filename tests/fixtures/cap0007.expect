@@ -38,6 +38,30 @@ cell_sum_mismatch     0
 cell_extreme_mismatch 0
 cell_count_disagree   0
 
+# Rated Capacity, still derived rather than read. Register 48 is the charge
+# left in the Pack, and dividing it by the State of Charge is the only route
+# to a nameplate figure the Monitor has: 33.3 Ah at 66.7 % is 49.93 Ah here,
+# and cap0006's 33.4 Ah at 66.8 % is 50.00 Ah. Two rides, two register pairs,
+# one 50 Ah Pack - which is why register 48 is decoded and Rated Capacity is
+# not a field. The register that would make it one is above this poll's window
+# and has never been read; see docs/field-table.md.
+remaining_ah_min      33.3
+remaining_ah_max      33.3
+rated_ah_min          49.93
+rated_ah_max          49.93
+
+# The two redundant registers, pinned as identities rather than as values.
+# Both are exactly derivable from fields already decoded, and that is the
+# whole evidence for what they are, so the test is the derivation itself:
+# register 56 must equal cell_max_mv - cell_min_mv, and register 57 must equal
+# pack_v x |current_a| truncated, in every response. They are decoded because
+# they cost nothing and they cross-check four other registers; nothing may be
+# built on them, because they carry no information of their own.
+cell_delta_mv_max     12
+power_w_max           536
+cell_delta_redundant_mismatch 0
+power_redundant_mismatch      0
+
 # Controller. The ride never left walking pace, so the decoded speed has to
 # stay in the 4-7 km/h the notes record; 5.64 km/h is the peak of this one.
 # The wheel geometry from type 0xaf is what that speed is computed from, so it

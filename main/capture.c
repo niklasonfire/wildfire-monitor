@@ -27,7 +27,8 @@
  *     Unlike the Fardriver it is strict request/response. Its BLE module is a
  *     UART bridge that never sends anything unsolicited, so a link that only
  *     subscribes stays silent for the whole ride. One Modbus request written
- *     to 0xfff2 produces exactly one 129 byte answer on 0xfff1, and the ATT
+ *     to 0xfff2 produces exactly one answer on 0xfff1 - 255 bytes at the poll
+ *     width below, 129 at the narrower one it falls back to - and the ATT
  *     MTU has to have been raised first or the peer truncates that answer at
  *     20 bytes and drops the remainder rather than fragmenting it - which is
  *     why the poll below exists and why a failed exchange is fatal for it.
@@ -107,19 +108,39 @@ static const uint32_t k_backoff_ms[] = { 1000, 2000, 5000 };
  * Fardriver's 35.5 Hz stream on the other link. */
 #define CAP_BMS_POLL_MS     1000
 
-/* What the poll asks for: the register block at 0 that carries the 28 cell
- * voltages, the pack voltage, current, SoC and the temperatures. Only the 0xd2
- * protocol variant answers on this unit; the 0x81 one is silent. The count is
- * the Field Table's, so that asking for fewer registers than the decoder reads
- * is not something these two files can disagree about. */
+/* What the poll asks for, starting at register 0. Only the 0xd2 protocol
+ * variant answers on this unit; the 0x81 one is silent. Both counts are the
+ * Field Table's, so that asking for fewer registers than the decoder reads is
+ * not something these two files can disagree about.
+ *
+ * WF_BMS_MAX_REGS is 125, which is the ceiling and not a preference: the
+ * answer to a read of n registers is 5 + 2n bytes, a Capture record's payload
+ * length is a uint8_t, and 5 + 2 x 125 is exactly 255. Reaching past register
+ * 124 needs a second request at a second address rather than a wider one.
+ *
+ * WF_BMS_PROVEN_REGS is 62, the only width this BMS has ever been seen to
+ * answer. The wider read is unverified - no Capture taken with it exists - and
+ * an unverified poll width must not be able to cost a whole ride's State of
+ * Charge, so the poll narrows to the proven width rather than giving up if
+ * either the MTU cannot carry the wide answer or the BMS does not send one. */
 #define CAP_BMS_POLL_ADDR   0x0000
 #define CAP_BMS_POLL_COUNT  WF_BMS_MAX_REGS
+#define CAP_BMS_POLL_PROVEN WF_BMS_PROVEN_REGS
+
+/* How many unanswered wide requests it takes to conclude the BMS will not
+ * answer them. At CAP_BMS_POLL_MS that is five seconds of silence, which is
+ * well past any plausible burst of interference and short enough that a ride
+ * losing it costs five samples. The stale-link watchdog cannot do this job:
+ * it only arms once a link has notified at least once, and a BMS that refuses
+ * the wide read from the first request never does. */
+#define CAP_BMS_WIDE_TRIES  5
 
 /* A polled link, or all zeroes for one that is only ever pushed to. */
 typedef struct {
     uint8_t  start;           /* protocol variant, the Modbus slave address slot */
     uint16_t address;         /* first holding register */
-    uint16_t count;           /* how many of them */
+    uint16_t count;           /* how many of them, when the peer will answer */
+    uint16_t proven_count;    /* the narrower width to fall back to, 0 = none */
     uint32_t interval_ms;     /* 0 means this link is never polled */
 } cap_poll_t;
 
@@ -147,7 +168,9 @@ static const cap_target_t s_target[CAP_LINK_COUNT] = {
         .label = "bms", .name_substr = "DL", .adv_uuid = 0x0000,
         .svc_uuid = 0xfff0, .chr_uuid = 0xfff1, .ctrl_uuid = 0xfff2,
         .poll = { .start = DALY_START_D2, .address = CAP_BMS_POLL_ADDR,
-                  .count = CAP_BMS_POLL_COUNT, .interval_ms = CAP_BMS_POLL_MS },
+                  .count = CAP_BMS_POLL_COUNT,
+                  .proven_count = CAP_BMS_POLL_PROVEN,
+                  .interval_ms = CAP_BMS_POLL_MS },
         .rec_type = WFREC_BMS, .rescan_first = false,
     },
 };
@@ -199,6 +222,23 @@ typedef struct {
     bool       want;          /* the running capture wants this link up */
     uint32_t   retry_at_ms;   /* uptime at which the next reconnect is due */
     uint32_t   poll_at_ms;    /* uptime at which the next request is due */
+    /* How many registers this link's poll currently asks for. Zero until a
+     * subscribe chooses it, and chosen afresh on every connection, because the
+     * MTU that bounds it is a property of the connection and not of the peer. */
+    uint16_t   poll_count;
+    /* Set once this peer has been shown not to answer the wide read at all,
+     * which - unlike the MTU - is a property of the peer, so it is remembered
+     * for the rest of the boot. Re-probing on every reconnect would otherwise
+     * cost CAP_BMS_WIDE_TRIES seconds of the Anchor each time the link flaps.
+     * A power cycle asks again, which is what makes this recoverable without
+     * being a setting. */
+    bool       poll_refused;
+    /* Requests sent since the last one that decoded. Guarded: written by the
+     * capture task and cleared by the NimBLE host task. An exception frame or
+     * a truncated answer is a notification but not a decode, so it does not
+     * clear this - which is the whole point of counting decodes rather than
+     * notifications. */
+    uint16_t   poll_unanswered;
     uint8_t    backoff_idx;
 } cap_link_ctx_t;
 
@@ -384,17 +424,24 @@ static void controller_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
  * running, same as the Controller side, and for the same reason: the rider's
  * Remaining Energy must not depend on whether the ride is being recorded.
  *
- * Validation - a 129-byte frame and a CRC over all of it - happens outside the
- * critical section. Only the fold is inside. */
-static void bms_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
+ * Validation - a well-formed response of at most WF_BMS_MAX_REGS registers and
+ * a CRC over all of it - happens outside the critical section. Only the fold
+ * is inside.
+ *
+ * The return value is what tells the poll its request was answered: a Modbus
+ * exception frame, or an answer too long for a Capture record, arrives as a
+ * notification and fails here, which is exactly the case the poll has to see
+ * as "unanswered". */
+static bool bms_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
 {
     wf_bms_t bms;
     if (!wf_bms_decode(data, len, &bms)) {
-        return;
+        return false;
     }
     portENTER_CRITICAL(&s_mux);
     wf_est_feed_bms(&s_est, t_ms, &bms);
     portEXIT_CRITICAL(&s_mux);
+    return true;
 }
 
 /* Copies the estimator's state out under the lock and writes it to NVS outside
@@ -437,7 +484,13 @@ static void notify_sink(int idx, const uint8_t *data, uint16_t len)
     if (idx == CAP_LINK_MCU) {
         controller_decode(data, len, uptime);
     } else if (idx == CAP_LINK_BMS) {
-        bms_decode(data, len, uptime);
+        if (bms_decode(data, len, uptime)) {
+            /* The request this answers got a well-formed response, so the
+             * width the poll is asking for is one this peer will serve. */
+            portENTER_CRITICAL(&s_mux);
+            s_link[idx].poll_unanswered = 0;
+            portEXIT_CRITICAL(&s_mux);
+        }
     }
 
     if (!s_rec_on) {
@@ -738,13 +791,15 @@ static int link_setup(int idx)
     if (conn == BLE_HS_CONN_HANDLE_NONE) {
         return BLE_HS_ENOTCONN;
     }
+    uint16_t want_count = 0;    /* poll width for this connection, 0 = unpolled */
 
     /* The MTU exchange is not required for the Fardriver's 16 byte frames, but
      * it removes MTU as a variable and matches what the host-driven capture
-     * did. On a polled link it is load bearing: the answer is 129 bytes and a
-     * peer that has not agreed a larger MTU truncates it to what fits and
-     * throws the rest away, so the link would come up, look healthy and record
-     * nothing usable for the whole ride. Fail it instead and let the reconnect
+     * did. On a polled link it is load bearing: the answer is 255 bytes at the
+     * full poll width and a peer that has not agreed a larger MTU truncates it
+     * to what fits and throws the rest away, so the link would come up, look
+     * healthy and record nothing usable for the whole ride. Narrow the poll if
+     * that buys enough, fail the link if it does not, and let the reconnect
      * path try again. */
     xSemaphoreTake(s_op_sem, 0);
     int rc = ble_gattc_exchange_mtu(conn, on_mtu, NULL);
@@ -756,13 +811,34 @@ static int link_setup(int idx)
             ESP_LOGE(TAG, "%s mtu exchange rc=%d, cannot poll", t->label, rc);
             return rc;
         }
-        /* Three bytes of the MTU go to the ATT notification header. */
-        uint16_t need = (uint16_t)(daly_response_len(t->poll.count) + 3);
+        /* How wide this poll may be, decided fresh for this connection: the
+         * wide read unless this peer has already refused it outright, then
+         * whatever the MTU can actually carry. The result is not written to
+         * the link until the subscribe below has succeeded, so a setup that
+         * fails halfway leaves no width behind. */
+        want_count = t->poll.count;
+        if (s_link[idx].poll_refused && t->poll.proven_count != 0) {
+            want_count = t->poll.proven_count;
+        }
+        /* Three bytes of the MTU go to the ATT notification header. Both
+         * Captures we hold negotiated 512 on this link and the wide answer
+         * needs 258, so this is not expected to bite - but a peer that offers
+         * less should cost the upper registers, not the ride. */
         uint16_t mtu = ble_att_mtu(conn);
-        if (mtu < need) {
-            ESP_LOGE(TAG, "%s mtu %u, needs %u for a %u byte response",
-                     t->label, mtu, need, daly_response_len(t->poll.count));
-            return BLE_HS_EMSGSIZE;
+        if (mtu < (uint16_t)(daly_response_len(want_count) + 3)) {
+            uint16_t proven = t->poll.proven_count;
+            if (proven != 0 && proven < want_count &&
+                mtu >= (uint16_t)(daly_response_len(proven) + 3)) {
+                ESP_LOGW(TAG, "%s mtu %u cannot carry %u registers, asking for "
+                              "%u", t->label, mtu, want_count, proven);
+                want_count = proven;
+            } else {
+                ESP_LOGE(TAG, "%s mtu %u, needs %u for a %u byte response",
+                         t->label, mtu,
+                         (unsigned)(daly_response_len(want_count) + 3),
+                         daly_response_len(want_count));
+                return BLE_HS_EMSGSIZE;
+            }
         }
     } else if (rc != 0) {
         ESP_LOGW(TAG, "%s mtu exchange rc=%d, continuing", t->label, rc);
@@ -876,16 +952,25 @@ static int link_setup(int idx)
     uint32_t uptime = now_ms();
     /* Only now is the poll allowed to run: the CCCD write above has completed,
      * so the answer to the first request has somewhere to arrive. Due at once,
-     * so the first block of registers is in the file before the bike moves. */
+     * so the first block of registers is in the file before the bike moves.
+     * The width decided above is committed here for the same reason - a setup
+     * that failed between the MTU exchange and this point leaves the link with
+     * no width rather than with one nothing will use. */
     s_link[idx].poll_at_ms = uptime;
     portENTER_CRITICAL(&s_mux);
+    s_link[idx].poll_count = want_count;
+    s_link[idx].poll_unanswered = 0;
     s_pub.link[idx].subscribed = true;
     s_link[idx].last_rx_ms = uptime;   /* baseline for the stale watchdog */
     portEXIT_CRITICAL(&s_mux);
 
-    cap_event("%s subscribed val=0x%04x cccd=0x%04x ctrl=0x%04x mtu=%u",
+    /* The poll width goes into the Capture, because a Capture that turns out
+     * to carry 62-register answers has to say whether that is what was asked
+     * for or what came back. */
+    cap_event("%s subscribed val=0x%04x cccd=0x%04x ctrl=0x%04x mtu=%u regs=%u",
               t->label, s_link[idx].val_handle, s_disc_cccd,
-              s_link[idx].ctrl_handle, ble_att_mtu(conn));
+              s_link[idx].ctrl_handle, ble_att_mtu(conn),
+              s_link[idx].poll_count);
     return 0;
 }
 
@@ -905,16 +990,64 @@ static void link_poll(int idx)
         return;
     }
 
+    uint16_t count, missed;
+    portENTER_CRITICAL(&s_mux);
+    count = s_link[idx].poll_count;
+    missed = s_link[idx].poll_unanswered;
+    portEXIT_CRITICAL(&s_mux);
+    if (count == 0) {
+        return;         /* not subscribed yet, so no width has been chosen */
+    }
+
+    /* The wide read is asked for on trust: no Capture taken with it exists, so
+     * this is the first thing that finds out whether the BMS serves it. A peer
+     * that answers a register block it does not have with an exception frame,
+     * or with nothing at all, would otherwise cost the ride its Anchor - so
+     * after CAP_BMS_WIDE_TRIES unanswered requests the poll gives up the upper
+     * registers and keeps the ride, for this boot: see poll_refused. */
+    if (missed >= CAP_BMS_WIDE_TRIES && t->poll.proven_count != 0 &&
+        count > t->poll.proven_count) {
+        count = t->poll.proven_count;
+        portENTER_CRITICAL(&s_mux);
+        s_link[idx].poll_count = count;
+        s_link[idx].poll_unanswered = 0;
+        /* Remembered for the rest of the boot: this peer does not serve that
+         * block, and asking again after every reconnect would cost the Anchor
+         * five seconds each time for an answer already known. */
+        s_link[idx].poll_refused = true;
+        portEXIT_CRITICAL(&s_mux);
+        cap_event("%s answered none of %u wide reads, asking for %u registers",
+                  t->label, (unsigned)CAP_BMS_WIDE_TRIES, count);
+    }
+
     uint8_t frame[DALY_REQ_LEN];
     daly_build_request(frame, t->poll.start, DALY_FUNC_READ, t->poll.address,
-                       t->poll.count);
+                       count);
+
+    /* Counted before the write, not after. The answer arrives on the NimBLE
+     * host task and clears this counter, and a round trip cannot beat the next
+     * few instructions on this one - but counting first means the ordering
+     * does not have to be argued about at all, and the only cost is undoing it
+     * on the write path that failed. */
+    portENTER_CRITICAL(&s_mux);
+    if (s_link[idx].poll_unanswered < 0xffffu) {
+        s_link[idx].poll_unanswered++;
+    }
+    portEXIT_CRITICAL(&s_mux);
 
     int rc = ble_gattc_write_no_rsp_flat(conn, s_link[idx].ctrl_handle, frame,
                                          sizeof(frame));
     if (rc != 0) {
         /* Nothing to recover: a lost request costs one sample, and a link that
-         * keeps failing stops answering and is rebuilt by the stale watchdog. */
+         * keeps failing stops answering and is rebuilt by the stale watchdog.
+         * A request that never left is not evidence about the width either, so
+         * it is taken back off the count that drives the fallback. */
         ESP_LOGW(TAG, "%s poll rc=%d", t->label, rc);
+        portENTER_CRITICAL(&s_mux);
+        if (s_link[idx].poll_unanswered > 0) {
+            s_link[idx].poll_unanswered--;
+        }
+        portEXIT_CRITICAL(&s_mux);
     }
 }
 
@@ -1108,6 +1241,10 @@ static void link_drop(int idx)
     s_link[idx].val_handle = 0;
     s_link[idx].cccd_handle = 0;
     s_link[idx].ctrl_handle = 0;
+    /* The poll width goes with the connection that chose it; poll_refused does
+     * not, because it is a fact about the peer. */
+    s_link[idx].poll_count = 0;
+    s_link[idx].poll_unanswered = 0;
     s_pub.link[idx].connected = false;
     s_pub.link[idx].subscribed = false;
     portEXIT_CRITICAL(&s_mux);

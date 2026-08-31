@@ -43,7 +43,7 @@
 #include "wfl_read.h"
 
 #define MAX_FIXTURE_BYTES (16 * 1024 * 1024)
-#define MAX_METRICS       64
+#define MAX_METRICS       96
 
 /* ------------------------------------------------------- measured values */
 
@@ -114,6 +114,21 @@ typedef struct {
     long     cell_sum_mismatch;      /* reg 40 vs the sum of reg 0-27 */
     long     cell_extreme_mismatch;  /* reg 43/44 vs the extremes of reg 0-27 */
     long     cell_count_disagree;    /* reg 49 vs reg 51 */
+    /* Rated Capacity, which is not a register: remaining_ah divided by the
+     * State of Charge. Collected per response so that a ride watching the Pack
+     * empty says whether the derivation holds as the divisor shrinks - which
+     * is where it is weakest, and why reading a nameplate register instead is
+     * still the open half of issue #3. */
+    double   remaining_ah_min, remaining_ah_max;
+    double   rated_ah_min, rated_ah_max;
+    long     rated_ah_samples;       /* responses the derivation was safe on */
+    /* The two redundant registers, checked as identities rather than values.
+     * Both must be exactly derivable from registers decoded elsewhere, and a
+     * single failure means the map has slipped, not that the BMS rounded. */
+    unsigned cell_delta_mv_max;
+    unsigned power_w_max;
+    long     cell_delta_redundant_mismatch;  /* reg 56 vs reg 43 - reg 44 */
+    long     power_redundant_mismatch;       /* reg 57 vs reg 40 x |reg 41| */
     /* The one cross-device check there is: the Controller and the BMS measure
      * the same Pack with separate instruments, so the largest gap between
      * their two pack voltages is the strongest evidence either decode is
@@ -326,6 +341,8 @@ static void run_init(run_t *r)
     r->ctrl_pack_v_min = r->ctrl_current_a_min = 1e9;
     r->ctrl_pack_v_max = r->ctrl_current_a_max = -1e9;
     r->cell_mv_min = 0xffffu;
+    r->remaining_ah_min = r->rated_ah_min = 1e9;
+    r->remaining_ah_max = r->rated_ah_max = -1e9;
     r->cell_count_stable = true;
     r->est_hash = r->dist_hash = 0xcbf29ce484222325ull;   /* FNV-1a basis */
     /* Cold: a fixture carries no persisted state, so every replay of it starts
@@ -483,6 +500,44 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
             if (b.reg[49] != b.reg[51]) {
                 r->cell_count_disagree++;
             }
+            if (b.remaining_ah < r->remaining_ah_min) {
+                r->remaining_ah_min = b.remaining_ah;
+            }
+            if (b.remaining_ah > r->remaining_ah_max) {
+                r->remaining_ah_max = b.remaining_ah;
+            }
+            /* Rated Capacity, derived rather than read. Guarded on the State
+             * of Charge because the derivation divides by it: near empty the
+             * divisor is small enough that the BMS's own 0.1 % resolution
+             * dominates the answer, which is exactly the weakness a nameplate
+             * register would not have. */
+            if (b.soc_pct > 5.0f) {
+                double rated = b.remaining_ah / (b.soc_pct / 100.0);
+                if (rated < r->rated_ah_min) r->rated_ah_min = rated;
+                if (rated > r->rated_ah_max) r->rated_ah_max = rated;
+                r->rated_ah_samples++;
+            }
+            /* The two redundant registers. Not "close enough": both identities
+             * hold exactly in every response of every Capture we hold, so any
+             * mismatch at all means the register map moved under us. */
+            if (b.cell_delta_mv > r->cell_delta_mv_max) {
+                r->cell_delta_mv_max = b.cell_delta_mv;
+            }
+            if (b.power_w > r->power_w_max) {
+                r->power_w_max = b.power_w;
+            }
+            if ((int)b.cell_delta_mv != (int)b.cell_max_mv - (int)b.cell_min_mv) {
+                r->cell_delta_redundant_mismatch++;
+            }
+            /* Truncated, not rounded - the same convention avg_cell_mv uses.
+             * The half-watt of slack absorbs the last bit of the two floats
+             * this multiplies, not a disagreement about the value. */
+            double watts = b.pack_v * (b.current_a < 0.0f ? -b.current_a
+                                                          : b.current_a);
+            double lost = watts - (double)b.power_w;   /* 0 <= lost < 1 */
+            if (lost < -0.5 || lost > 1.5) {
+                r->power_redundant_mismatch++;
+            }
             /* Two instruments, one Pack. The Controller's reading is up to a
              * fifth of a second old here and the BMS averages internally, so
              * they are allowed to differ a little - but only a little, and
@@ -598,6 +653,17 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "cell_sum_mismatch", (double)r->cell_sum_mismatch);
         put(ms, "cell_extreme_mismatch", (double)r->cell_extreme_mismatch);
         put(ms, "cell_count_disagree", (double)r->cell_count_disagree);
+        put(ms, "remaining_ah_min", r->remaining_ah_min);
+        put(ms, "remaining_ah_max", r->remaining_ah_max);
+        put(ms, "cell_delta_mv_max", (double)r->cell_delta_mv_max);
+        put(ms, "power_w_max", (double)r->power_w_max);
+        put(ms, "cell_delta_redundant_mismatch",
+            (double)r->cell_delta_redundant_mismatch);
+        put(ms, "power_redundant_mismatch", (double)r->power_redundant_mismatch);
+    }
+    if (r->rated_ah_samples > 0) {
+        put(ms, "rated_ah_min", r->rated_ah_min);
+        put(ms, "rated_ah_max", r->rated_ah_max);
     }
 
     if (r->est_points > 0) {
@@ -748,6 +814,31 @@ static void check_invariants(const char *fixture, const run_t *r)
             fail(fixture, "state of charge %.1f-%.1f %% is not a percentage",
                  r->soc_pct_min, r->soc_pct_max);
         }
+        /* The two redundant registers, as identities. Exact in all 68
+         * responses of cap0006 and cap0007, so any mismatch is a slipped map
+         * rather than a rounding difference - and these are the only entries
+         * in the BMS table whose whole justification is the identity, so the
+         * identity is what has to be re-checked on every Capture. */
+        if (r->cell_delta_redundant_mismatch != 0) {
+            fail(fixture, "%ld of %ld responses: cell_delta_mv is not "
+                          "cell_max_mv - cell_min_mv",
+                 r->cell_delta_redundant_mismatch, r->bms_responses_ok);
+        }
+        if (r->power_redundant_mismatch != 0) {
+            fail(fixture, "%ld of %ld responses: power_w is not pack_v x "
+                          "|current_a| truncated", r->power_redundant_mismatch,
+                 r->bms_responses_ok);
+        }
+    }
+    /* Rated Capacity, the number this project cannot yet read. Derived it is
+     * 50 Ah on both Captures; a derivation that lands outside 45-55 Ah means a
+     * register moved, because the Pack did not. This is deliberately an
+     * invariant and not a per-ride expectation: any Capture of this bike that
+     * derives a different Pack is wrong about something. */
+    if (r->rated_ah_samples > 0 &&
+        (r->rated_ah_min < 45.0 || r->rated_ah_max > 55.0)) {
+        fail(fixture, "Rated Capacity derives to %.1f-%.1f Ah, and this Pack "
+                      "is 50 Ah", r->rated_ah_min, r->rated_ah_max);
     }
     if (r->power_frames > 0) {
         /* This Pack is 28 lithium cells in series: 56 V flat, 118 V full.

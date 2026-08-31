@@ -19,7 +19,7 @@
 
     "**Frame envelope, confirmed by a second source.** A Controller frame is `aa <type> <12-byte payload> <crc_lo> <crc_hi>`, sixteen bytes, as in `docs/capture.md`. jackhumbert's version of the same envelope reads byte 1 as a 6-bit ID (0..54) packed with a 2-bit flags field; the flags we always see are `0b10`, which is exactly why our type byte runs `0x80..0xb6` rather than `0x00..0x36`. His `fardriver.hpp` builds its CRC table from the same two seed bytes we use as the initial value (`0x3c`, `0x7f` -> little-endian `0x7f3c`). Two independent implementations agreeing on an unusual initial value means this is the documented vendor protocol and not something bespoke to our unit.",
 
-    "**The two key spaces are different.** A Controller field is addressed by frame type plus a 0-based byte offset into the 12-byte payload, so payload byte 0 is frame byte 2, and multi-byte values are little-endian. A BMS field is addressed by a 0-based register index into the 62 big-endian u16 registers of the `0xd2` read-holding-registers response, so register 0 is response bytes 3-4. The table carries both, and the generator emits a decoder for each.",
+    "**The two key spaces are different.** A Controller field is addressed by frame type plus a 0-based byte offset into the 12-byte payload, so payload byte 0 is frame byte 2, and multi-byte values are little-endian. A BMS field is addressed by a 0-based register index into the big-endian u16 registers of the `0xd2` read-holding-registers response, so register 0 is response bytes 3-4. The table carries both, and the generator emits a decoder for each.",
 
     "**What this table deliberately does not cover.** Two decodes are not offset-and-scale and stay hand-written in both languages, per ADR-0002: road speed, which needs the rpm from the `motion` block and the wheel geometry from type `0xaf` at once, and phase current, which is 24-bit big-endian under a square root and is not decoded at all today. They are listed under \"Hand-written\" below so that reading this document still tells you everything the decoders produce."
   ],
@@ -404,12 +404,17 @@
       "dump_fn": "wf_bms_fields_dump",
       "key_name": "register index",
       "endian": "be",
-      "note": "The BMS answers only when asked, over the `0xd2` Modbus read-holding-registers variant - a different framing entirely from the `a5`-command set in the appendix, and unrelated to it. The Monitor writes an 8-byte request `d2 03 <addr_hi> <addr_lo> <count_hi> <count_lo> <crc_lo> <crc_hi>` to handle `0xfff2` asking for 62 registers from address 0, and gets back 129 bytes: `d2 03 7c <124 bytes, 62 big-endian u16 registers> <crc_lo> <crc_hi>`, where `0x7c` = 124 = 2 x 62. Every register index below is 0-based into those 62 u16s. The whole map was decoded from cap0007, a 47 s parking-lot ride, which is why nothing here is worse than \"consistent with our own Captures\" and nothing is better either.",
+      "note": "The BMS answers only when asked, over the `0xd2` Modbus read-holding-registers variant - a different framing entirely from the `a5`-command set in the appendix, and unrelated to it. The Monitor writes an 8-byte request `d2 03 <addr_hi> <addr_lo> <count_hi> <count_lo> <crc_lo> <crc_hi>` to handle `0xfff2` and gets back `d2 03 <2n> <2n bytes, n big-endian u16 registers> <crc_lo> <crc_hi>`. Every register index below is 0-based into those u16s, so register 0 is response bytes 3-4.\n\n**Every Capture this project holds was taken at n = 62**, a 129-byte answer, and every field below was decoded from one of them - which is why nothing here is worse than \"consistent with our own Captures\" and nothing is better either. `WF_BMS_MAX_REGS` is now 125 and the poll asks for that, so the next Capture reaches registers 62-124 for the first time. **Nothing in that upper half is in this table**, because no response containing it exists anywhere in this repository; see \"Not decoded\" below for what is expected up there and what has to be observed before it can be written down.",
       "constants": [
         {
           "name": "WF_BMS_MAX_REGS",
+          "value": 125,
+          "note": "How many registers the Monitor's poll asks for, and the widest response the decoder will accept. Not a property of the fields - widening it is what reaches a register nobody has read yet, and it is deliberately the only number that has to change to do that.\n\n**125 is the ceiling, not a preference.** The answer to a read of n registers is `5 + 2n` bytes; a Capture record's payload length is a `uint8_t`, so the answer has to fit in 255 bytes, and `5 + 2 x 125 = 255` exactly. The Modbus byte-count field is a single byte too, but it is the looser of the two - it could declare 254 bytes, which is 127 registers. The ATT MTU is the other limit and is not the binding one here - the answer needs `5 + 2n + 3` bytes of MTU for the notification header, so 125 registers needs 258, and the BMS negotiated 512 in both cap0006 and cap0007. A peer that offers less is handled by falling back to `WF_BMS_PROVEN_REGS` rather than by failing the link.\n\nReaching further than 125 registers therefore needs a second request at a second address, not a wider one. The console's `daly read <start> <addr> <count>` already issues arbitrary reads and its receive path takes 512 bytes, so probing above 124 costs a bench session and no firmware change."
+        },
+        {
+          "name": "WF_BMS_PROVEN_REGS",
           "value": 62,
-          "note": "How many registers the Monitor's poll asks for, which is what fixes the response length. Not a property of the fields."
+          "note": "The only width this BMS has ever actually answered, across every Capture we hold. It is the poll's fallback: if the wider request goes unanswered, or the negotiated MTU cannot carry its reply, the Monitor drops back to this rather than losing the Anchor for a whole ride. A poll width nobody has tested must not be able to cost the State of Charge, and until a Capture comes back with 125 registers in it, 125 is exactly that."
         }
       ],
       "groups": [
@@ -561,6 +566,21 @@
           "note": "Same offset, and equal to temp_hi_c throughout cap0007 - a Pack that has been sitting is uniform, so this ride cannot separate the two sensors."
         },
         {
+          "name": "remaining_ah",
+          "register": 48,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 0.1,
+          "unit": "Ah",
+          "ctype": "float",
+          "confidence": "consistent",
+          "note": "The charge left in the Pack, and the closest this table gets to Rated Capacity. **Rated Capacity is not a field**: it is derived from this one, as `remaining_ah / (soc_pct / 100)`, and the two Captures we hold agree on the answer from different starting points - cap0006 reads 33.4 Ah at 66.8 % for 50.00 Ah, cap0007 reads 33.3 Ah at 66.7 % for 49.93 Ah. Two rides landing on 50 Ah from two different pairs of registers is what establishes both the 0.1 Ah scale and the meaning; `make test` re-derives it per response and fails outside 45-55 Ah, so a slipped register shows up as an absurd Pack rather than a plausible one.\n\nDerived is not read. A nameplate register would say what the Pack was sold as regardless of how full it is, would not inherit the State of Charge's own error, and - paired with the cycle count - is what makes State of Health measurable at all. Neither is in the polled window; #3 widened the poll to look for them and no Capture taken with the wider poll exists yet."
+        },
+        {
           "name": "avg_cell_mv",
           "register": 55,
           "count": 1,
@@ -574,6 +594,36 @@
           "ctype": "uint16_t",
           "confidence": "consistent",
           "note": "Reads 3767 against a mean of the 28 Cell registers of 3767.9-3768.0 across cap0007, i.e. the mean truncated rather than rounded. Agreeing with a number computed from 28 other registers is a strong check that this one is what it claims."
+        },
+        {
+          "name": "cell_delta_mv",
+          "register": 56,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "mV",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "**Redundant. Do not build on it.** Exactly `cell_max_mv - cell_min_mv` in all 68 responses of cap0006 and cap0007, without a single exception, which is simultaneously the entire evidence for what it is and the reason it carries no information: anything that wants a Cell spread can subtract two registers this table already decodes. It is here because the identity is free to assert and, asserted per response by `make test`, it cross-checks registers 43, 44 and 56 against each other - a map that has slipped breaks the identity."
+        },
+        {
+          "name": "power_w",
+          "register": 57,
+          "count": 1,
+          "width": 1,
+          "endian": "be",
+          "signed": false,
+          "mask": null,
+          "shift": 0,
+          "scale": 1,
+          "unit": "W",
+          "ctype": "uint16_t",
+          "confidence": "consistent",
+          "note": "**Redundant. Do not build on it.** The BMS's own instantaneous Pack power, and exactly `pack_v x |current_a|` truncated to a whole watt in all 68 responses we hold - 10 W parked at 0.1 A, 536 W at the hardest moment of cap0007's 5.1 A, and every value in between. Unsigned, so it says nothing about direction that `current_a` does not say better. Same reasoning as `cell_delta_mv`: worth an identity `make test` can check across registers 40, 41 and 57, worth nothing as a source. In particular it must never become an energy source - ADR-0003 gives the Controller authority over power, and a watt-hour counted from a register the BMS rounded to the watt at 1 Hz is not the same quantity."
         }
       ],
       "hand_written": [
@@ -596,8 +646,24 @@
       ],
       "not_decoded": [
         {
-          "name": "registers 28-31, 33-39, 47, 50, 52-54, 56-61",
-          "note": "Unassigned. Not zero in every case - register 48 reads 333 and registers 56-57 read single digits that move between responses - so there is more here to find."
+          "name": "registers 62-124, the upper half of the poll",
+          "note": "**Never read.** #3 widened the poll from 62 registers to 125 to reach Rated Capacity and the cycle count, which are known not to be in the lower half; every Capture in this repository predates that change, so no response containing these bytes exists anywhere and there is nothing here to decode from. That is the honest state of it, and it is why this ticket left the table's upper half empty rather than transcribing a register map from a Daly document written for a different unit: `0xd2` is the protocol variant this BMS answers on and the addresses in the published maps belong to the `0x81` one, whose own address plan the console's `daly probe` already disagrees with (it reads status from `0x0041`, where this unit reads it from register 40).\n\nWhat closes it is one Capture taken with the wider poll running. Then: a register that reads ~500 and does not move as the Pack empties is the Rated Capacity in 0.1 Ah, and the derivation from `remaining_ah` above says what number to look for; a small integer that never moves within a ride but is one higher after a full charge is the cycle count. Neither can be claimed from a single parked Capture alone - a constant register is what almost anything looks like over 47 s."
+        },
+        {
+          "name": "registers 28-31 and 33-39",
+          "note": "Zero in every response of both Captures. Twelve registers between the 28 Cells and the status block, with register 32 alive in the middle of them, which is what a fixed-size array of temperature sensors with two populated looks like - but zero is zero and nothing here has been established."
+        },
+        {
+          "name": "register 47, the charge/discharge state",
+          "note": "The most nearly decodable register left in the polled block, and deliberately still out. It reads 0 through the whole of cap0006 (parked, 0.0 A) and takes exactly two values in cap0007: 0 whenever the Pack is delivering 2.0 A or less, and 2 whenever it is delivering 2.6 A or more, tracking the throttle bursts response for response. Nothing between those two currents was sampled, so the threshold is bracketed and not known.\n\nThat is enough to say the register is a load state and not enough to name its values. The obvious reading - 0 stationary, 1 charging, 2 discharging - would make the field useful, and value 1 has never once been seen, because neither Capture went anywhere near a charger. Writing 1 into the table on the strength of a convention nobody has checked on this unit is the exact move this table exists to prevent. **One Capture with the charger plugged in settles it**, and costs a bench session rather than a ride."
+        },
+        {
+          "name": "registers 50, 52, 53 and 54, the switch states",
+          "note": "Constant across every response of both Captures: 50 = 1, 52 = 0, 53 = 1, 54 = 1. Four flags, three of them set, on a bike that was riding - which is the shape of charge MOSFET, discharge MOSFET, charger-connected and load-connected, and is not evidence about which is which. A register that never changes cannot be told apart from its neighbour, so all four stay here. The same charging Capture that settles register 47 moves at least two of them, and that is the cheapest way to separate them."
+        },
+        {
+          "name": "registers 58-61",
+          "note": "Zero in every response of both Captures. The poll reached them, so their being zero is a measurement rather than a gap - unlike registers 62-124 above, which is a distinction worth keeping straight."
         },
         {
           "name": "register 32",
@@ -606,6 +672,10 @@
         {
           "name": "register 51",
           "note": "A second copy of cell_count. Read by the test as a cross-check rather than decoded into a field of its own."
+        },
+        {
+          "name": "no balancing bitmap and no alarm word",
+          "note": "Looked for and not found: nothing in registers 0-61 carries a per-Cell balancing bitmap, and no register holds a non-zero alarm or fault word in either Capture. Both Packs were healthy and unbalanced by under 12 mV, so an all-zero alarm word is what a working BMS should report - the search says the polled block contains no candidate, not that this BMS has no such register."
         }
       ]
     }

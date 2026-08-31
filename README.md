@@ -177,7 +177,8 @@ Output is written as tagged single-line records (`DEV`, `SVC`, `CHR`, `DSC`,
                                    # name is the Fardriver rotating its MAC
 ./wf.sh 'connect name DL' 'probe 30@90'
 ./wf.sh 'rec dump@180'             # the raw frames
-./wf.sh 'daly probe@30' 'rec dump@180'   # which Modbus variant answers
+./wf.sh 'daly probe@40' 'rec dump@180'   # which Modbus variant answers, and
+                                         # how wide a read it will serve
 ```
 
 ## Boot

@@ -720,9 +720,10 @@ static int cmd_daly(int argc, char **argv)
         /* Both of these are what makes the probe self-contained rather than a
          * trap. The answer to a request arrives as a notification on 0xfff1,
          * so without the subscription the probe reports frames=0 however
-         * correctly the BMS replied; and without the MTU exchange the 129 byte
-         * answer is truncated at 20 bytes by the peer and the remainder is
-         * lost rather than fragmented across further notifications. */
+         * correctly the BMS replied; and without the MTU exchange the answer -
+         * 129 bytes at 62 registers, 255 at 125 - is truncated at 20 bytes by
+         * the peer and the remainder is lost rather than fragmented across
+         * further notifications. */
         uint16_t mtu = 0;
         int rc = blex_exchange_mtu(&mtu);
         printf("DALY_PROBE mtu_rc=%d negotiated=%u effective=%u\n", rc, mtu,
@@ -743,8 +744,37 @@ static int cmd_daly(int argc, char **argv)
         blex_rec_start();
 
         printf("DALY_PROBE step=d2_status\n");
-        daly_send(ctrl, 0xD2, 0x03, 0x0000, 0x003E);
+        daly_send(ctrl, 0xD2, 0x03, 0x0000, WF_BMS_PROVEN_REGS);
         vTaskDelay(pdMS_TO_TICKS(1500));
+        /* The two steps that close issue #3, and the only ones here that have
+         * never been run against this BMS.
+         *
+         * `d2_wide` is exactly what the standalone capture now polls, so if it
+         * answers, a ride records registers 62-124 and Rated Capacity and the
+         * cycle count are somewhere to be found in them. `d2_above` asks for
+         * the block starting where that one stops, which is the experiment
+         * that says whether a second poll is worth building: 125 registers is
+         * the most one answer can carry, because a Capture record's payload
+         * length is a uint8_t and 5 + 2 x 125 is 255 exactly.
+         *
+         * This path can read what the capture cannot store - the explorer's
+         * notification buffer takes 512 bytes - so an answer here that the
+         * ride cannot record is still a useful answer. */
+        /* Skipped rather than run blind if the MTU is too small: silence from
+         * these two is the finding, and a truncated answer looks exactly like
+         * it. Three bytes of the MTU go to the notification header. */
+        uint16_t wide_need = (uint16_t)(daly_response_len(WF_BMS_MAX_REGS) + 3);
+        if (blex_mtu() < wide_need) {
+            printf("DALY_PROBE skip=d2_wide,d2_above mtu=%u need=%u\n",
+                   blex_mtu(), wide_need);
+        } else {
+            printf("DALY_PROBE step=d2_wide\n");
+            daly_send(ctrl, 0xD2, 0x03, 0x0000, WF_BMS_MAX_REGS);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            printf("DALY_PROBE step=d2_above\n");
+            daly_send(ctrl, 0xD2, 0x03, WF_BMS_MAX_REGS, WF_BMS_MAX_REGS);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
         printf("DALY_PROBE step=81_cells\n");
         daly_send(ctrl, 0x81, 0x03, 0x0000, 0x0040);
         vTaskDelay(pdMS_TO_TICKS(1500));
