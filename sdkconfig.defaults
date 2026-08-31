@@ -8,6 +8,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# --- OTA: two app slots, and the bootloader's rollback (ADR-0006) ---
+# The Monitor is mounted on a vehicle, so a firmware that will not boot must
+# not be a firmware that has to come off the bike. With rollback enabled a
+# freshly written image boots on probation and keeps its place only by calling
+# esp_ota_mark_app_valid_cancel_rollback(); a crash loop, a hang, or a health
+# check that never passes and the next reset takes the bootloader back to the
+# slot that worked. What the image has to prove first is in main/ota_health.c.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # Console on UART0 (GPIO1/GPIO3 -> CH9102 USB-serial), 115200 baud
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

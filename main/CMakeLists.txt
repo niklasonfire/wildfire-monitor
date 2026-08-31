@@ -45,6 +45,9 @@ idf_component_register(
     SRCS "main.c" "board.c" "ble_explorer.c" "cmd_ble.c" "cmd_cap.c"
          "capture.c" "capture_store.c" "display.c" "ui.c" "rtc_bm8563.c"
          "webdump.c" "imu.c" "i2c_bus.c"
+         # ADR-0006: what a firmware written into the spare app slot has to
+         # prove before the bootloader stops holding a rollback over it.
+         "ota_health.c"
          # The NVS adapter for the estimation seam. Firmware, deliberately:
          # main/wfest must not know NVS exists.
          "est_store.c"
@@ -55,9 +58,10 @@ idf_component_register(
          # Generated from field-table.json, above.
          "${WF_GEN_C}"
     INCLUDE_DIRS "." "${WF_GEN_DIR}" "wfdecode" "wfest"
-    REQUIRES bt console driver esp_adc esp_driver_gpio esp_driver_i2c
-             esp_driver_spi esp_event esp_http_server esp_lcd esp_netif
-             esp_timer esp_wifi fatfs nvs_flash spi_flash vfs wear_levelling)
+    REQUIRES app_update bt console driver esp_adc esp_driver_gpio
+             esp_driver_i2c esp_driver_spi esp_event esp_http_server esp_lcd
+             esp_netif esp_partition esp_timer esp_wifi fatfs nvs_flash
+             spi_flash vfs wear_levelling)
 
 # Determinism, the other half of the Makefile's FPDET. GCC is free by default
 # to contract a*b+c into a fused multiply-add, which rounds once instead of

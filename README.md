@@ -195,6 +195,26 @@ Output is written as tagged single-line records (`DEV`, `SVC`, `CHR`, `DSC`,
 The board blinks the red LED twice at boot as a visible sign that the freshly
 flashed image is running.
 
+## Firmware slots and rollback
+
+The flash carries two app slots, `ota_0` and `ota_1`, of 1.875 MB each, and the
+bootloader's rollback is on - so a firmware written over the air can be undone
+without a cable. See ADR-0006 and `partitions.csv`.
+
+An image written into the spare slot boots on probation and keeps its place
+only once NVS has opened, the capture store has mounted, the display has drawn
+a frame and sixty seconds have passed. Anything else - a crash loop, a hang, a
+store that will not mount - and the next reset takes the bootloader back to the
+slot that worked. No Controller or BMS link is required, deliberately: updates
+happen with the bike switched off. `ota` on the console prints which slot is
+running and how far the check has got, and `info` names the slot too.
+
+Moving onto this table moved the capture store from `0x210000` to `0x3E0000`,
+so it reformats on the first boot after the change: **pull every Capture off
+the board before flashing it.** A partition table cannot be replaced over the
+air, so that flash is the cable this whole arrangement exists to be the last
+of.
+
 ## Board pins (M5StickC PLUS2)
 
 | Pin | Function |

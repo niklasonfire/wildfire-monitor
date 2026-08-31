@@ -28,6 +28,7 @@
 #include "capture.h"
 #include "capture_store.h"
 #include "display.h"
+#include "ota_health.h"
 #include "rtc_bm8563.h"
 
 #include "esp_log.h"
@@ -1092,6 +1093,12 @@ static void ui_task(void *arg)
                 draw_state(&st, full);
             }
         }
+        /* Reaching here means the panel is up and holds a frame this task put
+         * there - one of the four things a freshly written image has to do
+         * before it may keep its slot. See ota_health.h; the call is
+         * idempotent, so it costs a spinlock a tick and no state of our own. */
+        ota_health_pass(OTA_GATE_DISPLAY);
+
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
         s_tick++;
     }

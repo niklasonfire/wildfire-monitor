@@ -24,6 +24,7 @@
 #include "display.h"
 #include "i2c_bus.h"
 #include "imu.h"
+#include "ota_health.h"
 #include "rtc_bm8563.h"
 #include "ui.h"
 #include "webdump.h"
@@ -127,11 +128,37 @@ static int cmd_info(int argc, char **argv)
     printf("flash      %lu MB\n", (unsigned long)(flash_size / (1024 * 1024)));
     printf("mac(sta)   %02x:%02x:%02x:%02x:%02x:%02x\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    printf("app slot   %s%s\n", ota_running_label(),
+           ota_health_on_probation() ? " (on probation)" : "");
     printf("idf        %s\n", esp_get_idf_version());
     printf("ble        %s\n", blex_ready() ? "ready" : "not ready");
     printf("free heap  %lu bytes\n", (unsigned long)esp_get_free_heap_size());
     printf("min heap   %lu bytes\n", (unsigned long)esp_get_minimum_free_heap_size());
     printf("uptime_ms  %lld\n", esp_timer_get_time() / 1000);
+    return 0;
+}
+
+/* The health check runs whether or not anything is on probation (see
+ * ota_health.h), so this is what makes it observable on a board that has only
+ * ever been flashed down a cable: watch the gates fill in, watch "confirmed"
+ * flip a minute in. Read-only - the half that downloads and installs an image
+ * is a later ticket. */
+static int cmd_ota(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    uint32_t gates = ota_health_gates();
+
+    printf("running    %s\n", ota_running_label());
+    printf("next boot  %s\n", ota_boot_label());
+    printf("probation  %s\n", ota_health_on_probation() ? "yes" : "no");
+    printf("gates      nvs=%d store=%d display=%d\n",
+           (gates & OTA_GATE_NVS) != 0, (gates & OTA_GATE_STORE) != 0,
+           (gates & OTA_GATE_DISPLAY) != 0);
+    printf("uptime_s   %lld of %d\n", esp_timer_get_time() / 1000000,
+           OTA_HEALTH_UPTIME_S);
+    printf("confirmed  %s\n", ota_health_confirmed() ? "yes" : "no");
     return 0;
 }
 
@@ -144,6 +171,7 @@ static void register_commands(void)
         {.command = "hb", .help = "Heartbeat log on/off: hb on|off", .func = cmd_hb},
         {.command = "info", .help = "Print chip, flash, MAC, BLE and heap info", .func = cmd_info},
         {.command = "sleep", .help = "Wait, so a script can let the board work: sleep <secs>", .func = cmd_sleep},
+        {.command = "ota", .help = "Print the running app slot and the rollback health check", .func = cmd_ota},
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -302,12 +330,17 @@ void app_main(void)
 
     ESP_LOGI(TAG, "wildfire_monitor, IDF %s", esp_get_idf_version());
 
+    /* First, so the log opens with which slot this is and whether it is on
+     * probation, and so the gates reported below have somewhere to land. */
+    ota_health_start();
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    ota_health_pass(OTA_GATE_NVS);
 
     /* The screen comes up first: everything after this can report its own
      * failure to the rider instead of only to a serial log nobody is reading. */
@@ -339,6 +372,8 @@ void app_main(void)
     err = store_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "capture store: %s", esp_err_to_name(err));
+    } else {
+        ota_health_pass(OTA_GATE_STORE);
     }
 
     err = blex_init();
