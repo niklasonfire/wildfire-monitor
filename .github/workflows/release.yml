@@ -2,7 +2,10 @@ name: release
 # Cut a firmware release on the self-hosted runner when a version tag is pushed.
 #   git tag v1.2.3 && git push origin v1.2.3
 # Builds wildfire_monitor for esp32 inside espressif/idf:v6.1 (same image idf.sh uses),
-# then publishes a GitHub Release with the firmware binaries.
+# then publishes a GitHub Release with the firmware binaries and the manifest that
+# update mode reads. See docs/release.md and ADR-0006: the Monitor knows exactly one
+# URL, https://github.com/<owner>/<repo>/releases/latest/download/manifest.json, and a
+# release without that file attached is a release no bike can install.
 on:
   push:
     tags: ['v*']
@@ -47,16 +50,74 @@ jobs:
           cp "build/partition_table/partition-table.bin"   "release/partition-table-${VERSION}.bin"
           ls -l release
 
+      - name: Write the OTA manifest
+        # The four fields update mode parses, and nothing else — main/wfota
+        # refuses a body that is not the flat object described in ADR-0006.
+        # `url` names this release's own app image rather than `latest`, so an
+        # old manifest keeps naming the image it was published with.
+        run: |
+          set -euo pipefail
+          die() { echo "release: $*" >&2; exit 1; }
+
+          ASSET="${APP_NAME}-${VERSION}-app-ota.bin"
+          APP="release/${ASSET}"
+          [ -f "$APP" ] || die "$APP was not produced by the build"
+
+          # What wfota_tag_ok() accepts, checked here because a tag the Monitor
+          # would refuse is one it can never install: letters, digits, dot, dash
+          # and underscore, and short enough for esp_app_desc_t::version.
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]*) die "tag '$VERSION' holds a character update mode will not accept" ;;
+          esac
+          [ "${#VERSION}" -le 31 ] || die "tag '$VERSION' is longer than the 31 characters an image can carry"
+
+          # The version read back out of the image rather than recomputed:
+          # esp_app_desc_t follows the 24-byte image header and the 8-byte
+          # segment header, and its version[32] sits 16 bytes into that, so 48.
+          # This is what makes the image and the manifest incapable of
+          # disagreeing. Update mode compares the two strings for inequality, so
+          # an image calling itself anything else is one the Monitor would
+          # install, reboot into, and still see as an update waiting.
+          BAKED="$(dd if="$APP" bs=1 skip=48 count=32 2>/dev/null | tr -d '\0')"
+          [ "$BAKED" = "$VERSION" ] || die "the image calls itself '$BAKED', not '$VERSION'; git describe picked another name for this commit"
+
+          SIZE="$(stat -c %s "$APP")"
+          SHA256="$(sha256sum "$APP" | cut -d' ' -f1)"
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${VERSION}/${ASSET}"
+
+          cat > release/manifest.json <<EOF
+          {
+            "version": "$VERSION",
+            "url": "$URL",
+            "size": $SIZE,
+            "sha256": "$SHA256"
+          }
+          EOF
+          cat release/manifest.json
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # Both flags, because make_latest is what decides which release the
+          # Monitor's one URL resolves to. The action defaults it to true, and
+          # the API cannot mark a prerelease as latest — asked to do both it
+          # drops the prerelease flag instead, which is how v0.2.1-rc2 became a
+          # full release and took /releases/latest/download/ with it. A tag with
+          # a dash in it is a prerelease: it still carries a manifest, so a
+          # Monitor pinned to that tag can install it, but nothing unpinned sees
+          # it.
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: release/*
           body: |
             ESP32 firmware for **wildfire_monitor** (M5StickC PLUS2 / ESP32-PICO-V3-02).
             Built in `espressif/idf:v6.1` on the self-hosted runner from tag `${{ github.ref_name }}`.
+
+            ### Update over the air
+            `manifest.json` is what update mode fetches; it names the app image
+            below, its size and its sha256. Nothing has to be downloaded by hand.
 
             ### Flash — single merged image (easiest)
             ```
