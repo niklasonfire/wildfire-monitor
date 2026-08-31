@@ -317,6 +317,93 @@ class ReportsWhatTheDataSupports(unittest.TestCase):
                       + [span(0.5, 900.0, closed="time", capture="capB")])
         self.assertEqual(f.contributing, ["capA"])
 
+    def test_a_refused_fit_publishes_no_range_and_no_provenance(self):
+        """The accepted spans are counted and measured before any of the four
+        refusals is taken, so everything that describes a fit has a value by
+        the time the refusal happens. None of it may reach the header.
+
+        A range on an unfitted build is not a cosmetic contradiction. The
+        firmware's own test asserts that no speed is inside the range when
+        WF_FIT_FITTED is 0, and issue #20 asks the range whether the speed it
+        is about to suggest is one the archive can speak about - so a range
+        left over from spans that were never fitted licences advice from a
+        curve that does not exist.
+        """
+        # Five spans over 20-80 km/h: plenty of range, far too few to fit, so
+        # the refusal is taken with speed_min, speed_max, n and contributing
+        # all populated.
+        f = fit_lines(ramp(lo=20.0, hi=80.0, n=5, capture="capA"))
+        self.assertFalse(f.fitted, "five spans were fitted")
+        self.assertGreater(f.n, 0, "no span was accepted, so the refusal is "
+                                   "not the one this test is about")
+        self.assertAlmostEqual(f.accepted_min_kmh, 20.0, places=4)
+        self.assertAlmostEqual(f.accepted_max_kmh, 80.0, places=4)
+
+        self.assertEqual(f.speed_min_kmh, 0.0)
+        self.assertEqual(f.speed_max_kmh, 0.0)
+        self.assertEqual(f.samples, 0)
+        self.assertEqual(f.contributing, [])
+        self.assertEqual(f.r2, 0.0)
+        self.assertEqual(f.rms, 0.0)
+
+        text = fc.render_header(f)
+        self.assertIn("#define WF_FIT_FITTED                0", text)
+        self.assertIn("#define WF_FIT_SPEED_MIN_KMH         0.0", text)
+        self.assertIn("#define WF_FIT_SPEED_MAX_KMH         0.0", text)
+        self.assertIn("#define WF_FIT_SAMPLES               0", text)
+        self.assertIn('#define WF_FIT_CAPTURES              ""', text)
+        self.assertNotIn("20.0", text.split("#ifndef")[1])
+        self.assertNotIn("80.0", text.split("#ifndef")[1])
+
+    def test_every_refusal_path_publishes_nothing(self):
+        """The same rule down each of the four ways a fit can be refused, so
+        that adding a fifth is the only way to reintroduce this."""
+        cases = {
+            "too few spans": ramp(lo=20.0, hi=80.0, n=5),
+            "too narrow a range": ramp(lo=30.0, hi=32.0, n=40),
+            "a singular solve": ramp(lo=30.0, hi=30.0, n=40),
+            "no variation to explain": ramp(lo=20.0, hi=80.0, n=40, c=0.0),
+        }
+        for why, lines in cases.items():
+            with self.subTest(refusal=why):
+                f = fit_lines(lines)
+                self.assertFalse(f.fitted, "%s was fitted" % why)
+                self.assertEqual((f.speed_min_kmh, f.speed_max_kmh), (0.0, 0.0))
+                self.assertEqual(f.samples, 0)
+                self.assertEqual(f.contributing, [])
+                self.assertEqual((f.r2, f.rms), (0.0, 0.0))
+
+
+class OneRejectionIsOneReason(unittest.TestCase):
+    """render_header() emits one comment line per distinct rejection reason,
+    and the committed header is compared byte for byte against a fresh run. A
+    reason that interpolates per-span numbers is therefore a reason that grows
+    the firmware header by one line per span - hundreds of them over a real
+    ride - so the reasons are keys and the numbers belong to the report."""
+
+    def accelerating(self, n):
+        """n spans that are all rejected for the same rule, each with its own
+        spread and its own speed."""
+        return [span(20.0 + 2.0 * i, 100.0, spread_kmh=20.0 + 2.0 * i)
+                for i in range(n)]
+
+    def test_one_rule_is_one_key_however_many_spans_hit_it(self):
+        f = fit_lines(self.accelerating(60))
+        self.assertEqual(sum(f.rejected.values()), 60,
+                         "the spans were not all rejected, so this is not "
+                         "testing the tally: %r" % f.rejected)
+        self.assertEqual(len(f.rejected), 1,
+                         "60 spans rejected by one rule produced %d distinct "
+                         "reasons: %r" % (len(f.rejected), sorted(f.rejected)))
+
+    def test_the_header_does_not_grow_with_the_ride(self):
+        small = fc.render_header(fit_lines(self.accelerating(5)))
+        big = fc.render_header(fit_lines(self.accelerating(60)))
+        self.assertEqual(
+            len(big.splitlines()), len(small.splitlines()),
+            "the header grew by %d lines between a 5-span ride and a 60-span "
+            "one" % (len(big.splitlines()) - len(small.splitlines())))
+
 
 class TheHeaderCarriesItsProvenance(unittest.TestCase):
     """A coefficient with no provenance is what the Confidence discipline
@@ -442,6 +529,62 @@ class OverTheArchiveAsItStands(unittest.TestCase):
             self.assertIn("NO FIT", quiet.getvalue())
             with open(out, encoding="utf-8") as f:
                 self.assertIn("WF_FIT_FITTED", f.read())
+
+
+class AFailedRunLeavesTheHeaderAlone(unittest.TestCase):
+    """The header is committed, is compared byte for byte by the test above,
+    and is what the firmware compiles. A reporting run that fails must not be
+    able to destroy it.
+
+    Truncating on open made that possible: `open(path, "w")` empties the file
+    before render_header() has produced a single character, so a raise inside
+    the render - c_double() raises by design when a coefficient is not finite
+    - or a Ctrl-C, or a full disk, left main/wfest/wf_fit.h empty and the
+    firmware unable to compile."""
+
+    def run_over(self, header, render=None):
+        """The tool end to end against a temporary header, optionally with a
+        render that fails the way c_double() does."""
+        quiet = io.StringIO()
+        stdout, sys.stdout = sys.stdout, quiet
+        real = fc.render_header
+        if render is not None:
+            fc.render_header = render
+        try:
+            return fc.main(["--captures", FIXTURE_DIR, "--header", header])
+        finally:
+            fc.render_header = real
+            sys.stdout = stdout
+
+    def test_a_render_that_raises_does_not_truncate_the_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "wf_fit.h")
+            standing = "/* the header the firmware is compiling today */\n"
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(standing)
+
+            def explode(_f):
+                raise ValueError("inf cannot be written as a C double literal")
+
+            with self.assertRaises(ValueError):
+                self.run_over(out, render=explode)
+
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), standing,
+                                 "a run that failed rewrote the committed "
+                                 "header")
+            self.assertEqual(sorted(os.listdir(tmp)), ["wf_fit.h"],
+                             "the failed run left a temporary file behind")
+
+    def test_a_run_that_succeeds_still_replaces_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "wf_fit.h")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("/* stale */\n")
+            self.assertEqual(self.run_over(out), 0)
+            with open(out, encoding="utf-8") as f:
+                self.assertIn("WF_FIT_FITTED", f.read())
+            self.assertEqual(sorted(os.listdir(tmp)), ["wf_fit.h"])
 
 
 if __name__ == "__main__":

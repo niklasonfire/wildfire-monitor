@@ -198,8 +198,16 @@ def reject_reason(s, rules):
         return "stationary: below %.1f km/h" % rules.min_speed_kmh
     limit = max(rules.steady_abs_kmh, rules.steady_frac * s.mean_kmh)
     if s.spread_kmh > limit:
-        return "accelerating: %.1f km/h of spread over a %.1f km/h limit" % (
-            s.spread_kmh, limit)
+        # The rule's own numbers and not the span's. A reason is a KEY: the
+        # report tallies by it and render_header() emits one comment line per
+        # distinct one, so a reason carrying a per-span figure would put a line
+        # in main/wfest/wf_fit.h for every accelerating span in the archive -
+        # hundreds of them over one real ride, in a file the test suite
+        # compares byte for byte. What each span's spread was belongs to the
+        # span, and the tool is not in the business of printing every one.
+        return ("accelerating: more spread than %.0f %% of the mean speed, or "
+                "%.1f km/h, whichever is larger"
+                % (100.0 * rules.steady_frac, rules.steady_abs_kmh))
     return None
 
 
@@ -337,15 +345,27 @@ class Fit:
         self.linear = False
         self.coeffs = []          # [a] + ([b] if linear) + [c]
         self.n = 0
-        self.r2 = 0.0
-        self.rms = 0.0
-        self.speed_min_kmh = 0.0
-        self.speed_max_kmh = 0.0
         self.captures = []
-        self.contributing = []    # capture names that supplied a sample
         self.seen = 0
         self.rejected = {}        # reason -> count
         self.negative = 0         # accepted spans that recovered energy
+        # What the accepted spans were, whether or not a fit came out of them.
+        # These describe the data; the properties below describe the fit, and
+        # on a refusal there is no fit for them to describe.
+        self.accepted_min_kmh = 0.0
+        self.accepted_max_kmh = 0.0
+        self.accepted_captures = []
+        self.residual_rms = 0.0
+        self.residual_r2 = 0.0
+
+    # Everything a reader would take as a statement about a fit reads zero
+    # when there is none, the same way `a` and `c` do. A refusal happens after
+    # the accepted spans have been counted and measured, so without this the
+    # header would carry WF_FIT_FITTED 0 beside a speed range, a sample count
+    # and a list of contributing Captures - which contradicts the comment four
+    # lines above it, breaks the firmware's own assertion that no speed is
+    # inside the range of an unfitted build, and would licence issue #20 to
+    # call a speed supported that nothing was ever fitted over.
 
     @property
     def a(self):
@@ -358,6 +378,30 @@ class Fit:
     @property
     def c(self):
         return self.coeffs[-1] if self.fitted else 0.0
+
+    @property
+    def speed_min_kmh(self):
+        return self.accepted_min_kmh if self.fitted else 0.0
+
+    @property
+    def speed_max_kmh(self):
+        return self.accepted_max_kmh if self.fitted else 0.0
+
+    @property
+    def contributing(self):
+        return list(self.accepted_captures) if self.fitted else []
+
+    @property
+    def samples(self):
+        return self.n if self.fitted else 0
+
+    @property
+    def r2(self):
+        return self.residual_r2 if self.fitted else 0.0
+
+    @property
+    def rms(self):
+        return self.residual_rms if self.fitted else 0.0
 
     def predict(self, v):
         return sum(k * x for k, x in zip(self.coeffs, basis(v, self.linear)))
@@ -379,10 +423,10 @@ def fit(samples, captures, rules, linear=False):
             f.rejected[why] = f.rejected.get(why, 0) + 1
 
     f.n = len(accepted)
-    f.contributing = sorted({s.capture for s in accepted})
+    f.accepted_captures = sorted({s.capture for s in accepted})
     if accepted:
-        f.speed_min_kmh = min(s.mean_kmh for s in accepted)
-        f.speed_max_kmh = max(s.mean_kmh for s in accepted)
+        f.accepted_min_kmh = min(s.mean_kmh for s in accepted)
+        f.accepted_max_kmh = max(s.mean_kmh for s in accepted)
         f.negative = sum(1 for s in accepted if s.energy_wh < 0.0)
 
     want = 3 if linear else 2
@@ -393,14 +437,15 @@ def fit(samples, captures, rules, linear=False):
             "fit." % (f.n, "" if f.n == 1 else "s", rules.min_samples, want))
         return f
 
-    span = f.speed_max_kmh - f.speed_min_kmh
+    span = f.accepted_max_kmh - f.accepted_min_kmh
     if span < rules.min_span_kmh:
         f.refusal = (
             "the accepted spans cover %.1f to %.1f km/h, a range of %.1f km/h. "
             "Below %.1f km/h of range a constant and a quadratic are not "
             "distinguishable: the fit would hand back two coefficients that "
             "trade off against each other freely and mean nothing apart."
-            % (f.speed_min_kmh, f.speed_max_kmh, span, rules.min_span_kmh))
+            % (f.accepted_min_kmh, f.accepted_max_kmh, span,
+               rules.min_span_kmh))
         return f
 
     rows = [basis(s.mean_kmh, linear) for s in accepted]
@@ -426,12 +471,12 @@ def fit(samples, captures, rules, linear=False):
     residuals = [yi - sum(k * x for k, x in zip(f.coeffs, row))
                  for row, yi in zip(rows, y)]
     ss_res = sum(r * r for r in residuals)
-    f.rms = (ss_res / len(y)) ** 0.5
+    f.residual_rms = (ss_res / len(y)) ** 0.5
     if ss_tot == 0.0:
         f.refusal = ("every accepted span has the same Consumption, so there "
                      "is no variation for a fit to explain")
         return f
-    f.r2 = 1.0 - ss_res / ss_tot
+    f.residual_r2 = 1.0 - ss_res / ss_tot
     f.fitted = True
     return f
 
@@ -673,7 +718,7 @@ def render_header(f):
     w(" * figure on the screen can be built out of the fit rather than out of")
     w(" * a comment nobody compiles. */")
     w("#define WF_FIT_R2                    %s" % c_double(f.r2))
-    w("#define WF_FIT_SAMPLES               %d" % f.n)
+    w("#define WF_FIT_SAMPLES               %d" % f.samples)
     w("#define WF_FIT_RMS_WH_PER_KM         %s" % c_double(f.rms))
     w("")
     w("/* The Captures that went in, so a coefficient can be traced to the")
@@ -682,6 +727,38 @@ def render_header(f):
     w("")
     w("#endif /* WF_FIT_H */")
     return "\n".join(lines) + "\n"
+
+
+def write_header(path, f):
+    """The header, replaced whole or not at all.
+
+    `open(path, "w")` truncates before anything is rendered, so a raise inside
+    render_header() - c_double() raises by design - or a Ctrl-C, or a full
+    disk, would leave main/wfest/wf_fit.h empty and the firmware unable to
+    compile, out of a run that was only ever meant to report. The committed
+    header is the deliverable of ADR-0005 and one of two files in this project
+    the test suite compares byte for byte; a tool that can destroy it by
+    failing is not one anybody should have to think twice before running.
+
+    So: render first, write a sibling, rename over the top. The rename is
+    atomic on POSIX and the sibling shares the filesystem, so there is no
+    moment at which the header is half a file.
+    """
+    text = render_header(f)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        # Including KeyboardInterrupt: a partial sibling left behind would be
+        # picked up by nothing, but it would sit next to a committed file
+        # looking like an artefact of it.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------- main
@@ -718,8 +795,7 @@ def main(argv=None):
 
     print(report(result))
     if not args.dry_run:
-        with open(args.header, "w", encoding="utf-8") as f:
-            f.write(render_header(result))
+        write_header(args.header, result)
         print("")
         print("Wrote %s." % os.path.relpath(args.header, ROOT))
     return 0
