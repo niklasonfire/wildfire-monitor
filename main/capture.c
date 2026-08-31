@@ -122,7 +122,10 @@ static const uint32_t k_backoff_ms[] = { 1000, 2000, 5000 };
  * answer. The wider read is unverified - no Capture taken with it exists - and
  * an unverified poll width must not be able to cost a whole ride's State of
  * Charge, so the poll narrows to the proven width rather than giving up if
- * either the MTU cannot carry the wide answer or the BMS does not send one. */
+ * either the MTU cannot carry the wide answer or the BMS does not send one.
+ *
+ * Narrowing is conditional on the narrow answer still decoding - see
+ * poll_fallback_count(), which is where that is decided and why. */
 #define CAP_BMS_POLL_ADDR   0x0000
 #define CAP_BMS_POLL_COUNT  WF_BMS_MAX_REGS
 #define CAP_BMS_POLL_PROVEN WF_BMS_PROVEN_REGS
@@ -178,6 +181,35 @@ static const cap_target_t s_target[CAP_LINK_COUNT] = {
 static bool target_polled(int idx)
 {
     return s_target[idx].poll.interval_ms != 0;
+}
+
+/* The narrower width this target may fall back to, or 0 when there is none
+ * worth falling back to.
+ *
+ * The fallback exists to keep the Anchor when the wide read cannot be had. It
+ * only does that while the narrow answer still decodes, and whether it does is
+ * not a constant: WF_BMS_PROVEN_REGS is 62 and WF_BMS_REG_NEEDED is whatever
+ * the Field Table's highest assigned register makes it. The stated purpose of
+ * widening the poll to WF_BMS_MAX_REGS is to find Rated Capacity and the cycle
+ * count somewhere in registers 62-124, so the very next thing this project
+ * means to do puts WF_BMS_REG_NEEDED above 62 - and from that moment a
+ * narrowed poll would produce nothing wf_bms_decode() accepts. Since a
+ * rejected response is also an unanswered one, the link would narrow, latch
+ * poll_refused for the boot, and then decode nothing at all for the whole
+ * ride, with a width event as the only sign of it.
+ *
+ * So the decision is asked of the decoder rather than assumed. With no
+ * fallback the poll stays wide: a peer that will not answer it costs the
+ * Anchor either way, and staying wide at least keeps the width that could
+ * carry it. tests/host/unit.c asserts that today's proven width still decodes,
+ * so the day it stops is a failing test and not a silent ride. */
+static uint16_t poll_fallback_count(const cap_target_t *t)
+{
+    uint16_t proven = t->poll.proven_count;
+    if (proven == 0 || !wf_bms_width_decodes(proven)) {
+        return 0;
+    }
+    return proven;
 }
 
 /* NimBLE keeps addresses LSB first, so 40:18:03:01:20:e9 reads backwards. */
@@ -817,8 +849,9 @@ static int link_setup(int idx)
          * the link until the subscribe below has succeeded, so a setup that
          * fails halfway leaves no width behind. */
         want_count = t->poll.count;
-        if (s_link[idx].poll_refused && t->poll.proven_count != 0) {
-            want_count = t->poll.proven_count;
+        uint16_t fallback = poll_fallback_count(t);
+        if (s_link[idx].poll_refused && fallback != 0) {
+            want_count = fallback;
         }
         /* Three bytes of the MTU go to the ATT notification header. Both
          * Captures we hold negotiated 512 on this link and the wide answer
@@ -826,7 +859,7 @@ static int link_setup(int idx)
          * less should cost the upper registers, not the ride. */
         uint16_t mtu = ble_att_mtu(conn);
         if (mtu < (uint16_t)(daly_response_len(want_count) + 3)) {
-            uint16_t proven = t->poll.proven_count;
+            uint16_t proven = fallback;
             if (proven != 0 && proven < want_count &&
                 mtu >= (uint16_t)(daly_response_len(proven) + 3)) {
                 ESP_LOGW(TAG, "%s mtu %u cannot carry %u registers, asking for "
@@ -1005,9 +1038,9 @@ static void link_poll(int idx)
      * or with nothing at all, would otherwise cost the ride its Anchor - so
      * after CAP_BMS_WIDE_TRIES unanswered requests the poll gives up the upper
      * registers and keeps the ride, for this boot: see poll_refused. */
-    if (missed >= CAP_BMS_WIDE_TRIES && t->poll.proven_count != 0 &&
-        count > t->poll.proven_count) {
-        count = t->poll.proven_count;
+    uint16_t fallback = poll_fallback_count(t);
+    if (missed >= CAP_BMS_WIDE_TRIES && fallback != 0 && count > fallback) {
+        count = fallback;
         portENTER_CRITICAL(&s_mux);
         s_link[idx].poll_count = count;
         s_link[idx].poll_unanswered = 0;

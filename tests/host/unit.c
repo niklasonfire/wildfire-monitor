@@ -98,6 +98,93 @@ static void test_odo_delta_across_the_wrap(void)
     CHECK_U(wf_ctrl_odo_delta_counts(5, 4), 65535, "a step backwards");
 }
 
+/* ------------------------------------------------------ the BMS poll width */
+
+/* A well-formed 0xd2 response of n registers, all zero, checksummed the way
+ * the BMS checksums one. Built here rather than taken from a fixture because
+ * every Capture we hold is 62 registers wide and the widths that matter are
+ * the ones no Capture contains. */
+static size_t make_bms_response(uint8_t *out, size_t n_reg)
+{
+    size_t len = 3 + 2 * n_reg + 2;
+    memset(out, 0, len);
+    out[0] = WF_BMS_LEAD;
+    out[1] = WF_BMS_FUNC_READ;
+    out[2] = (uint8_t)(2 * n_reg);
+    uint16_t crc = wf_crc16(out, len - 2, WF_BMS_CRC_INIT);
+    out[len - 2] = (uint8_t)(crc & 0xff);
+    out[len - 1] = (uint8_t)(crc >> 8);
+    return len;
+}
+
+/* THE POLL MAY ONLY NARROW TO A WIDTH THAT STILL DECODES.
+ *
+ * main/capture.c asks the BMS for WF_BMS_MAX_REGS registers and falls back to
+ * WF_BMS_PROVEN_REGS when the wide read goes unanswered or the MTU cannot
+ * carry it, so that an unverified poll width cannot cost a ride its Anchor.
+ * That reasoning holds only while the narrow answer is one wf_bms_decode()
+ * accepts, and whether it is depends on the Field Table: WF_BMS_REG_NEEDED is
+ * one past the highest register any field reads.
+ *
+ * The trap is that the next thing this project means to do is exactly what
+ * springs it. Widening the poll to 125 was done to find Rated Capacity and the
+ * cycle count in registers 62-124; the moment such a field is written down,
+ * WF_BMS_REG_NEEDED passes WF_BMS_PROVEN_REGS and every 62-register response
+ * is rejected. A rejected response is also an unanswered one, so the link
+ * would narrow, latch its refusal for the boot and then decode nothing at all
+ * for the whole ride.
+ *
+ * poll_fallback_count() in main/capture.c asks wf_bms_width_decodes() rather
+ * than assuming, and this is where the question is pinned. It is also the trap
+ * detector: the assertion below turns that Field Table change from a silent
+ * ride into a failing test. When it fires, the fix is not to widen the proven
+ * width - nothing proved it - but to decide, deliberately, whether the poll
+ * should stay wide and lose the fallback, or whether the decoder should learn
+ * required fields from optional ones. */
+static void test_the_poll_may_only_narrow_to_a_width_that_decodes(void)
+{
+    CHECK(!wf_bms_width_decodes(0), "an empty response was called decodable");
+    CHECK(!wf_bms_width_decodes(WF_BMS_REG_NEEDED - 1),
+          "%d registers was called decodable, one short of the %d the fields "
+          "need", WF_BMS_REG_NEEDED - 1, WF_BMS_REG_NEEDED);
+    CHECK(wf_bms_width_decodes(WF_BMS_REG_NEEDED),
+          "the exact width the fields need was called undecodable");
+    CHECK(wf_bms_width_decodes(WF_BMS_MAX_REGS),
+          "the widest response the poll asks for was called undecodable");
+    CHECK(!wf_bms_width_decodes(WF_BMS_MAX_REGS + 1),
+          "a response past the decoder's own buffer was called decodable");
+
+    /* And the predicate says what the decoder does, at every width, rather
+     * than agreeing with it by coincidence at the two the archive holds. */
+    uint8_t frame[3 + 2 * WF_BMS_MAX_REGS + 2];
+    for (size_t n = 1; n <= WF_BMS_MAX_REGS + 1; n++) {
+        if (n > WF_BMS_MAX_REGS) {
+            /* Wider than the buffer: the length check rejects it before the
+             * registers are read, which is what the predicate has to say too.
+             */
+            CHECK(!wf_bms_width_decodes(n), "%u registers passed the width "
+                  "predicate and cannot be decoded", (unsigned)n);
+            break;
+        }
+        size_t len = make_bms_response(frame, n);
+        wf_bms_t b;
+        bool decoded = wf_bms_decode(frame, len, &b);
+        CHECK(decoded == wf_bms_width_decodes(n),
+              "a %u-register response decoded=%d and the width predicate said "
+              "%d", (unsigned)n, (int)decoded, (int)wf_bms_width_decodes(n));
+    }
+
+    /* THE TRAP. Today the fallback is worth taking; the assertion is here so
+     * that the day it stops being worth taking is a failure and not a ride. */
+    CHECK(wf_bms_width_decodes(WF_BMS_PROVEN_REGS),
+          "the poll's fallback width of %d registers no longer carries every "
+          "field the Field Table assigns - it now needs %d. main/capture.c "
+          "will not narrow to it any more, so a BMS that refuses the wide "
+          "read costs the Anchor rather than the upper registers. Decide "
+          "which: keep the poll wide, or split the fields into required and "
+          "optional", WF_BMS_PROVEN_REGS, WF_BMS_REG_NEEDED);
+}
+
 /* --------------------------------------------------------- the power block */
 
 /* A Controller frame built from a type and twelve payload bytes, checksummed
@@ -4277,6 +4364,7 @@ int main(void)
     test_odo_metres();
     test_odo_delta_does_not_wrap();
     test_odo_delta_across_the_wrap();
+    test_the_poll_may_only_narrow_to_a_width_that_decodes();
     test_power_block_decodes_at_every_type();
     test_line_current_is_signed();
     test_a_type_outside_the_block_changes_nothing();

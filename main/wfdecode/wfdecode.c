@@ -115,6 +115,11 @@ static uint16_t rd_u16be(const uint8_t *p)
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+bool wf_bms_width_decodes(size_t n_reg)
+{
+    return n_reg >= (size_t)WF_BMS_REG_NEEDED && n_reg <= WF_BMS_MAX_REGS;
+}
+
 bool wf_bms_decode(const uint8_t *data, size_t len, wf_bms_t *out)
 {
     if (data == NULL || out == NULL || len < 5) {
@@ -128,7 +133,7 @@ bool wf_bms_decode(const uint8_t *data, size_t len, wf_bms_t *out)
         return false;
     }
     size_t n_reg = n_bytes / 2;
-    if (n_reg > WF_BMS_MAX_REGS || n_reg < WF_BMS_REG_NEEDED) {
+    if (!wf_bms_width_decodes(n_reg)) {
         return false;
     }
     /* Modbus appends the checksum least significant byte first, so running the

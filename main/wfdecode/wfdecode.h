@@ -121,6 +121,22 @@ uint32_t wf_ctrl_odo_delta_metres(uint16_t from, uint16_t to);
 #define WF_BMS_FUNC_READ  0x03      /* read holding registers */
 #define WF_BMS_CRC_INIT   0xffff
 
+/* Whether a response of n_reg registers is one wf_bms_decode() will accept:
+ * wide enough to carry every field the Field Table assigns, and no wider than
+ * the decoder's own buffer.
+ *
+ * It is here because the poll has to ask the question before it chooses a
+ * width. main/capture.c asks the BMS for WF_BMS_MAX_REGS registers and falls
+ * back to WF_BMS_PROVEN_REGS - the only width this unit has ever been seen to
+ * answer - when the wide read goes unanswered or the MTU cannot carry it. That
+ * fallback is only worth taking while the narrower answer still decodes. The
+ * moment a field lands above register WF_BMS_PROVEN_REGS - 1, which is the
+ * whole point of having widened the poll, narrowing would turn "we lose the
+ * upper registers" into "we decode nothing at all" and cost the ride its
+ * Anchor with only a width event to show for it. So the poll asks, rather than
+ * assuming an answer that was true when it was written. */
+bool wf_bms_width_decodes(size_t n_reg);
+
 /* Decodes a 0xd2 response: d2 03 <byte count> <registers, big endian>
  * <crc_lo> <crc_hi>. Returns false - leaving out alone - for anything else:
  * a short frame, a different lead or function byte, an inconsistent byte
