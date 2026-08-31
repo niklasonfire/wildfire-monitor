@@ -595,7 +595,7 @@ static void draw_idle(bool full)
         FIELD(F_V0, 2, ROW_IDLE_FREE, 2, DISP_RED, "NO FLASH");
         FIELD(F_V1, 2, ROW_IDLE_CAPS, 2, COL_DIM, "%s", "");
     }
-    draw_hint("A: SCAN  B-hold: WIFI");
+    draw_hint("A: SCAN  B-hold: MENU");
 }
 
 static void draw_scanning(const cap_status_t *st)

@@ -192,19 +192,35 @@ static void heartbeat_task(void *arg)
 }
 
 
-/* ---- readout mode -------------------------------------------------------
+/* ---- the modes behind the menu ------------------------------------------
  *
- * Wi-Fi and NimBLE do not fit in this chip's RAM together, so entering readout
+ * Readout mode and update mode share a shape: one radio at a time, entered
+ * deliberately by the rider, left by a reboot. Both take the radio the capture
+ * needs, so both refuse while one is running - and so does the menu that
+ * offers them, which is the earliest point the rider can be told. One
+ * predicate for all three, so they cannot drift apart.
+ */
+static bool capture_busy(const char *what)
+{
+    cap_state_t st = cap_state();
+
+    if (st != CAP_RECORDING && st != CAP_CONNECTING) {
+        return false;
+    }
+    ESP_LOGW(TAG, "refusing %s while a capture is running", what);
+    return true;
+}
+
+/* Wi-Fi and NimBLE do not fit in this chip's RAM together, so entering readout
  * mode is a one-way door: BLE goes down for good and the way back to capturing
- * is a reboot. Both the B button and the "wifi on" command land here.
+ * is a reboot. Both the menu and the "wifi on" command land here.
  */
 bool app_readout_enter(void)
 {
     if (web_running()) {
         return true;
     }
-    if (cap_state() == CAP_RECORDING || cap_state() == CAP_CONNECTING) {
-        ESP_LOGW(TAG, "refusing readout mode while a capture is running");
+    if (capture_busy("readout mode")) {
         return false;
     }
 
@@ -229,12 +245,158 @@ bool app_readout_enter(void)
     return true;
 }
 
+/* Menu timings. Up here because the update screen below borrows the idle one:
+ * a screen the rider walked away from should fall out of the way on the same
+ * schedule wherever it came from. */
+#define MENU_IDLE_MS    10000   /* long enough to read two entries in a helmet */
+#define MENU_REFUSE_MS  2500    /* the refusal is a sentence, not a screen */
+#define MENU_LABEL_MAX  12      /* "> " plus the longest label, plus the NUL */
+
+/* Update mode proper - join the hotspot, read the manifest, write the image -
+ * is issue #28. What is here is the door it gets fitted behind, so the menu
+ * has its second entry from the day the menu exists and the gesture can be
+ * ridden with before there is anything to download. The capture check is
+ * repeated rather than left to the menu because ADR-0006 asks update mode
+ * itself to refuse, exactly as readout mode does, and #28 will grow a console
+ * way in that does not come past the menu at all.
+ *
+ * Unlike readout mode this screen is not a one-way door yet: nothing has been
+ * shut down, so it hands the panel back rather than stranding the rider on a
+ * screen whose only exit is a reboot for no reason.
+ */
+static bool app_update_enter(void)
+{
+    if (capture_busy("update mode")) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "update mode: nothing to install yet");
+    ui_message("UPDATE", "nothing to", "install yet", NULL, "any: BACK");
+
+    board_btn_evt_t evt;
+    (void)board_btn_wait(&evt, MENU_IDLE_MS);
+    ui_message_clear();
+    return true;
+}
+
+/* ---- the B menu ---------------------------------------------------------
+ *
+ * Two buttons cannot carry a gesture per mode, so held-B stopped being the
+ * readout shortcut and became the way in to a list (ADR-0006). Readout mode
+ * costs one keypress more than it did; that keypress is what buys somewhere
+ * to put update mode, and whatever follows it, without inventing a third
+ * gesture nobody would remember.
+ *
+ * The menu runs inside the button task rather than as a screen the task posts
+ * to: it is a loop that reads the same queue with a timeout instead of
+ * forever, so which button means what while it is up needs no mode flag that
+ * the rest of the task then has to test. The timeout is the whole trick - a
+ * menu opened by a pocket press must fall out of the way on its own, because
+ * a rider who has just noticed a menu they did not ask for is looking at the
+ * road, not at the panel.
+ *
+ * B cycles and A picks: B is the button that opened the menu, so the thumb is
+ * already there, and A - the button that means "do the thing" everywhere else
+ * in this firmware - keeps meaning it here.
+ */
+typedef struct {
+    const char *label;
+    bool      (*enter)(void);   /* true once the panel is somebody else's */
+} menu_entry_t;
+
+static const menu_entry_t s_menu[] = {
+    {"READOUT", app_readout_enter},
+    {"UPDATE",  app_update_enter},
+};
+#define MENU_COUNT ((int)(sizeof(s_menu) / sizeof(s_menu[0])))
+
+/* The message screen takes four lines, and the fourth is the button hint, so
+ * three entries is the ceiling before this needs a scrolling window. The
+ * two-character cursor prefix also keeps every row at the same text scale:
+ * fit_scale() in ui.c drops from 3 to 2 above seven characters, so a short
+ * label and a long one would otherwise be drawn at different sizes. */
+_Static_assert(MENU_COUNT <= 3, "the message screen has three lines for entries");
+
+static void menu_draw(int sel)
+{
+    char        row[3][MENU_LABEL_MAX];
+    const char *line[3] = {NULL, NULL, NULL};
+
+    for (int i = 0; i < MENU_COUNT; i++) {
+        snprintf(row[i], sizeof(row[i]), "%c %s", i == sel ? '>' : ' ',
+                 s_menu[i].label);
+        line[i] = row[i];
+    }
+    ui_message("MENU", line[0], line[1], line[2], "B: NEXT  A: PICK");
+}
+
+static void menu_run(void)
+{
+    if (capture_busy("the menu")) {
+        /* On screen and not only in the log: the rider pressed something and
+         * has to be told why nothing happened. Dismissable, because the
+         * recording screen is the one they actually want back. */
+        ui_message("BUSY", "capture", "running", NULL, "any: BACK");
+        board_btn_evt_t busy_evt;
+        (void)board_btn_wait(&busy_evt, MENU_REFUSE_MS);
+        ui_message_clear();
+        return;
+    }
+
+    int sel = 0;
+    menu_draw(sel);
+
+    while (true) {
+        board_btn_evt_t evt;
+
+        if (!board_btn_wait(&evt, MENU_IDLE_MS)) {
+            break;              /* idle: leave, rather than trap the rider */
+        }
+
+        switch (evt.btn) {
+        case BOARD_BTN_B_ID:
+            if (evt.press == BOARD_PRESS_SHORT) {
+                sel = (sel + 1) % MENU_COUNT;
+                menu_draw(sel);
+            } else {
+                /* Held B is the gesture that opened this, so holding it again
+                 * closes it. The press that got here fired its LONG while
+                 * still down and stays silent on release, so this cannot see
+                 * the opening gesture and shut the menu straight again. */
+                goto leave;
+            }
+            break;
+
+        case BOARD_BTN_A_ID:
+            if (evt.press == BOARD_PRESS_SHORT) {
+                /* Whichever entry this is, the menu is over: the mode it
+                 * starts owns the panel from here - readout mode never gives
+                 * it back, and a failure has its own screen to show. */
+                (void)s_menu[sel].enter();
+                return;
+            }
+            break;
+
+        case BOARD_BTN_PWR_ID:
+            if (evt.press == BOARD_PRESS_LONG) {
+                /* Power off has to work from every screen, menu included. */
+                cap_record_stop();
+                board_power_off();
+            }
+            goto leave;         /* short PWR is the cancel */
+        }
+    }
+
+leave:
+    ui_message_clear();
+}
+
 /* ---- buttons ------------------------------------------------------------
  *
  * A is the whole capture workflow - scan, start, stop - because it is the one
  * button a rider can find with a glove on. B is the display and, held, the
- * readout mode. PWR short is otherwise idle time on a button already under
- * the thumb for power-off, so it toggles the live telemetry screen.
+ * menu. PWR short is otherwise idle time on a button already under the thumb
+ * for power-off, so it toggles the live telemetry screen.
  */
 static uint32_t s_markers;
 
@@ -290,7 +452,7 @@ static void button_task(void *arg)
 
         case BOARD_BTN_B_ID:
             if (evt.press == BOARD_PRESS_LONG) {
-                app_readout_enter();
+                menu_run();
             } else if (cap_state() == CAP_RECORDING) {
                 /* While recording, B is the marker: the rider rides a defined
                  * manoeuvre and stamps it, which is what turns a stream of

@@ -195,6 +195,22 @@ Output is written as tagged single-line records (`DEV`, `SVC`, `CHR`, `DSC`,
 The board blinks the red LED twice at boot as a visible sign that the freshly
 flashed image is running.
 
+## The button menu
+
+A is the capture workflow - scan, start, stop - and short B is the backlight,
+or a Marker while a Capture is recording. Holding B opens a menu instead of
+going straight to readout mode as it used to: B cycles the entries, A picks
+one, and holding B again, a short press of the power button, or ten seconds of
+nothing at all closes it.
+
+| Entry | What it does |
+| --- | --- |
+| `READOUT` | Wi-Fi access point, Captures over HTTP, back only by reboot |
+| `UPDATE` | update mode - the screen exists, the download is issue #28 |
+
+The menu will not open while a Capture is recording or connecting, and says so
+on the panel: both modes need the radio the Capture is using. See ADR-0006.
+
 ## Firmware slots and rollback
 
 The flash carries two app slots, `ota_0` and `ota_1`, of 1.875 MB each, and the
