@@ -2,16 +2,18 @@
 """ADR-0002, asserted rather than asserted-to.
 
 The Field Table's whole claim is that one description of the bytes produces
-three artefacts that cannot disagree. Two tests hold it to that:
+three artefacts that cannot disagree. Three tests hold it to that:
 
 * the generated C decoder and the generated Python decoder are handed the same
   recorded Capture and have to produce identical numbers for every field of
-  every record, and
+  every record,
+* both are handed values no Capture we hold contains, because the comparison
+  above can only compare what the archive happens to carry, and
 * the committed field documentation has to be what the generator produces from
   the table as it stands today.
 
-Both fail loudly. The first names the record and the field that diverged; the
-second says which command puts it right.
+All fail loudly. The first names the record and the field that diverged; the
+last says which command puts it right.
 """
 import glob
 import json
@@ -20,6 +22,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "scripts"))
+from field_table import load as load_fields          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(ROOT, "tests", "fixtures")
@@ -95,6 +101,98 @@ class CrossLanguageAgreement(unittest.TestCase):
                 if problem is not None:
                     self.fail("%s: the generated decoders disagree.\n%s"
                               % (os.path.basename(path), problem))
+
+
+class BothDecodersNarrowTheSameWay(unittest.TestCase):
+    """The cross-language test above can only compare the values the archive
+    happens to contain, and the archive is one 47-second parking-lot ride. It
+    would agree just as loudly on two decoders that diverge on every value that
+    ride did not produce.
+
+    This drives the values instead of waiting for them. The C decoder assigns
+    into a struct member of a declared width, so every integer it produces is
+    inside that member's range by construction; Python has no such member and
+    has to be made to do the same thing deliberately. The obvious case is a
+    sensor that is absent: a BMS answering 0xffff for a temperature it does not
+    have reads -41 C in C and 65495 in Python if nobody narrows.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fields = load_fields()
+        with open(TABLE, encoding="utf-8") as f:
+            cls.table = json.load(f)
+
+    # What a C assignment to each member can hold. A ctype that is not in here
+    # is one nobody has thought about, which is a failure and not a skip.
+    RANGE = {
+        "uint8_t":  (0, 0xff),
+        "int8_t":   (-0x80, 0x7f),
+        "uint16_t": (0, 0xffff),
+        "int16_t":  (-0x8000, 0x7fff),
+        "uint32_t": (0, 0xffffffff),
+        "int32_t":  (-0x80000000, 0x7fffffff),
+    }
+
+    def device(self, dev_id):
+        for d in self.table["devices"]:
+            if d["id"] == dev_id:
+                return d
+        self.fail("no device %s in the table" % dev_id)
+
+    def check(self, dev_id, decoded, what):
+        """Every integer field of one device, against the range the member it
+        is assigned to in C can actually hold."""
+        checked = 0
+        for f in self.device(dev_id)["fields"]:
+            ctype = f["ctype"]
+            if ctype in ("bool", "float"):
+                continue
+            self.assertIn(ctype, self.RANGE,
+                          "%s is declared %s, which this test has no C range "
+                          "for - add one rather than letting the field go "
+                          "unchecked" % (f["name"], ctype))
+            lo, hi = self.RANGE[ctype]
+            if f["name"] not in decoded:
+                continue
+            got = decoded[f["name"]]
+            values = got if isinstance(got, list) else [got]
+            for i, v in enumerate(values):
+                where = ("%s[%d]" % (f["name"], i)) if isinstance(got, list) \
+                    else f["name"]
+                self.assertTrue(
+                    lo <= v <= hi,
+                    "%s: the Python decoder produced %s = %r, outside the "
+                    "%s the C decoder assigns it to (%d..%d). The two "
+                    "decoders disagree on this value and no fixture contains "
+                    "it." % (what, where, v, ctype, lo, hi))
+                checked += 1
+        self.assertTrue(checked, "%s: no integer field was checked at all"
+                        % what)
+
+    def test_the_bms_decoder_narrows_every_integer_field(self):
+        for fill, what in ((0xffff, "every register 0xffff"),
+                           (0x0000, "every register zero"),
+                           (0x8000, "every register 0x8000")):
+            with self.subTest(registers=what):
+                regs = [fill] * self.fields.WF_BMS_MAX_REGS
+                out = {}
+                self.assertTrue(self.fields.bms_apply(out, regs),
+                                "a full-width response was rejected")
+                self.check("bms", out, what)
+
+    def test_the_controller_decoder_narrows_every_integer_field(self):
+        # Every frame type, so no group is missed for want of knowing which
+        # types carry it; the ones the table does not cover assign nothing.
+        for fill, what in ((0xff, "every payload byte 0xff"),
+                           (0x00, "every payload byte zero"),
+                           (0x80, "every payload byte 0x80")):
+            with self.subTest(payload=what):
+                live = {}
+                payload = bytes([fill]) * 12
+                for ftype in range(256):
+                    self.fields.ctrl_apply(live, ftype, payload)
+                self.check("controller", live, what)
 
 
 class DocumentationIsGenerated(unittest.TestCase):

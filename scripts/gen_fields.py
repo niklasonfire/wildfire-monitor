@@ -252,20 +252,53 @@ def py_extract(f, src, index=None):
     return expr
 
 
+# How Python has to be told to do what a C assignment does for free. The C
+# decoder writes every integer into a struct member of a declared width, and
+# the conversion that happens on the way in is part of the decoding: a BMS
+# answering 0xffff for a temperature it does not have reads -41 in C and would
+# read 65495 in Python if nobody said so. Python integers do not overflow, so
+# the narrowing has to be written down.
+#
+# Keyed by ctype, so a table that declares a member is a table that has said
+# how wide it is; load() refuses any integer ctype that is not in here.
+NARROW = {
+    "uint8_t":  ("_u8",  "def _u8(v):\n    return v & 0xff\n"),
+    "int8_t":   ("_i8",  "def _i8(v):\n    return _s8(v & 0xff)\n"),
+    "uint16_t": ("_u16", "def _u16(v):\n    return v & 0xffff\n"),
+    "int16_t":  ("_i16", "def _i16(v):\n    return _s16(v & 0xffff)\n"),
+    "uint32_t": ("_u32", "def _u32(v):\n    return v & 0xffffffff\n"),
+    "int32_t":  ("_i32", "def _i32(v):\n"
+                         "    v &= 0xffffffff\n"
+                         "    return v - 0x100000000 if v >= 0x80000000 "
+                         "else v\n"),
+}
+
+
 def py_value(f, src, index=None):
+    """The mirror of c_value(), branch for branch. The two decoders exist twice
+    because ADR-0001 forces them to; they agree because this function and that
+    one are written to the same shape and tested against each other."""
     raw = py_extract(f, src, index)
     if f["ctype"] == "bool":
         return f"({raw}) != 0"
+    if f["ctype"] == "float":
+        if f["bias"]:
+            sign = "-" if f["bias"] < 0 else "+"
+            raw = f"({raw} {sign} {abs(f['bias'])})"
+        if f["divisor_name"] is not None:
+            return f"{raw} / {f['divisor_name']}"
+        if f["divisor"] is not None:
+            return f"{raw} / {f['divisor']}"
+        if f["scale"] != 1:
+            return f"{raw} * {f['scale']}"
+        return raw
+    # An integer member: bias first, in an integer wide enough that reg - 40
+    # cannot wrap, then narrow to what the member actually is. load() has
+    # already refused a scale here, because a scaled integer is not one.
     if f["bias"]:
         sign = "-" if f["bias"] < 0 else "+"
         raw = f"({raw} {sign} {abs(f['bias'])})"
-    if f["divisor_name"] is not None:
-        return f"{raw} / {f['divisor_name']}"
-    if f["divisor"] is not None:
-        return f"{raw} / {f['divisor']}"
-    if f["scale"] != 1:
-        return f"{raw} * {f['scale']}"
-    return raw
+    return f"{NARROW[f['ctype']][0]}({raw})"
 
 
 # ------------------------------------------------------------------- the C
@@ -678,6 +711,15 @@ def emit_py(table, out_dir):
     o.append("    return v - 0x10000 if v >= 0x8000 else v")
     o.append("")
     o.append("")
+
+    # The narrowing C does on the way into a struct member, for the member
+    # widths this table actually uses. Only those, so the generated module has
+    # no dead code in it - the same rule the C side applies to its readers.
+    used = {f["ctype"] for dev in (ctrl, bms) for f in dev["fields"]}
+    for ctype, (_, body) in NARROW.items():
+        if ctype in used:
+            o.append(body)
+            o.append("")
 
     o.append("def ctrl_apply(live, ftype, payload):")
     o.append('    """Folds one validated Controller frame into the live dict."""')
