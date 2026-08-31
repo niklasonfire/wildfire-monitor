@@ -25,14 +25,20 @@
  *     a gap in the BMS stream, the sign convention and the persisted state all
  *     have to be driven with synthesised streams here instead.
  *
- * Same rules as the rest of main/wfdecode and main/wfest: pure C99, no board,
- * no fixtures.
+ *   - everything update mode does before it touches the radio. The manifests
+ *     that matter are the ones no release will ever publish - truncated,
+ *     missing a field, an HTML error page - and none of them can be produced
+ *     by cutting a release, so they are written out here instead.
+ *
+ * Same rules as the rest of main/wfdecode, main/wfest and main/wfota: pure
+ * C99, no board, no fixtures.
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "wfdecode.h"
 #include "wfest.h"
+#include "wfota.h"
 
 static int failures;
 
@@ -4359,6 +4365,287 @@ static void test_the_advice_retires_when_it_is_taken(void)
           (unsigned)(t - t_taken), (unsigned)WF_EST_ADVICE_DWELL_MS);
 }
 
+/* ----------------------------------------------- update mode, off the bike
+ *
+ * The three questions update mode asks before any radio is involved: which of
+ * the networks we know is worth joining, what URL the manifest lives at, and
+ * whether what came back is a manifest at all. See main/wfota/wfota.h.
+ *
+ * Every manifest a release ever publishes is written by one heredoc in
+ * scripts/release.sh, so the interesting cases are all the ones that will
+ * never be published: the truncated body a dropped hotspot leaves, the HTML
+ * GitHub serves for a release that does not exist, a field that is missing or
+ * says something the download half could not use. None of those can be
+ * produced by cutting a release, and all of them can happen on a bike.
+ */
+
+#define K_URL "https://github.com/niklasonfire/wildfire_monitor/releases/" \
+              "download/v0.1.0/wildfire_monitor.bin"
+#define K_SHA "3056b696feaaed678d650caed5877c712817504d819666cb699d77957b039213"
+
+/* Exactly what scripts/release.sh writes, down to the indentation and the
+ * trailing newline - the one body that has to parse. */
+static const char k_published[] =
+    "{\n"
+    "  \"version\": \"v0.1.0\",\n"
+    "  \"url\": \"" K_URL "\",\n"
+    "  \"size\": 1169600,\n"
+    "  \"sha256\": \"" K_SHA "\"\n"
+    "}\n";
+
+static void check_parse(const char *json, wfota_err_t want, const char *what)
+{
+    wfota_manifest_t m;
+    wfota_err_t got = wfota_manifest_parse(json, strlen(json), &m);
+
+    CHECK(got == want, "%s: got \"%s\", expected \"%s\"", what,
+          wfota_err_str(got), wfota_err_str(want));
+}
+
+/* One manifest with one field replaced, so a test names the field it is
+ * about instead of restating the other three. */
+static void one_field(char *out, size_t cap, const char *version,
+                      const char *url, const char *size, const char *sha)
+{
+    snprintf(out, cap,
+             "{\"version\":\"%s\",\"url\":\"%s\",\"size\":%s,\"sha256\":\"%s\"}",
+             version, url, size, sha);
+}
+
+static void test_the_published_manifest_reads(void)
+{
+    wfota_manifest_t m;
+
+    CHECK(wfota_manifest_parse(k_published, sizeof(k_published) - 1, &m) == WFOTA_OK,
+          "the manifest docs/release.md prints did not parse");
+    CHECK(strcmp(m.version, "v0.1.0") == 0, "version: got \"%s\"", m.version);
+    CHECK(strcmp(m.url, K_URL) == 0, "url: got \"%s\"", m.url);
+    CHECK_U(m.size, 1169600, "size");
+    CHECK(strcmp(m.sha256, K_SHA) == 0, "sha256: got \"%s\"", m.sha256);
+
+    /* The same four fields with no whitespace anywhere, because the body is
+     * whatever the server sends and not whatever the heredoc looked like. */
+    char compact[512];
+    one_field(compact, sizeof(compact), "v0.1.0", K_URL, "1169600", K_SHA);
+    check_parse(compact, WFOTA_OK, "the compact form");
+}
+
+static void test_a_missing_field_is_refused(void)
+{
+    check_parse("{\"url\":\"" K_URL "\",\"size\":1,\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_FIELD, "no version");
+    check_parse("{\"version\":\"v1\",\"size\":1,\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_FIELD, "no url");
+    check_parse("{\"version\":\"v1\",\"url\":\"" K_URL "\",\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_FIELD, "no size");
+    check_parse("{\"version\":\"v1\",\"url\":\"" K_URL "\",\"size\":1}",
+                WFOTA_ERR_FIELD, "no sha256");
+    check_parse("{}", WFOTA_ERR_FIELD, "the empty object");
+}
+
+/* Which of the two is the answer? There is no rule that gives one, and a
+ * Monitor that installed whichever came last would depend on the order of a
+ * file nobody reads that far into. */
+static void test_a_repeated_field_is_refused(void)
+{
+    check_parse("{\"version\":\"v1\",\"version\":\"v2\",\"url\":\"" K_URL "\","
+                "\"size\":1,\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_FIELD, "two versions");
+}
+
+/* A key we have never heard of is skipped, not refused: publishing a fifth
+ * field one day must not stop a Monitor running today's firmware from reading
+ * the four it does know. */
+static void test_an_unknown_field_is_skipped(void)
+{
+    check_parse("{\"version\":\"v1\",\"notes\":\"fixes the fitter\","
+                "\"url\":\"" K_URL "\",\"size\":1,\"sha256\":\"" K_SHA "\","
+                "\"published\":1756600000}",
+                WFOTA_OK, "a fifth and a sixth field");
+}
+
+static void test_a_malformed_body_is_refused(void)
+{
+    /* What a hotspot that walked away leaves behind. */
+    check_parse("{\"version\":\"v0.1.0\",\"url\":\"https://gith",
+                WFOTA_ERR_JSON, "a body cut off mid-string");
+    check_parse("{\"version\":\"v0.1.0\",\"size\":1169600",
+                WFOTA_ERR_JSON, "a body cut off before the brace");
+    /* What GitHub serves when the release is not there. */
+    check_parse("<!DOCTYPE html><html><title>Not Found</title></html>",
+                WFOTA_ERR_JSON, "an HTML error page");
+    check_parse("Not Found", WFOTA_ERR_JSON, "a plain-text 404 body");
+    check_parse("", WFOTA_ERR_EMPTY, "nothing at all");
+
+    /* Shapes the four-field contract says cannot occur, so nothing here has
+     * to grow a parser with a stack to handle them. */
+    check_parse("[{\"version\":\"v1\"}]", WFOTA_ERR_JSON, "an array");
+    check_parse("{\"version\":{\"tag\":\"v1\"},\"url\":\"" K_URL "\","
+                "\"size\":1,\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_JSON, "a nested object");
+    check_parse("{\"version\":null,\"url\":\"" K_URL "\",\"size\":1,"
+                "\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_JSON, "a null value");
+    check_parse("{\"version\":\"v1\\u0031\",\"url\":\"" K_URL "\",\"size\":1,"
+                "\"sha256\":\"" K_SHA "\"}",
+                WFOTA_ERR_JSON, "an escape sequence");
+    check_parse("{\"version\":\"v1\",} ", WFOTA_ERR_JSON, "a trailing comma");
+    check_parse("{\"version\":\"v1\",\"url\":\"" K_URL "\",\"size\":1,"
+                "\"sha256\":\"" K_SHA "\"} and more",
+                WFOTA_ERR_JSON, "junk after the object");
+}
+
+/* Well formed, four fields, and still not something the download half could
+ * act on. Refused here so that it is refused before the radio spends three
+ * minutes on it. */
+static void test_a_field_that_cannot_be_used_is_refused(void)
+{
+    char buf[512];
+
+    one_field(buf, sizeof(buf), "v0.1.0",
+              "http://github.com/x/y/releases/download/v0.1.0/wildfire_monitor.bin",
+              "1169600", K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "an image offered over plain http");
+
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "0", K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "an empty image");
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "1966081", K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "an image one byte over the slot");
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "1966080", K_SHA);
+    check_parse(buf, WFOTA_OK, "an image that exactly fills the slot");
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "99999999999", K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "a size that overflows a u32");
+
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "1169600",
+              "3056B696FEAAED678D650CAED5877C712817504D819666CB699D77957B039213");
+    check_parse(buf, WFOTA_ERR_FIELD, "an upper-case digest");
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "1169600", "3056b696");
+    check_parse(buf, WFOTA_ERR_FIELD, "a digest of the wrong length");
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, "1169600",
+              "zzz6b696feaaed678d650caed5877c712817504d819666cb699d77957b039213");
+    check_parse(buf, WFOTA_ERR_FIELD, "a digest that is not hex");
+
+    one_field(buf, sizeof(buf), "", K_URL, "1169600", K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "an empty version");
+    one_field(buf, sizeof(buf), "v0.1.0 (final)", K_URL, "1169600", K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "a version that is not a tag");
+}
+
+/* The cap is what stops a redirect to something enormous from being read into
+ * RAM the Monitor does not have. Both halves are asserted: the body one byte
+ * over, and the body that just fits. */
+static void test_an_oversized_body_is_refused(void)
+{
+    static char big[WFOTA_BODY_MAX + 2];
+    wfota_manifest_t m;
+
+    memset(big, ' ', sizeof(big));
+    big[0] = '{';
+    big[sizeof(big) - 1] = '}';
+    CHECK(wfota_manifest_parse(big, WFOTA_BODY_MAX + 1, &m) == WFOTA_ERR_BIG,
+          "a body one byte over the cap was read anyway");
+    /* At the cap it is parsed and refused on its merits, not on its length. */
+    CHECK(wfota_manifest_parse(big, WFOTA_BODY_MAX, &m) != WFOTA_ERR_BIG,
+          "a body at exactly the cap was refused for being too big");
+}
+
+/* ADR-0006: inequality, never order. It is what removes all version
+ * comparison from the Monitor and makes going back an upgrade's equal. */
+static void test_the_version_is_compared_for_inequality(void)
+{
+    wfota_manifest_t m;
+
+    CHECK(wfota_manifest_parse(k_published, sizeof(k_published) - 1, &m) == WFOTA_OK,
+          "the published manifest did not parse");
+    CHECK(strcmp(m.version, "v0.1.0") == 0, "the same tag is not an update");
+    CHECK(strcmp(m.version, "v0.2.0") != 0, "a newer tag is an update");
+    CHECK(strcmp(m.version, "v0.0.9") != 0, "an older tag is an update too");
+}
+
+static void test_the_url_is_latest_until_something_is_pinned(void)
+{
+    char url[256];
+
+    CHECK(wfota_manifest_url(NULL, url, sizeof(url)), "no pin was refused");
+    CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
+          "unpinned: got \"%s\"", url);
+    CHECK(wfota_manifest_url("", url, sizeof(url)), "a cleared pin was refused");
+    CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
+          "cleared pin: got \"%s\"", url);
+
+    CHECK(wfota_manifest_url("v0.1.0", url, sizeof(url)), "a tag was refused");
+    CHECK(strcmp(url, WFOTA_RELEASES "/download/v0.1.0/manifest.json") == 0,
+          "pinned: got \"%s\"", url);
+
+    /* A buffer that cannot hold it leaves nothing half-built behind. */
+    char small[16];
+    CHECK(!wfota_manifest_url("v0.1.0", small, sizeof(small)),
+          "a URL was truncated into a buffer that could not hold it");
+    CHECK(small[0] == '\0', "the truncated URL was left in the buffer");
+}
+
+/* The pin comes off a console line, and it is pasted into a URL. Nothing that
+ * could make that URL name something else gets through. */
+static void test_a_tag_that_could_rewrite_the_url_is_refused(void)
+{
+    char url[256];
+
+    CHECK(wfota_tag_ok("v0.1.0"), "a plain tag");
+    CHECK(wfota_tag_ok("v1.2.3-rc1_x"), "dots, dashes and underscores");
+    CHECK(!wfota_tag_ok("../../etc/passwd"), "a path");
+    CHECK(!wfota_tag_ok("v1/x"), "a slash");
+    CHECK(!wfota_tag_ok("v1?raw=1"), "a query string");
+    CHECK(!wfota_tag_ok("v1 v2"), "a space");
+    CHECK(!wfota_tag_ok("v1%2f"), "a percent escape");
+    CHECK(!wfota_tag_ok(""), "the empty tag");
+    CHECK(!wfota_tag_ok(NULL), "no tag at all");
+    CHECK(!wfota_tag_ok("v0.1.0-with-a-really-long-suffix-0123456789"),
+          "a tag longer than a version field");
+
+    CHECK(!wfota_manifest_url("v1/../../x", url, sizeof(url)),
+          "a tag with a path in it built a URL");
+    CHECK(url[0] == '\0', "the refused tag left a URL behind");
+}
+
+/* ---- picking a network -------------------------------------------------- */
+
+static void test_the_strongest_known_network_is_picked(void)
+{
+    const char *known[] = {"hotspot-a", "hotspot-b"};
+    const wfota_seen_t seen[] = {
+        {"neighbour",  -40},
+        {"hotspot-a",  -70},
+        {"hotspot-b",  -55},
+        {"cafe",       -30},
+    };
+
+    int pick = wfota_pick_network(known, 2, seen, 4);
+    CHECK(pick == 2, "picked index %d, expected hotspot-b at 2", pick);
+    /* -55 beats -70 and both lose to nothing else in the list, however loud
+     * the networks we do not know are. */
+    CHECK(pick >= 0 && seen[pick].rssi == -55, "picked the weaker of the two");
+}
+
+static void test_a_network_we_do_not_know_is_never_joined(void)
+{
+    const char *known[] = {"hotspot"};
+    const wfota_seen_t others[] = {{"hotspot2", -30}, {"otspot", -30},
+                                   {"HOTSPOT", -30}, {"", -30}};
+    const wfota_seen_t exact[] = {{"hotspot", -80}};
+    const char *none[] = {""};
+
+    /* A prefix, a suffix, a different case and an empty SSID are all other
+     * networks: 802.11 does not fold case and these are octets, not text. */
+    CHECK(wfota_pick_network(known, 1, others, 4) == -1,
+          "joined a network whose SSID only resembles the one we know");
+    CHECK(wfota_pick_network(known, 1, exact, 1) == 0,
+          "refused the network we know because it was faint");
+    CHECK(wfota_pick_network(known, 1, exact, 0) == -1, "an empty scan");
+    CHECK(wfota_pick_network(none, 0, exact, 1) == -1, "an empty wifi list");
+    CHECK(wfota_pick_network(none, 1, exact, 1) == -1,
+          "an empty stored SSID matched something");
+}
+
 int main(void)
 {
     test_odo_metres();
@@ -4433,6 +4720,19 @@ int main(void)
     test_the_advice_holds_through_its_own_band();
     test_the_advice_retires_when_it_is_taken();
 
+    test_the_published_manifest_reads();
+    test_a_missing_field_is_refused();
+    test_a_repeated_field_is_refused();
+    test_an_unknown_field_is_skipped();
+    test_a_malformed_body_is_refused();
+    test_a_field_that_cannot_be_used_is_refused();
+    test_an_oversized_body_is_refused();
+    test_the_version_is_compared_for_inequality();
+    test_the_url_is_latest_until_something_is_pinned();
+    test_a_tag_that_could_rewrite_the_url_is_refused();
+    test_the_strongest_known_network_is_picked();
+    test_a_network_we_do_not_know_is_never_joined();
+
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();
     test_a_version_3_blob_is_migrated();
@@ -4441,7 +4741,7 @@ int main(void)
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");
         return 1;
     }
-    printf("unit: odometer wrap, the power block and the estimator, "
-           "all assertions hold\n");
+    printf("unit: odometer wrap, the power block, the estimator and the "
+           "manifest, all assertions hold\n");
     return 0;
 }

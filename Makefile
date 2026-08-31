@@ -30,6 +30,7 @@ HOST_STD  = -std=c99 -D_DEFAULT_SOURCE
 BUILD     = build-host
 WFDECODE  = main/wfdecode
 WFEST     = main/wfest
+WFOTA     = main/wfota
 FIXTURES  = tests/fixtures
 PYTHON   ?= python3
 
@@ -45,8 +46,8 @@ GEN       = $(BUILD)/gen
 GEN_STAMP = $(GEN)/.generated
 
 PURE_OBJ  = $(BUILD)/wfdecode.o $(BUILD)/wfl_read.o $(BUILD)/wf_fields.o \
-            $(BUILD)/wfest.o
-INC       = -I$(WFDECODE) -I$(WFEST) -I$(GEN)
+            $(BUILD)/wfest.o $(BUILD)/wfota.o
+INC       = -I$(WFDECODE) -I$(WFEST) -I$(WFOTA) -I$(GEN)
 REPLAY    = $(BUILD)/replay
 UNIT      = $(BUILD)/unit
 
@@ -58,8 +59,9 @@ FIT_H     = $(WFEST)/wf_fit.h
 test: test-unit test-replay test-scripts
 
 # The decoding a recorded ride cannot reach: the Odometer wrap, which no
-# fixture we hold crosses, and the power block's offsets read out of a frame
-# built byte by byte. See tests/host/unit.c.
+# fixture we hold crosses, the power block's offsets read out of a frame built
+# byte by byte, and the manifests update mode has to refuse - which no release
+# will ever publish. See tests/host/unit.c.
 test-unit: $(UNIT)
 	$(UNIT)
 
@@ -99,6 +101,12 @@ $(BUILD)/wf_fields.o: $(GEN_STAMP) | $(BUILD)
 	    -c $(GEN)/wf_fields.c -o $@
 
 $(BUILD)/wfest.o: $(WFEST)/wfest.c $(WFEST)/wfest.h $(GEN_STAMP) | $(BUILD)
+	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
+
+# The pure half of update mode - the manifest, its URL, and which network to
+# join. Nothing generated goes into it, so unlike the two above it does not
+# wait on the Field Table.
+$(BUILD)/wfota.o: $(WFOTA)/wfota.c $(WFOTA)/wfota.h | $(BUILD)
 	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
 
 $(BUILD)/%.o: $(WFDECODE)/%.c $(GEN_STAMP) | $(BUILD)

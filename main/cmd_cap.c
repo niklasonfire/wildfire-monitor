@@ -23,6 +23,7 @@
 #include "rtc_bm8563.h"
 #include "ui.h"
 #include "webdump.h"
+#include "wifi_store.h"
 
 #include "esp_console.h"
 #include "esp_err.h"
@@ -223,10 +224,88 @@ static int cmd_capdump(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Two jobs under one name, because to a rider they are one thing: the radio.
+ * `wifi on|off` is readout mode, the access point this board puts up. `wifi
+ * add|list|del` is the list of networks update mode is allowed to join - up
+ * to four of them (ADR-0006), so that a second phone is not a data-model
+ * change and a provisioning screen later has somewhere to write to.
+ *
+ * The credentials only ever arrive here, at runtime, over the cable: the
+ * repository is public, so nothing in it may carry an SSID or a passphrase.
+ * They are stored unencrypted, deliberately - a hotspot key is the right kind
+ * of secret to keep on a bike, and it can be rotated on the phone.
+ *
+ * An SSID or a passphrase with a space in it needs quoting, which the console
+ * splitter understands: wifi add "the cafe" "long pass phrase".
+ */
+static void wifi_usage(void)
+{
+    printf("usage: wifi on|off|list|add <ssid> [passphrase]|del <ssid>\n");
+}
+
+static void wifi_print_list(void)
+{
+    wifi_net_t nets[WIFI_STORE_MAX];
+    int        n = wifi_store_load(nets, WIFI_STORE_MAX);
+
+    for (int i = 0; i < n; i++) {
+        /* The passphrase is not printed back. It is in NVS in the clear by
+         * design, but a console session is copied into log files and pasted
+         * into tickets, and its length is enough to spot a typo by. */
+        printf("WIFINET %d ssid=%s passlen=%u\n", i, nets[i].ssid,
+               (unsigned)strlen(nets[i].pass));
+    }
+    printf("WIFINETS count=%d max=%d\n", n, WIFI_STORE_MAX);
+}
+
 static int cmd_wifi(int argc, char **argv)
 {
+    if (argc < 2) {
+        wifi_usage();
+        return 1;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        wifi_print_list();
+        return 0;
+    }
+    if (strcmp(argv[1], "add") == 0) {
+        if (argc < 3 || argc > 4) {
+            wifi_usage();
+            return 1;
+        }
+        esp_err_t err = wifi_store_add(argv[2], (argc == 4) ? argv[3] : "");
+        if (err != ESP_OK) {
+            /* The two that are worth naming: a passphrase WPA2 would refuse
+             * anyway, and a list with no room left. */
+            printf("WIFI error=%s\n",
+                   err == ESP_ERR_INVALID_SIZE ? "ssid or passphrase length"
+                   : err == ESP_ERR_NO_MEM     ? "the list is full"
+                                               : esp_err_to_name(err));
+            return 1;
+        }
+        wifi_print_list();
+        return 0;
+    }
+    if (strcmp(argv[1], "del") == 0) {
+        if (argc != 3) {
+            wifi_usage();
+            return 1;
+        }
+        esp_err_t err = wifi_store_del(argv[2]);
+        if (err != ESP_OK) {
+            printf("WIFI error=%s\n",
+                   err == ESP_ERR_NOT_FOUND ? "no such network"
+                                            : esp_err_to_name(err));
+            return 1;
+        }
+        wifi_print_list();
+        return 0;
+    }
+
     if (argc != 2) {
-        printf("usage: wifi on|off\n");
+        wifi_usage();
         return 1;
     }
     if (strcmp(argv[1], "on") == 0) {
@@ -241,7 +320,7 @@ static int cmd_wifi(int argc, char **argv)
          * letting the user believe a capture would still work. */
         printf("WIFI off - reboot to capture again\n");
     } else {
-        printf("usage: wifi on|off\n");
+        wifi_usage();
         return 1;
     }
     printf("WIFI running=%d clients=%d\n", web_running(), web_clients());
@@ -322,7 +401,8 @@ void cmd_cap_register(void)
          .help = "Print a capture over the console: capdump <seq> [max_records]",
          .func = cmd_capdump},
         {.command = "wifi",
-         .help = "Wi-Fi readout mode (takes BLE down): wifi on|off",
+         .help = "Readout mode and the networks update mode may join: "
+                 "wifi on|off|list|add <ssid> [passphrase]|del <ssid>",
          .func = cmd_wifi},
         {.command = "time",
          .help = "Read or set the RTC: time [set <YYYY-MM-DD> <HH:MM[:SS]>] (UTC)",

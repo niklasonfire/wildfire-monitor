@@ -206,7 +206,7 @@ nothing at all closes it.
 | Entry | What it does |
 | --- | --- |
 | `READOUT` | Wi-Fi access point, Captures over HTTP, back only by reboot |
-| `UPDATE` | update mode - the screen exists, the download is issue #28 |
+| `UPDATE` | joins a hotspot it knows and says what release is on offer |
 
 The menu will not open while a Capture is recording or connecting, and says so
 on the panel: both modes need the radio the Capture is using. See ADR-0006.
@@ -230,6 +230,38 @@ so it reformats on the first boot after the change: **pull every Capture off
 the board before flashing it.** A partition table cannot be replaced over the
 air, so that flash is the cable this whole arrangement exists to be the last
 of.
+
+## Update mode
+
+`UPDATE` on the menu joins a hotspot and reads the manifest of the newest
+release, so the panel says either `UP TO DATE` or the tag on offer, with the
+address it was given underneath. Downloading and installing the image is issue
+#28; nothing is written to flash by the check itself.
+
+It shares readout mode's shape: Wi-Fi and NimBLE do not fit in this chip's RAM
+together, so BLE goes down when it starts and the way back to capturing is a
+reboot. A failure is left failed - it names which failure it was and hands the
+panel back, and nothing retries on its own.
+
+The networks it may join live in NVS and arrive from the console, never from
+this repository, which is public:
+
+| Command | Effect |
+| --- | --- |
+| `wifi add <ssid> [passphrase]` | Remember a network, up to four; quote anything with a space in it |
+| `wifi list` | What is stored, passphrases by length only |
+| `wifi del <ssid>` | Forget one |
+| `ota` | Slot, rollback health, the pin, and the URL the next check reads |
+| `ota pin <tag>` / `ota pin` | Read one release instead of `latest` / go back to `latest` |
+| `ota check` | Run the check from the console, without the menu |
+
+The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
+the right kind of secret to keep on a bike, and it can be rotated on the
+phone. Trust for the fetch comes from the ESP-IDF certificate bundle and not
+from a pinned certificate - GitHub rotates its certificates, and a pinned one
+would eventually stop every update. Versions are compared for inequality and
+never for order, which is what makes `ota pin <tag>` a way of backing a bad
+release out. See ADR-0006.
 
 ## Publishing a release
 

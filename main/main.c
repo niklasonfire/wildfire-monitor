@@ -25,10 +25,12 @@
 #include "i2c_bus.h"
 #include "imu.h"
 #include "ota_health.h"
+#include "ota_update.h"
 #include "rtc_bm8563.h"
 #include "ui.h"
 #include "webdump.h"
 
+#include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_console.h"
 #include "esp_err.h"
@@ -138,19 +140,50 @@ static int cmd_info(int argc, char **argv)
     return 0;
 }
 
-/* The health check runs whether or not anything is on probation (see
- * ota_health.h), so this is what makes it observable on a board that has only
- * ever been flashed down a cable: watch the gates fill in, watch "confirmed"
- * flip a minute in. Read-only - the half that downloads and installs an image
- * is a later ticket. */
+/* Update mode from the console. Takes BLE down and blocks for as long as the
+ * check runs, exactly as "wifi on" does, because it is the same one-way door;
+ * main.c owns the sequence because the menu goes through it too. */
+static bool app_update_enter(void);
+
+/*
+ * The health check runs whether or not anything is on probation (see
+ * ota_health.h), so plain `ota` is what makes it observable on a board that
+ * has only ever been flashed down a cable: watch the gates fill in, watch
+ * "confirmed" flip a minute in. It also prints the URL the next check will
+ * read, which is the one thing the pin changes.
+ *
+ * `ota pin <tag>` points the Monitor at one release instead of at `latest`,
+ * and `ota pin` with no argument clears it. Because versions are compared for
+ * inequality and never for order (ADR-0006), pinning an older tag is how a
+ * suspect release is backed out without publishing anything.
+ */
 static int cmd_ota(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    if (argc >= 2 && strcmp(argv[1], "pin") == 0) {
+        const char *tag = (argc >= 3) ? argv[2] : NULL;
+        esp_err_t   err = otaup_pin_set(tag);
+
+        if (err != ESP_OK) {
+            printf("OTA error=%s\n", esp_err_to_name(err));
+            return 1;
+        }
+    } else if (argc >= 2 && strcmp(argv[1], "check") == 0) {
+        if (!app_update_enter()) {
+            printf("OTA error=check failed\n");
+            return 1;
+        }
+        return 0;
+    } else if (argc >= 2) {
+        printf("usage: ota [pin [<tag>]|check]\n");
+        return 1;
+    }
 
     uint32_t gates = ota_health_gates();
+    char     pin[40] = "";
+    char     url[256] = "";
 
     printf("running    %s\n", ota_running_label());
+    printf("version    %s\n", esp_app_get_description()->version);
     printf("next boot  %s\n", ota_boot_label());
     printf("probation  %s\n", ota_health_on_probation() ? "yes" : "no");
     printf("gates      nvs=%d store=%d display=%d\n",
@@ -159,6 +192,8 @@ static int cmd_ota(int argc, char **argv)
     printf("uptime_s   %lld of %d\n", esp_timer_get_time() / 1000000,
            OTA_HEALTH_UPTIME_S);
     printf("confirmed  %s\n", ota_health_confirmed() ? "yes" : "no");
+    printf("pin        %s\n", otaup_pin_get(pin, sizeof(pin)) ? pin : "(latest)");
+    printf("manifest   %s\n", otaup_manifest_url(url, sizeof(url)) ? url : "-");
     return 0;
 }
 
@@ -171,7 +206,9 @@ static void register_commands(void)
         {.command = "hb", .help = "Heartbeat log on/off: hb on|off", .func = cmd_hb},
         {.command = "info", .help = "Print chip, flash, MAC, BLE and heap info", .func = cmd_info},
         {.command = "sleep", .help = "Wait, so a script can let the board work: sleep <secs>", .func = cmd_sleep},
-        {.command = "ota", .help = "Print the running app slot and the rollback health check", .func = cmd_ota},
+        {.command = "ota",
+         .help = "Slot, rollback health, and update mode: ota [pin [<tag>]|check]",
+         .func = cmd_ota},
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -211,6 +248,10 @@ static bool capture_busy(const char *what)
     return true;
 }
 
+/* Set once either mode has taken BLE down for the radio. It is what stops
+ * button A from offering a capture that can no longer be started. */
+static bool s_ble_spent;
+
 /* Wi-Fi and NimBLE do not fit in this chip's RAM together, so entering readout
  * mode is a one-way door: BLE goes down for good and the way back to capturing
  * is a reboot. Both the menu and the "wifi on" command land here.
@@ -229,6 +270,7 @@ bool app_readout_enter(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "BLE shutdown: %s", esp_err_to_name(err));
     }
+    s_ble_spent = true;
 
     char ssid[40] = "", ip[24] = "";
     err = web_start(ssid, sizeof(ssid), ip, sizeof(ip));
@@ -252,31 +294,95 @@ bool app_readout_enter(void)
 #define MENU_REFUSE_MS  2500    /* the refusal is a sentence, not a screen */
 #define MENU_LABEL_MAX  12      /* "> " plus the longest label, plus the NUL */
 
-/* Update mode proper - join the hotspot, read the manifest, write the image -
- * is issue #28. What is here is the door it gets fitted behind, so the menu
- * has its second entry from the day the menu exists and the gesture can be
- * ridden with before there is anything to download. The capture check is
- * repeated rather than left to the menu because ADR-0006 asks update mode
- * itself to refuse, exactly as readout mode does, and #28 will grow a console
- * way in that does not come past the menu at all.
+/* ---- update mode --------------------------------------------------------
  *
- * Unlike readout mode this screen is not a one-way door yet: nothing has been
- * shut down, so it hands the panel back rather than stranding the rider on a
- * screen whose only exit is a reboot for no reason.
+ * It shares readout mode's shape (ADR-0006): BLE goes down so the radio is
+ * free, the Monitor joins the strongest hotspot it knows, and the only way
+ * back to capturing is a reboot. What it does with the link is one question -
+ * is there something newer than this - and it answers it and stops. The
+ * download and the install are issue #28.
+ *
+ * The capture check is repeated rather than left to the menu because ADR-0006
+ * asks update mode itself to refuse, exactly as readout mode does, and because
+ * `ota check` on the console comes here without passing the menu at all.
+ *
+ * Unlike readout mode this is not a screen the rider is stranded on: a failure
+ * is left failed, says which failure it was, and hands the panel back. Nothing
+ * retries by itself - the rider is standing next to the Monitor, and a retry
+ * loop would only hide a hotspot too weak to finish.
  */
+/* Runs on the check's own task. ui_message() copies its lines under the UI
+ * mutex, so this is safe from there, and it is the only reason the rider sees
+ * "scanning" and "joining" rather than ten seconds of a frozen panel. */
+static void update_stage(const char *l1, const char *l2)
+{
+    ui_message("UPDATE", l1, l2, NULL, NULL);
+}
+
+/* One line per failure, in the words a rider can act on: which of them it was
+ * decides whether they move the bike, open the hotspot on their phone, or go
+ * and look at what was published. The second line is whatever detail the check
+ * collected - a disconnect reason, an HTTP status, why the JSON was refused. */
+static const char *update_fail_line(otaup_err_t err)
+{
+    switch (err) {
+    case OTAUP_ERR_STATE:    return "already on";
+    case OTAUP_ERR_WIFI:     return "radio failed";
+    case OTAUP_ERR_NO_NETS:  return "no networks";
+    case OTAUP_ERR_NO_SCAN:  return "no hotspot";
+    case OTAUP_ERR_NO_KNOWN: return "none known";
+    case OTAUP_ERR_JOIN:     return "join failed";
+    case OTAUP_ERR_FETCH:    return "no manifest";
+    case OTAUP_ERR_MANIFEST: return "bad manifest";
+    case OTAUP_OK:           break;
+    }
+    return "failed";
+}
+
 static bool app_update_enter(void)
 {
+    otaup_result_t res;
+
     if (capture_busy("update mode")) {
         return false;
     }
 
-    ESP_LOGI(TAG, "update mode: nothing to install yet");
-    ui_message("UPDATE", "nothing to", "install yet", NULL, "any: BACK");
+    ui_message("UPDATE", "starting", NULL, NULL, NULL);
+    esp_err_t err = cap_ble_shutdown();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BLE shutdown: %s", esp_err_to_name(err));
+    }
+    s_ble_spent = true;
+
+    otaup_err_t uerr = otaup_check(&res, update_stage);
+    if (uerr != OTAUP_OK) {
+        ESP_LOGE(TAG, "update mode: %s (%s)", otaup_err_str(uerr),
+                 res.detail[0] ? res.detail : "-");
+        ui_message("UPDATE", update_fail_line(uerr),
+                   res.detail[0] ? res.detail : NULL,
+                   (uerr == OTAUP_ERR_NO_NETS) ? "use wifi add" : NULL,
+                   "any: BACK");
+    } else if (!res.differs) {
+        ESP_LOGI(TAG, "update mode: %s is current, from %s at %s",
+                 res.running, res.ssid, res.ip);
+        ui_message("UPDATE", "UP TO DATE", res.running, res.ip, "any: BACK");
+    } else {
+        /* Named, not judged: versions are compared for inequality, so the tag
+         * on offer may be older than the one running and installing it is the
+         * same operation either way. */
+        ESP_LOGI(TAG, "update mode: %s on offer, running %s",
+                 res.manifest.version, res.running);
+        ui_message("UPDATE", "ON OFFER", res.manifest.version, res.ip,
+                   "any: BACK");
+    }
 
     board_btn_evt_t evt;
     (void)board_btn_wait(&evt, MENU_IDLE_MS);
     ui_message_clear();
-    return true;
+    /* The link goes down with the screen. #28 is where it stays up, because
+     * that is the ticket with something to download through it. */
+    otaup_stop();
+    return uerr == OTAUP_OK;
 }
 
 /* ---- the B menu ---------------------------------------------------------
@@ -418,6 +524,17 @@ static void button_task(void *arg)
             }
             if (evt.btn == BOARD_BTN_B_ID) {
                 disp_backlight(!disp_backlight_get());
+            }
+            continue;
+        }
+
+        if (s_ble_spent && evt.btn == BOARD_BTN_A_ID) {
+            /* Update mode has been through here, so BLE is gone and A has no
+             * capture left to start. Rebooting is the only thing that gets one
+             * back, and it is what A already means on the readout screen. B
+             * still opens the menu, so update mode can be run again. */
+            if (evt.press == BOARD_PRESS_SHORT) {
+                esp_restart();
             }
             continue;
         }

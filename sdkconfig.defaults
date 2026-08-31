@@ -17,6 +17,16 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # slot that worked. What the image has to prove first is in main/ota_health.c.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
+# --- Update mode: HTTPS trusted by the certificate bundle (ADR-0006) ---
+# Whose certificate the Monitor believes when it fetches a release manifest.
+# The bundle and not a pinned certificate: GitHub rotates its certificates,
+# and a pinned one would eventually stop every update with no way back except
+# the cable this whole arrangement exists to be the last of. The full bundle
+# rather than the common subset, because the flash it costs is headroom the
+# app slot has and a root that turns out to be missing costs a ride.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
 # Console on UART0 (GPIO1/GPIO3 -> CH9102 USB-serial), 115200 baud
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

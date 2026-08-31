@@ -46,22 +46,25 @@ idf_component_register(
          "capture.c" "capture_store.c" "display.c" "ui.c" "rtc_bm8563.c"
          "webdump.c" "imu.c" "i2c_bus.c"
          # ADR-0006: what a firmware written into the spare app slot has to
-         # prove before the bootloader stops holding a rollback over it.
-         "ota_health.c"
+         # prove before the bootloader stops holding a rollback over it, and
+         # update mode's two halves - the networks it may join, and the join
+         # and the manifest read themselves.
+         "ota_health.c" "wifi_store.c" "ota_update.c"
          # The NVS adapter for the estimation seam. Firmware, deliberately:
          # main/wfest must not know NVS exists.
          "est_store.c"
          # Pure C99, no ESP-IDF: the same files the host replay harness builds,
          # see the Makefile, tests/host/replay.c and tests/host/unit.c.
          "wfdecode/wfdecode.c" "wfdecode/wfl_read.c"
-         "wfest/wfest.c"
+         "wfest/wfest.c" "wfota/wfota.c"
          # Generated from field-table.json, above.
          "${WF_GEN_C}"
-    INCLUDE_DIRS "." "${WF_GEN_DIR}" "wfdecode" "wfest"
-    REQUIRES app_update bt console driver esp_adc esp_driver_gpio
-             esp_driver_i2c esp_driver_spi esp_event esp_http_server esp_lcd
-             esp_netif esp_partition esp_timer esp_wifi fatfs nvs_flash
-             spi_flash vfs wear_levelling)
+    INCLUDE_DIRS "." "${WF_GEN_DIR}" "wfdecode" "wfest" "wfota"
+    REQUIRES app_update bt console driver esp_adc esp_app_format
+             esp_driver_gpio esp_driver_i2c esp_driver_spi esp_event
+             esp_http_client esp_http_server esp_lcd esp_netif esp_partition
+             esp_timer esp_wifi fatfs mbedtls nvs_flash spi_flash vfs
+             wear_levelling)
 
 # Determinism, the other half of the Makefile's FPDET. GCC is free by default
 # to contract a*b+c into a fused multiply-add, which rounds once instead of
