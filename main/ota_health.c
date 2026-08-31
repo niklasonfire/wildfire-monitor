@@ -26,8 +26,10 @@ static volatile uint32_t s_gates;
 
 static bool          s_probation;
 static volatile bool s_confirmed;
-static const char   *s_running = "unknown";
-static const char   *s_boot    = "unknown";
+static bool          s_rolled_back;
+static const char   *s_running  = "unknown";
+static const char   *s_boot     = "unknown";
+static const char   *s_rollback = "none";
 
 static const char *label_of(const esp_partition_t *p)
 {
@@ -126,6 +128,23 @@ void ota_health_start(void)
              s_running, (run != NULL) ? run->address : 0u,
              s_probation ? "on probation" : "confirmed");
 
+    /* The other slot, which is where a rollback leaves its evidence: the
+     * bootloader marks an image it gave up on INVALID or ABORTED and comes
+     * back here. A board that has only ever been flashed over USB has no
+     * otadata entry for that slot at all, so the read fails and this stays
+     * false - which is what keeps a bench board from claiming a rollback that
+     * never happened. */
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    esp_ota_img_states_t   ostate = ESP_OTA_IMG_UNDEFINED;
+    if (other != NULL && esp_ota_get_state_partition(other, &ostate) == ESP_OK &&
+        (ostate == ESP_OTA_IMG_INVALID || ostate == ESP_OTA_IMG_ABORTED)) {
+        s_rolled_back = true;
+        s_rollback    = label_of(other);
+        ESP_LOGW(TAG, "%s holds an image the bootloader gave up on - "
+                      "the last update was rolled back and %s is what came up",
+                 s_rollback, s_running);
+    }
+
     xTaskCreate(watch_task, "otahealth", WATCH_STACK, NULL, WATCH_PRIO, NULL);
 }
 
@@ -141,3 +160,5 @@ const char *ota_boot_label(void)    { return s_boot; }
 bool     ota_health_on_probation(void) { return s_probation; }
 uint32_t ota_health_gates(void)        { return s_gates; }
 bool     ota_health_confirmed(void)    { return s_confirmed; }
+bool        ota_health_rolled_back(void) { return s_rolled_back; }
+const char *ota_rollback_label(void)     { return s_rollback; }

@@ -106,3 +106,88 @@ typedef struct {
  */
 int wfota_pick_network(const char *const *known, int n_known,
                        const wfota_seen_t *seen, int n_seen);
+
+/* ---- the download --------------------------------------------------------
+ *
+ * The fourth question, and the only one whose wrong answer cannot be taken
+ * back from a handlebar: are the bytes that just went into the spare app slot
+ * the image the manifest named. Answering it is arithmetic over a byte
+ * stream - a running digest, a length, and the percentage the panel shows -
+ * so it lives here, where a truncated body is a string literal instead of a
+ * hotspot somebody has to walk out of range of.
+ *
+ * SHA-256 is written out here rather than called out of mbedtls, which the
+ * TLS in ota_update.c links anyway. mbedtls does not build in the host
+ * harness, and this digest is the one thing standing between a corrupted
+ * download and a Monitor that has to come off the bike: it is worth the two
+ * hundred lines to have `make test` drive the same accumulator the Monitor
+ * runs, rather than a second one that agrees with it in principle.
+ */
+
+/* Enough of SHA-256 for an image arriving in whatever sized pieces the HTTP
+ * client hands over. Opaque in use; the fields are here only because this
+ * seam does not allocate. */
+typedef struct {
+    uint32_t h[8];
+    uint64_t bytes;
+    uint8_t  block[64];
+    size_t   fill;
+} wfota_sha256_t;
+
+void wfota_sha256_init(wfota_sha256_t *s);
+void wfota_sha256_feed(wfota_sha256_t *s, const void *data, size_t len);
+/* Ends the digest and writes it as 64 lowercase hex characters and a NUL, so
+ * `cap` must be at least WFOTA_SHA256_HEX + 1. The state is finished after
+ * this and must be re-initialised before it is fed again. */
+void wfota_sha256_hex(wfota_sha256_t *s, char *out, size_t cap);
+
+typedef enum {
+    WFOTA_DL_OK = 0,
+    WFOTA_DL_ERR_LONG,     /* more bytes arrived than the manifest promised */
+    WFOTA_DL_ERR_SHORT,    /* the body stopped early - a dropped hotspot */
+    WFOTA_DL_ERR_SHA256,   /* the right number of bytes, and the wrong ones */
+} wfota_dl_err_t;
+
+/* Two words at most, for the same 135x240 panel. */
+const char *wfota_dl_err_str(wfota_dl_err_t err);
+
+typedef struct {
+    uint32_t       want;         /* the manifest's size, in bytes */
+    uint32_t       got;
+    int            shown;        /* the last percentage handed to the screen */
+    wfota_sha256_t sha;
+    char           want_sha[WFOTA_SHA256_HEX + 1];
+    char           got_sha[WFOTA_SHA256_HEX + 1];  /* filled in by _end() */
+    wfota_dl_err_t err;          /* sticky: a failed download stays failed */
+} wfota_dl_t;
+
+/* Starts a download of the image `m` names. The manifest is copied from, not
+ * held, so the caller may reuse it. */
+void wfota_dl_begin(wfota_dl_t *d, const wfota_manifest_t *m);
+
+/*
+ * Takes the next piece of the body. The caller writes those bytes to flash
+ * only when this returns WFOTA_DL_OK, which is what keeps a body longer than
+ * the manifest promised from ever reaching the slot - the length is checked
+ * before the write, not after it.
+ */
+wfota_dl_err_t wfota_dl_feed(wfota_dl_t *d, const void *data, size_t len);
+
+/*
+ * Closes the download: the body has to have been exactly as long as the
+ * manifest said and to hash to what it said. Call it before anything switches
+ * the boot partition, because after that the answer is a reboot away from
+ * mattering. Idempotent, and it leaves the digest it computed in `got_sha`,
+ * which is the thing worth putting in the log when it does not match.
+ */
+wfota_dl_err_t wfota_dl_end(wfota_dl_t *d);
+
+/* How far along, 0..100. */
+int wfota_dl_percent(const wfota_dl_t *d);
+/*
+ * The percentage to draw, or -1 when it has not moved since the last call.
+ * A repaint costs an SPI frame and the body arrives in pieces far smaller
+ * than a percent of it, so the screen is told once per whole number rather
+ * than once per chunk.
+ */
+int wfota_dl_step(wfota_dl_t *d);

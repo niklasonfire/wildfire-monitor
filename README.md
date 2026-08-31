@@ -206,7 +206,7 @@ nothing at all closes it.
 | Entry | What it does |
 | --- | --- |
 | `READOUT` | Wi-Fi access point, Captures over HTTP, back only by reboot |
-| `UPDATE` | joins a hotspot it knows and says what release is on offer |
+| `UPDATE` | joins a hotspot it knows and installs the published release |
 
 The menu will not open while a Capture is recording or connecting, and says so
 on the panel: both modes need the radio the Capture is using. See ADR-0006.
@@ -223,7 +223,8 @@ a frame and sixty seconds have passed. Anything else - a crash loop, a hang, a
 store that will not mount - and the next reset takes the bootloader back to the
 slot that worked. No Controller or BMS link is required, deliberately: updates
 happen with the bike switched off. `ota` on the console prints which slot is
-running and how far the check has got, and `info` names the slot too.
+running, how far the check has got and whether the last update was rolled
+back, and `info` names the slot too.
 
 Moving onto this table moved the capture store from `0x210000` to `0x3E0000`,
 so it reformats on the first boot after the change: **pull every Capture off
@@ -234,9 +235,24 @@ of.
 ## Update mode
 
 `UPDATE` on the menu joins a hotspot and reads the manifest of the newest
-release, so the panel says either `UP TO DATE` or the tag on offer, with the
-address it was given underneath. Downloading and installing the image is issue
-#28; nothing is written to flash by the check itself.
+release, so the panel says either `UP TO DATE` or the tag on offer. Nothing is
+installed on the strength of that: `A` accepts the tag and `B`, or ten seconds
+of nobody answering, declines it. Accepted, the image streams into the spare
+app slot behind a percentage on the panel, and the Monitor reboots into it.
+
+What the download checks, in this order, is what makes the reboot safe:
+
+* the slot written is the inactive one, never the running one;
+* every piece of the body is length-checked before it is written, so a server
+  sending more than the manifest said cannot put a byte of it into the slot;
+* the SHA-256 is complete and compared to the manifest **before** the boot
+  partition is switched, so an image that does not match never becomes
+  bootable;
+* the new image then comes up on probation and has to pass the health check
+  below, or the next reset takes the previous firmware back.
+
+A rollback is not silent: the firmware that comes back up says `ROLLED BACK` on
+the panel and `ota` prints which slot was abandoned.
 
 It shares readout mode's shape: Wi-Fi and NimBLE do not fit in this chip's RAM
 together, so BLE goes down when it starts and the way back to capturing is a
@@ -254,6 +270,7 @@ this repository, which is public:
 | `ota` | Slot, rollback health, the pin, and the URL the next check reads |
 | `ota pin <tag>` / `ota pin` | Read one release instead of `latest` / go back to `latest` |
 | `ota check` | Run the check from the console, without the menu |
+| `ota install` | Check and install without waiting for the button press - how this is exercised on the bench |
 
 The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
 the right kind of secret to keep on a bike, and it can be rotated on the

@@ -52,6 +52,16 @@ const char *ota_running_label(void);
 const char *ota_boot_label(void);
 /* The running image was still on probation when it came up. */
 bool     ota_health_on_probation(void);
+/*
+ * The other app slot holds an image the bootloader gave up on, which means
+ * the last thing installed never reached the gates above and this firmware is
+ * what it went back to. A rollback that nobody is told about is a rollback
+ * that looks like an update which quietly did nothing, so this is what the
+ * screen and the console say it with. It stays true until something is
+ * written into that slot again.
+ */
+bool        ota_health_rolled_back(void);
+const char *ota_rollback_label(void);   /* the abandoned slot, or "none" */
 /* Gates passed so far, as a mask of ota_gate_t. */
 uint32_t ota_health_gates(void);
 /* The check has completed: rollback cancelled, or nothing to cancel. */

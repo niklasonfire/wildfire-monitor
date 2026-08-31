@@ -141,9 +141,10 @@ static int cmd_info(int argc, char **argv)
 }
 
 /* Update mode from the console. Takes BLE down and blocks for as long as the
- * check runs, exactly as "wifi on" does, because it is the same one-way door;
- * main.c owns the sequence because the menu goes through it too. */
-static bool app_update_enter(void);
+ * check and any install run, exactly as "wifi on" does, because it is the same
+ * one-way door; main.c owns the sequence because the menu goes through it too.
+ * `install_now` is what replaces the button press the console cannot give. */
+static bool app_update_run(bool install_now);
 
 /*
  * The health check runs whether or not anything is on probation (see
@@ -155,7 +156,9 @@ static bool app_update_enter(void);
  * `ota pin <tag>` points the Monitor at one release instead of at `latest`,
  * and `ota pin` with no argument clears it. Because versions are compared for
  * inequality and never for order (ADR-0006), pinning an older tag is how a
- * suspect release is backed out without publishing anything.
+ * suspect release is backed out without publishing anything - and `ota
+ * install` is then what puts it on, which is the same operation as going
+ * forward.
  */
 static int cmd_ota(int argc, char **argv)
 {
@@ -168,13 +171,23 @@ static int cmd_ota(int argc, char **argv)
             return 1;
         }
     } else if (argc >= 2 && strcmp(argv[1], "check") == 0) {
-        if (!app_update_enter()) {
+        if (!app_update_run(false)) {
             printf("OTA error=check failed\n");
             return 1;
         }
         return 0;
+    } else if (argc >= 2 && strcmp(argv[1], "install") == 0) {
+        /* The menu's run without the button press nobody is there to give.
+         * This is how update mode gets exercised on the bench, where the
+         * Monitor is on a cable rather than on a handlebar - and it is the
+         * only path that ends in a reboot rather than in a return. */
+        if (!app_update_run(true)) {
+            printf("OTA error=install failed\n");
+            return 1;
+        }
+        return 0;
     } else if (argc >= 2) {
-        printf("usage: ota [pin [<tag>]|check]\n");
+        printf("usage: ota [pin [<tag>]|check|install]\n");
         return 1;
     }
 
@@ -192,6 +205,8 @@ static int cmd_ota(int argc, char **argv)
     printf("uptime_s   %lld of %d\n", esp_timer_get_time() / 1000000,
            OTA_HEALTH_UPTIME_S);
     printf("confirmed  %s\n", ota_health_confirmed() ? "yes" : "no");
+    printf("rollback   %s\n", ota_health_rolled_back()
+           ? ota_rollback_label() : "no");
     printf("pin        %s\n", otaup_pin_get(pin, sizeof(pin)) ? pin : "(latest)");
     printf("manifest   %s\n", otaup_manifest_url(url, sizeof(url)) ? url : "-");
     return 0;
@@ -207,7 +222,8 @@ static void register_commands(void)
         {.command = "info", .help = "Print chip, flash, MAC, BLE and heap info", .func = cmd_info},
         {.command = "sleep", .help = "Wait, so a script can let the board work: sleep <secs>", .func = cmd_sleep},
         {.command = "ota",
-         .help = "Slot, rollback health, and update mode: ota [pin [<tag>]|check]",
+         .help = "Slot, rollback health, and update mode: "
+                 "ota [pin [<tag>]|check|install]",
          .func = cmd_ota},
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -299,8 +315,9 @@ bool app_readout_enter(void)
  * It shares readout mode's shape (ADR-0006): BLE goes down so the radio is
  * free, the Monitor joins the strongest hotspot it knows, and the only way
  * back to capturing is a reboot. What it does with the link is one question -
- * is there something newer than this - and it answers it and stops. The
- * download and the install are issue #28.
+ * is the published version a different one from this - and if the rider then
+ * says so, it downloads that image into the spare app slot, checks it, and
+ * restarts into it on probation.
  *
  * The capture check is repeated rather than left to the menu because ADR-0006
  * asks update mode itself to refuse, exactly as readout mode does, and because
@@ -339,7 +356,92 @@ static const char *update_fail_line(otaup_err_t err)
     return "failed";
 }
 
-static bool app_update_enter(void)
+/* Runs on the install's own task, once per whole percent. Two lines because
+ * the percentage alone cannot tell a rider whether a stalled number means a
+ * slow hotspot or a stopped one; the byte count keeps moving until it does. */
+static void install_stage(int percent, uint32_t got, uint32_t want)
+{
+    char pct[8];
+    char of[24];
+
+    snprintf(pct, sizeof(pct), "%d%%", percent);
+    snprintf(of, sizeof(of), "%uk of %uk", (unsigned)(got / 1024),
+             (unsigned)(want / 1024));
+    ui_message("INSTALL", pct, of, NULL, NULL);
+}
+
+/* As with the check: which failure it was decides what the rider does next -
+ * move closer to the phone, look at what was published, or reach for the
+ * cable. The detail line carries the number that goes with it. */
+static const char *install_fail_line(otain_err_t err)
+{
+    switch (err) {
+    case OTAIN_ERR_STATE:  return "link gone";
+    case OTAIN_ERR_SLOT:   return "no slot";
+    case OTAIN_ERR_BEGIN:  return "slot failed";
+    case OTAIN_ERR_FETCH:  return "download cut";
+    case OTAIN_ERR_SIZE:   return "wrong size";
+    case OTAIN_ERR_SHA256: return "bad sha256";
+    case OTAIN_ERR_WRITE:  return "write failed";
+    case OTAIN_ERR_END:    return "bad image";
+    case OTAIN_ERR_BOOT:   return "boot refused";
+    case OTAIN_OK:         break;
+    }
+    return "failed";
+}
+
+/*
+ * Downloads and installs, and on success does not come back: the Monitor
+ * restarts into the new image, which then has sixty seconds and three gates
+ * to earn its place before the bootloader takes it away again (ota_health.c).
+ *
+ * A failure returns false with the message already up, and nothing retries:
+ * otadata still points at the running app, so the half-written slot is dead
+ * weight, and the rider - who is standing right here - decides whether the
+ * hotspot is worth another try (ADR-0006).
+ */
+static bool app_update_install(const wfota_manifest_t *m)
+{
+    otain_result_t res;
+
+    ui_message("INSTALL", "0%", NULL, NULL, NULL);
+    otain_err_t err = otaup_install(m, &res, install_stage);
+    if (err != OTAIN_OK) {
+        ESP_LOGE(TAG, "install %s: %s (%s)", m->version, otain_err_str(err),
+                 res.detail[0] ? res.detail : "-");
+        ui_message("INSTALL", install_fail_line(err),
+                   res.detail[0] ? res.detail : NULL, "not installed",
+                   "any: BACK");
+        return false;
+    }
+
+    ESP_LOGW(TAG, "installed %s into %s, %" PRIu32 " bytes, sha256 %s",
+             m->version, res.slot, res.written, res.sha256);
+    /* The reboot is the last thing rather than the thing that interrupts the
+     * message: the rider gets to read what was installed before the panel
+     * goes away, and a Monitor that restarts with no explanation is
+     * indistinguishable from one that crashed. */
+    ui_message("INSTALL", "DONE", m->version, "rebooting", NULL);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return true;                /* not reached */
+}
+
+/* Nothing installs without this. ADR-0006: never silent and never automatic -
+ * the rider chose update mode, and now chooses the image. A screen nobody
+ * answers falls away rather than installing by default, which is the same
+ * rule the menu itself follows. */
+static bool update_confirmed(void)
+{
+    board_btn_evt_t evt;
+
+    if (!board_btn_wait(&evt, MENU_IDLE_MS)) {
+        return false;
+    }
+    return evt.btn == BOARD_BTN_A_ID && evt.press == BOARD_PRESS_SHORT;
+}
+
+static bool app_update_run(bool install_now)
 {
     otaup_result_t res;
 
@@ -372,17 +474,49 @@ static bool app_update_enter(void)
          * same operation either way. */
         ESP_LOGI(TAG, "update mode: %s on offer, running %s",
                  res.manifest.version, res.running);
-        ui_message("UPDATE", "ON OFFER", res.manifest.version, res.ip,
-                   "any: BACK");
+        ui_message("UPDATE", "ON OFFER", res.manifest.version,
+                   install_now ? "installing" : res.ip,
+                   install_now ? NULL : "A: INSTALL  B: BACK");
+        /* This branch owns its own ending: the offer screen has already
+         * spent the rider's attention once, and a decline that then held the
+         * panel for a second timeout would read as a Monitor that had not
+         * understood the answer. */
+        bool go = install_now || update_confirmed();
+
+        if (go) {
+            /* Downloaded through the link otaup_check() deliberately left up.
+             * It returns only if the install did not happen; otherwise the
+             * Monitor is already restarting into the new image. */
+            if (app_update_install(&res.manifest)) {
+                return true;                /* not reached */
+            }
+            /* The message on the panel is the install's own. */
+            board_btn_evt_t seen;
+            (void)board_btn_wait(&seen, MENU_IDLE_MS);
+        } else {
+            ESP_LOGI(TAG, "update mode: %s was offered and not installed",
+                     res.manifest.version);
+        }
+        ui_message_clear();
+        otaup_stop();
+        return go ? false : (uerr == OTAUP_OK);
     }
 
     board_btn_evt_t evt;
     (void)board_btn_wait(&evt, MENU_IDLE_MS);
     ui_message_clear();
-    /* The link goes down with the screen. #28 is where it stays up, because
-     * that is the ticket with something to download through it. */
+    /* The link goes down with the screen. It is only kept up across the
+     * offer, which is the window in which there is something to download
+     * through it. */
     otaup_stop();
     return uerr == OTAUP_OK;
+}
+
+/* What the menu calls: the same run, with the confirmation the rider is
+ * standing there to give. */
+static bool app_update_enter(void)
+{
+    return app_update_run(false);
 }
 
 /* ---- the B menu ---------------------------------------------------------
@@ -509,6 +643,22 @@ static uint32_t s_markers;
 static void button_task(void *arg)
 {
     (void)arg;
+
+    /* ADR-0006: a rollback is the point of the two slots, and a rollback the
+     * rider is not told about looks exactly like an update that quietly did
+     * nothing. Said here rather than in app_main() because this is the task
+     * that owns the button queue, so the screen can be dismissed the way
+     * every other message screen is. */
+    if (ota_health_rolled_back()) {
+        board_btn_evt_t first;
+
+        ESP_LOGW(TAG, "came up on %s after a rollback from %s",
+                 ota_running_label(), ota_rollback_label());
+        ui_message("UPDATE", "ROLLED BACK", esp_app_get_description()->version,
+                   "update failed", "any: BACK");
+        (void)board_btn_wait(&first, MENU_IDLE_MS);
+        ui_message_clear();
+    }
 
     board_btn_evt_t evt;
     while (true) {

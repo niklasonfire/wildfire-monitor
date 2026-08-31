@@ -1,12 +1,14 @@
 /*
- * ota_update - update mode's radio half: join a hotspot, read the manifest.
+ * ota_update - update mode's radio half: join a hotspot, read the manifest,
+ * install the image.
  *
  * The Monitor stops listening, brings Wi-Fi up as a station, joins the
  * strongest of the networks it knows, fetches the four-field manifest from
  * the repository's newest release over HTTPS, and compares its `version` to
- * the running app's for inequality. Nothing is downloaded and nothing is
- * written to flash beyond the Wi-Fi list and the pin: installing the image is
- * issue #28.
+ * the running app's for inequality. If the rider then says so, it streams the
+ * image the manifest names into the inactive app slot, checks its length and
+ * its SHA-256 against the manifest, and only then points the bootloader at
+ * it. Whether it stays pointed there is main/ota_health.c's question.
  *
  * The shape is readout mode's (ADR-0006). Wi-Fi and NimBLE do not fit in this
  * chip's RAM together, so the caller takes BLE down first and the only way
@@ -72,6 +74,60 @@ bool otaup_running(void);
 
 /* A word for the console and the log, not a sentence for the panel. */
 const char *otaup_err_str(otaup_err_t err);
+
+/* ---- the install --------------------------------------------------------
+ *
+ * The half that cannot be undone from a handlebar, so the order it does
+ * things in is the whole design:
+ *
+ *   the inactive slot is chosen, never the running one;
+ *   the body is length-checked as it arrives, so nothing past the end of the
+ *     image is ever handed to esp_ota_write();
+ *   the SHA-256 is complete and compared before esp_ota_end(), and the boot
+ *     partition is switched only after both agree.
+ *
+ * Every failure before that last step leaves otadata alone, which is what
+ * makes a dropped hotspot harmless: the half-written slot is dead weight, the
+ * running app is still what boots, and the next attempt starts from zero.
+ * Nothing retries by itself (ADR-0006).
+ */
+typedef enum {
+    OTAIN_OK = 0,
+    OTAIN_ERR_STATE,      /* no link up, or no manifest to install */
+    OTAIN_ERR_SLOT,       /* no second app slot, or the image will not fit it */
+    OTAIN_ERR_BEGIN,      /* esp_ota_begin() refused - the slot would not erase */
+    OTAIN_ERR_FETCH,      /* TLS, an HTTP status, or the hotspot went away */
+    OTAIN_ERR_SIZE,       /* the body was not the length the manifest promised */
+    OTAIN_ERR_SHA256,     /* it was, and it is not the image named */
+    OTAIN_ERR_WRITE,      /* esp_ota_write() refused a block */
+    OTAIN_ERR_END,        /* esp_ota_end() refused: the slot holds no image */
+    OTAIN_ERR_BOOT,       /* otadata would not take the new slot */
+} otain_err_t;
+
+typedef struct {
+    char     slot[17];    /* the partition written - esp_partition_t's label */
+    uint32_t written;
+    char     sha256[WFOTA_SHA256_HEX + 1];  /* of what actually arrived */
+    char     detail[40];
+} otain_result_t;
+
+/* Called once per whole percent, on the install's own task. */
+typedef void (*otain_progress_fn)(int percent, uint32_t got, uint32_t want);
+
+/*
+ * Downloads and installs the image `m` names, and blocks for the minute or so
+ * that takes. Requires the station otaup_check() left joined.
+ *
+ * On OTAIN_OK the bootloader has been pointed at the new slot and nothing
+ * else has happened: the caller reboots, and the new image comes up on
+ * probation with main/ota_health.c's gates in front of it. It is deliberately
+ * not this function that restarts, because the rider should see what it did
+ * before the screen goes away.
+ */
+otain_err_t otaup_install(const wfota_manifest_t *m, otain_result_t *out,
+                          otain_progress_fn progress);
+
+const char *otain_err_str(otain_err_t err);
 
 /* ---- the pin ------------------------------------------------------------
  *

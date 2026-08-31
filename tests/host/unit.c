@@ -25,10 +25,12 @@
  *     a gap in the BMS stream, the sign convention and the persisted state all
  *     have to be driven with synthesised streams here instead.
  *
- *   - everything update mode does before it touches the radio. The manifests
+ *   - everything update mode does that is not the radio itself. The manifests
  *     that matter are the ones no release will ever publish - truncated,
- *     missing a field, an HTML error page - and none of them can be produced
- *     by cutting a release, so they are written out here instead.
+ *     missing a field, an HTML error page - and so are the downloads: the
+ *     body a dropped hotspot cut short, the one with a bit flipped in it, the
+ *     one longer than the image it claims to be. None of those can be
+ *     produced by cutting a release, so they are written out here instead.
  *
  * Same rules as the rest of main/wfdecode, main/wfest and main/wfota: pure
  * C99, no board, no fixtures.
@@ -4646,6 +4648,300 @@ static void test_a_network_we_do_not_know_is_never_joined(void)
           "an empty stored SSID matched something");
 }
 
+/* ---- the download ------------------------------------------------------- *
+ *
+ * The half of update mode that cannot be undone from a handlebar. Every case
+ * worth asserting is a failure - a hotspot that went away, a body that is not
+ * the length it said, a digest that does not match - and none of them can be
+ * produced by publishing a release, so they are synthesised here.
+ *
+ * The digest is pinned to FIPS 180-4 first, on the standard's own vectors.
+ * That test is what makes the ones after it worth anything: those build their
+ * expected digest with the same accumulator they then check, so on their own
+ * they would only prove it agrees with itself.
+ */
+
+static void check_digest(const void *data, size_t len, size_t chunk,
+                         const char *want, const char *what)
+{
+    wfota_sha256_t s;
+    char           got[WFOTA_SHA256_HEX + 1];
+    const char    *p = data;
+    size_t         left = len;
+
+    wfota_sha256_init(&s);
+    while (left > 0) {
+        size_t take = (left < chunk) ? left : chunk;
+        wfota_sha256_feed(&s, p, take);
+        p    += take;
+        left -= take;
+    }
+    wfota_sha256_hex(&s, got, sizeof(got));
+    CHECK(strcmp(got, want) == 0, "%s in %u-byte pieces: got %s", what,
+          (unsigned)chunk, got);
+}
+
+static void test_the_digest_is_the_one_fips_180_4_defines(void)
+{
+    static char million[1000000];
+    /* The three vectors in the standard, plus the empty string, which is the
+     * one that exercises the padding on its own. */
+    static const char *k_empty =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    static const char *k_abc =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    static const char *k_two_block =
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
+    static const char *k_million =
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+    const char *two_block =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    size_t i;
+
+    check_digest("", 0, 1, k_empty, "the empty message");
+    check_digest("abc", 3, 3, k_abc, "abc");
+    /* The same message in pieces of every awkward size: the accumulator holds
+     * a partial block between calls, and an image arrives in whatever lengths
+     * the HTTP client chose, none of them a multiple of 64. */
+    check_digest("abc", 3, 1, k_abc, "abc");
+    check_digest(two_block, 56, 56, k_two_block, "the two-block vector");
+    check_digest(two_block, 56, 1,  k_two_block, "the two-block vector");
+    check_digest(two_block, 56, 3,  k_two_block, "the two-block vector");
+    check_digest(two_block, 56, 64, k_two_block, "the two-block vector");
+    check_digest(two_block, 56, 65, k_two_block, "the two-block vector");
+
+    /* A megabyte, which is the order an image actually is, and the only
+     * vector that carries the 64-bit length field past a byte. */
+    for (i = 0; i < sizeof(million); i++) {
+        million[i] = 'a';
+    }
+    check_digest(million, sizeof(million), 1499, k_million, "a million bytes");
+}
+
+/* A manifest for a body this test just built. Everything but size and sha256
+ * is what release.sh would have written; those two are what the download
+ * checks against. */
+static void manifest_for(const void *body, uint32_t len, wfota_manifest_t *m)
+{
+    wfota_sha256_t s;
+
+    memset(m, 0, sizeof(*m));
+    snprintf(m->version, sizeof(m->version), "v0.2.0");
+    snprintf(m->url, sizeof(m->url), "%s", K_URL);
+    m->size = len;
+    wfota_sha256_init(&s);
+    wfota_sha256_feed(&s, body, len);
+    wfota_sha256_hex(&s, m->sha256, sizeof(m->sha256));
+}
+
+/* An image-shaped body: the first byte is the magic esp_ota_write insists on,
+ * and the rest is anything that is not all one value. */
+static void fake_image(char *buf, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        buf[i] = (char)(i * 31u + (i >> 8));
+    }
+    if (len > 0) {
+        buf[0] = (char)0xe9;
+    }
+}
+
+static void test_the_image_the_manifest_names_is_accepted(void)
+{
+    static char      image[9000];
+    wfota_manifest_t m;
+    wfota_dl_t       d;
+    size_t           off;
+
+    fake_image(image, sizeof(image));
+    manifest_for(image, (uint32_t)sizeof(image), &m);
+
+    wfota_dl_begin(&d, &m);
+    for (off = 0; off < sizeof(image); off += 1440) {
+        size_t take = sizeof(image) - off;
+        if (take > 1440) {
+            take = 1440;
+        }
+        CHECK(wfota_dl_feed(&d, image + off, take) == WFOTA_DL_OK,
+              "a piece of the image was refused at offset %u", (unsigned)off);
+    }
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_OK, "the published image was refused: %s",
+          wfota_dl_err_str(d.err));
+    CHECK_U(d.got, sizeof(image), "bytes taken");
+    CHECK(wfota_dl_percent(&d) == 100, "finished at %d%%", wfota_dl_percent(&d));
+    CHECK(strcmp(d.got_sha, m.sha256) == 0, "digest: got %s", d.got_sha);
+
+    /* Calling it twice is what happens when the caller logs the result and
+     * then tests it again; it must not become a failure the second time. */
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_OK, "the second _end() disagreed");
+}
+
+/* ADR-0006's dropped hotspot: otadata still points at the running app, so the
+ * half-written slot is dead weight - but only because this refuses it. */
+static void test_a_transfer_that_stops_early_is_refused(void)
+{
+    static char      image[9000];
+    wfota_manifest_t m;
+    wfota_dl_t       d;
+
+    fake_image(image, sizeof(image));
+    manifest_for(image, (uint32_t)sizeof(image), &m);
+
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, 5000) == WFOTA_DL_OK, "the first 5000 bytes");
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_ERR_SHORT,
+          "a body that stopped at 5000 of %u bytes was accepted",
+          (unsigned)sizeof(image));
+    /* One byte short is the same answer as half a body: the length is the
+     * manifest's, not a guess at what looks complete. */
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, sizeof(image) - 1) == WFOTA_DL_OK, "all but one");
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_ERR_SHORT, "one byte short was accepted");
+}
+
+/* The length is checked before the bytes are hashed, and the caller writes to
+ * flash only on WFOTA_DL_OK - so nothing past the end of the image can reach
+ * the slot, whatever the server decided to send. */
+static void test_a_body_longer_than_the_manifest_never_reaches_the_slot(void)
+{
+    static char      image[9000];
+    wfota_manifest_t m;
+    wfota_dl_t       d;
+
+    fake_image(image, sizeof(image));
+    manifest_for(image, (uint32_t)sizeof(image), &m);
+
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, sizeof(image)) == WFOTA_DL_OK, "the image");
+    CHECK(wfota_dl_feed(&d, image, 1) == WFOTA_DL_ERR_LONG,
+          "a byte after the end of the image was accepted");
+    CHECK_U(d.got, sizeof(image), "bytes taken past the refusal");
+
+    /* And the piece that crosses the end is refused whole, rather than being
+     * clipped to the part that fits: a slot with a partial block in it is
+     * exactly what esp_ota_write must never be handed. */
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, sizeof(image) - 10) == WFOTA_DL_OK, "most of it");
+    CHECK(wfota_dl_feed(&d, image, 200) == WFOTA_DL_ERR_LONG,
+          "a piece straddling the end was accepted");
+    CHECK_U(d.got, sizeof(image) - 10, "bytes taken from the straddling piece");
+}
+
+static void test_a_digest_that_does_not_match_is_refused(void)
+{
+    static char      image[9000];
+    wfota_manifest_t m;
+    wfota_dl_t       d;
+
+    fake_image(image, sizeof(image));
+    manifest_for(image, (uint32_t)sizeof(image), &m);
+
+    /* One flipped bit in the middle, the whole body still the right length:
+     * the case a size check on its own would install. */
+    image[4096] ^= 0x01;
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, sizeof(image)) == WFOTA_DL_OK, "the body");
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_ERR_SHA256,
+          "an image with one bit flipped was accepted");
+    CHECK(strcmp(d.got_sha, m.sha256) != 0, "the digests matched anyway");
+    CHECK(d.got_sha[0] != '\0',
+          "no digest was left to put in the log next to the expected one");
+
+    /* A manifest whose sha256 belongs to some other build - the same failure
+     * from the other side, and the one a mixed-up release produces. */
+    image[4096] ^= 0x01;
+    memset(m.sha256, 'a', WFOTA_SHA256_HEX);
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, sizeof(image)) == WFOTA_DL_OK, "the body");
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_ERR_SHA256,
+          "a manifest naming another image was accepted");
+}
+
+/* An image that cannot fit an app slot is refused where the manifest is read,
+ * three minutes before a download would have found out. WFOTA_IMAGE_MAX is
+ * the slot size in partitions.csv. */
+static void test_an_image_too_big_for_a_slot_is_refused(void)
+{
+    char buf[512];
+    char size[16];
+
+    snprintf(size, sizeof(size), "%u", (unsigned)WFOTA_IMAGE_MAX);
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, size, K_SHA);
+    check_parse(buf, WFOTA_OK, "an image exactly the size of a slot");
+
+    snprintf(size, sizeof(size), "%u", (unsigned)WFOTA_IMAGE_MAX + 1u);
+    one_field(buf, sizeof(buf), "v0.1.0", K_URL, size, K_SHA);
+    check_parse(buf, WFOTA_ERR_FIELD, "an image one byte over a slot");
+}
+
+/* The panel is repainted from the percentage, and a repaint is an SPI frame:
+ * once per whole number, in order, and never twice for the same one. */
+static void test_the_percentage_moves_once_per_whole_number(void)
+{
+    static char      image[10000];
+    wfota_manifest_t m;
+    wfota_dl_t       d;
+    int              seen[101];
+    int              last = -1;
+    size_t           off;
+    int              i;
+
+    fake_image(image, sizeof(image));
+    manifest_for(image, (uint32_t)sizeof(image), &m);
+    memset(seen, 0, sizeof(seen));
+
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_step(&d) == 0, "the first call did not offer 0%%");
+    for (off = 0; off < sizeof(image); off += 7) {
+        size_t take = sizeof(image) - off;
+        if (take > 7) {
+            take = 7;
+        }
+        (void)wfota_dl_feed(&d, image + off, take);
+
+        int pct = wfota_dl_step(&d);
+        if (pct < 0) {
+            continue;               /* still on the number already drawn */
+        }
+        CHECK(pct > last, "the percentage went from %d to %d", last, pct);
+        CHECK(pct >= 0 && pct <= 100, "the percentage left 0..100 at %d", pct);
+        if (pct >= 0 && pct <= 100) {
+            seen[pct]++;
+        }
+        last = pct;
+    }
+    CHECK(last == 100, "the transfer finished showing %d%%", last);
+    for (i = 0; i <= 100; i++) {
+        CHECK(seen[i] <= 1, "%d%% was drawn %d times", i, seen[i]);
+    }
+    /* Not asserted for every number: a body shorter than 100 pieces skips
+     * some, and skipping is fine. Repeating is not. */
+}
+
+/* ADR-0006: a failed download is left failed. Nothing here un-fails, because
+ * the recovery is the rider pressing the button again from the top, with a
+ * slot that gets erased before anything is written into it. */
+static void test_a_failed_download_stays_failed(void)
+{
+    static char      image[9000];
+    wfota_manifest_t m;
+    wfota_dl_t       d;
+
+    fake_image(image, sizeof(image));
+    manifest_for(image, (uint32_t)sizeof(image), &m);
+
+    wfota_dl_begin(&d, &m);
+    CHECK(wfota_dl_feed(&d, image, sizeof(image) + 1) == WFOTA_DL_ERR_LONG,
+          "an over-long first piece was accepted");
+    CHECK(wfota_dl_feed(&d, image, 1) == WFOTA_DL_ERR_LONG,
+          "a good piece after a refusal was taken");
+    CHECK(wfota_dl_end(&d) == WFOTA_DL_ERR_LONG,
+          "the download ended on something other than the failure it had");
+    CHECK_U(d.got, 0, "bytes taken after the refusal");
+}
+
 int main(void)
 {
     test_odo_metres();
@@ -4733,6 +5029,15 @@ int main(void)
     test_the_strongest_known_network_is_picked();
     test_a_network_we_do_not_know_is_never_joined();
 
+    test_the_digest_is_the_one_fips_180_4_defines();
+    test_the_image_the_manifest_names_is_accepted();
+    test_a_transfer_that_stops_early_is_refused();
+    test_a_body_longer_than_the_manifest_never_reaches_the_slot();
+    test_a_digest_that_does_not_match_is_refused();
+    test_an_image_too_big_for_a_slot_is_refused();
+    test_the_percentage_moves_once_per_whole_number();
+    test_a_failed_download_stays_failed();
+
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();
     test_a_version_3_blob_is_migrated();
@@ -4741,7 +5046,7 @@ int main(void)
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");
         return 1;
     }
-    printf("unit: odometer wrap, the power block, the estimator and the "
-           "manifest, all assertions hold\n");
+    printf("unit: odometer wrap, the power block, the estimator, the "
+           "manifest and the download, all assertions hold\n");
     return 0;
 }

@@ -1,6 +1,7 @@
 /* ota_update - see ota_update.h. */
 #include "ota_update.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,8 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -32,15 +35,24 @@ static const char *TAG = "otaup";
 #define JOIN_TIMEOUT_MS 20000
 #define HTTP_TIMEOUT_MS 15000
 /*
- * The check runs on a task of its own rather than on whichever task asked for
- * it. The TLS handshake wants several kilobytes of stack on top of the HTTP
- * client's own, and both callers - the button task at 4 KB and the console
- * REPL - have their stacks sized for something else entirely. A task with a
- * stack this file chooses is the only way that stays true when either caller
- * is resized.
+ * Neither the check nor the install runs on the task that asked for it. The
+ * TLS handshake wants several kilobytes of stack on top of the HTTP client's
+ * own, and both callers - the button task at 4 KB and the console REPL - have
+ * their stacks sized for something else entirely. A task with a stack this
+ * file chooses is the only way that stays true when either caller is resized.
  */
 #define CHECK_STACK     10240
 #define CHECK_PRIO      3
+/*
+ * The receive buffer for the image, which is also the header buffer, and it
+ * is the headers that size it: GitHub's redirect carries a
+ * Content-Security-Policy line of about 3.6 KB, and
+ * CONFIG_ESP_HTTP_CLIENT_STRICT_HEADER_BUFFER makes a header that does not
+ * fit an error rather than a truncation. Larger than the manifest fetch's
+ * only because every buffer-full here is an esp_ota_write() call, and there
+ * are a thousand of them.
+ */
+#define IMAGE_BUF       8192
 
 #define BIT_GOT_IP  BIT0
 #define BIT_FAILED  BIT1
@@ -512,30 +524,70 @@ static otaup_err_t run_check(otaup_result_t *r, otaup_progress_fn progress)
     return fetch_manifest(r);
 }
 
+/* ------------------------------------------------------- on our own task */
+
+typedef struct {
+    int             (*fn)(void *);
+    void             *arg;
+    int               rc;
+    SemaphoreHandle_t done;
+} job_t;
+
+static void job_task(void *arg)
+{
+    job_t *j = arg;
+
+    j->rc = j->fn(j->arg);
+    xSemaphoreGive(j->done);
+    vTaskDelete(NULL);
+}
+
+/* Runs `fn` on a task with the stack this file chose and waits for it. False
+ * only when the task could not be started, which is the one failure the
+ * caller has to have an answer of its own for. */
+static bool run_on_own_task(const char *name, int (*fn)(void *), void *arg,
+                            int *rc)
+{
+    job_t j = {.fn = fn, .arg = arg, .rc = 0, .done = NULL};
+
+    j.done = xSemaphoreCreateBinary();
+    if (j.done == NULL) {
+        return false;
+    }
+    if (xTaskCreate(job_task, name, CHECK_STACK, &j, CHECK_PRIO, NULL) != pdPASS) {
+        vSemaphoreDelete(j.done);
+        return false;
+    }
+    /* No timeout: every step inside has one of its own, and `j` lives on this
+     * stack, so returning while the task still holds it is not an option. */
+    xSemaphoreTake(j.done, portMAX_DELAY);
+    vSemaphoreDelete(j.done);
+    *rc = j.rc;
+    return true;
+}
+
 typedef struct {
     otaup_result_t   *result;
     otaup_progress_fn progress;
-    otaup_err_t       err;
-    SemaphoreHandle_t done;
 } check_ctx_t;
 
-static void check_task(void *arg)
+static int check_job(void *arg)
 {
     check_ctx_t *ctx = arg;
+    otaup_err_t  err = run_check(ctx->result, ctx->progress);
 
-    ctx->err = run_check(ctx->result, ctx->progress);
-    if (ctx->err != OTAUP_OK) {
+    if (err != OTAUP_OK) {
         /* Left failed, and left tidy: the radio goes back down so the failure
          * costs no heap while the rider reads the screen. */
         teardown();
     }
-    xSemaphoreGive(ctx->done);
-    vTaskDelete(NULL);
+    return (int)err;
 }
 
 otaup_err_t otaup_check(otaup_result_t *out, otaup_progress_fn progress)
 {
-    check_ctx_t ctx = {0};
+    check_ctx_t ctx;
+    int         rc = 0;
 
     if (out == NULL) {
         return OTAUP_ERR_STATE;
@@ -547,21 +599,245 @@ otaup_err_t otaup_check(otaup_result_t *out, otaup_progress_fn progress)
 
     ctx.result   = out;
     ctx.progress = progress;
-    ctx.err      = OTAUP_ERR_STATE;
-    ctx.done     = xSemaphoreCreateBinary();
-    if (ctx.done == NULL) {
+    if (!run_on_own_task("otacheck", check_job, &ctx, &rc)) {
         return OTAUP_ERR_WIFI;
     }
-    if (xTaskCreate(check_task, "otacheck", CHECK_STACK, &ctx, CHECK_PRIO,
-                    NULL) != pdPASS) {
-        vSemaphoreDelete(ctx.done);
-        return OTAUP_ERR_WIFI;
+    return (otaup_err_t)rc;
+}
+
+/* ---------------------------------------------------------- the install */
+
+typedef struct {
+    const wfota_manifest_t *m;
+    otain_result_t         *r;
+    otain_progress_fn       progress;
+    esp_ota_handle_t        handle;
+    bool                    open;       /* esp_ota_begin() succeeded */
+    esp_err_t               write_err;  /* what esp_ota_write() said, if it did */
+    wfota_dl_t              dl;
+} install_ctx_t;
+
+/*
+ * Every piece of the body, in the order it arrives. Two things happen here
+ * and their order is the point: the length is checked first, so the piece
+ * that would take the slot past the size the manifest promised is refused
+ * whole and never reaches flash, and only then is it written.
+ *
+ * Returning ESP_FAIL ends the transfer. Which failure it was is in the
+ * context, because the client reports only that the handler said no.
+ */
+static esp_err_t image_event(esp_http_client_event_t *evt)
+{
+    install_ctx_t *ic = (evt != NULL) ? evt->user_data : NULL;
+
+    if (evt == NULL || evt->event_id != HTTP_EVENT_ON_DATA || ic == NULL) {
+        return ESP_OK;
     }
-    /* No timeout: every step inside has one of its own, and ctx lives on this
-     * stack, so returning while the task still holds it is not an option. */
-    xSemaphoreTake(ctx.done, portMAX_DELAY);
-    vSemaphoreDelete(ctx.done);
-    return ctx.err;
+    /* Same rule as the manifest fetch: GitHub answers with a redirect to its
+     * object store and that redirect carries a body of its own. Only the body
+     * of the 200 is the image. */
+    if (esp_http_client_get_status_code(evt->client) != 200) {
+        return ESP_OK;
+    }
+    if (wfota_dl_feed(&ic->dl, evt->data, (size_t)evt->data_len) != WFOTA_DL_OK) {
+        return ESP_FAIL;
+    }
+    esp_err_t err = esp_ota_write(ic->handle, evt->data, (size_t)evt->data_len);
+    if (err != ESP_OK) {
+        ic->write_err = err;
+        return ESP_FAIL;
+    }
+
+    int pct = wfota_dl_step(&ic->dl);
+    if (pct >= 0 && ic->progress != NULL) {
+        ic->progress(pct, ic->dl.got, ic->dl.want);
+    }
+    return ESP_OK;
+}
+
+static otain_err_t install(install_ctx_t *ic)
+{
+    const wfota_manifest_t *m = ic->m;
+    otain_result_t         *r = ic->r;
+
+    if (!s_running || m == NULL) {
+        /* otaup_check() leaves the station joined precisely so that this can
+         * run through it; without that link there is nothing to download. */
+        return OTAIN_ERR_STATE;
+    }
+
+    /* The inactive slot, never the running one. This is the only call that
+     * knows which of ota_0 and ota_1 this firmware is not in, which is why
+     * the partition is asked for rather than named. */
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (part == NULL) {
+        snprintf(r->detail, sizeof(r->detail), "no spare slot");
+        return OTAIN_ERR_SLOT;
+    }
+    snprintf(r->slot, sizeof(r->slot), "%s", part->label);
+    /* wfota_manifest_parse() already refused anything over WFOTA_IMAGE_MAX;
+     * this asks the partition table on the board rather than the constant
+     * compiled into the image, because the two are allowed to disagree - a
+     * firmware built before a table change is exactly the firmware that would
+     * be installing over the air. */
+    if (m->size > part->size) {
+        snprintf(r->detail, sizeof(r->detail), "%u > %u bytes",
+                 (unsigned)m->size, (unsigned)part->size);
+        return OTAIN_ERR_SLOT;
+    }
+
+    ESP_LOGI(TAG, "installing %s into %s at 0x%06" PRIx32 ", %u bytes",
+             m->version, part->label, part->address, (unsigned)m->size);
+    ESP_LOGI(TAG, "GET %s", m->url);
+
+    /* The size is passed rather than OTA_SIZE_UNKNOWN so that exactly the
+     * space the image needs is erased: the whole 1.875 MB slot would be most
+     * of a minute of the rider's time, spent erasing flash nothing writes. */
+    esp_err_t err = esp_ota_begin(part, m->size, &ic->handle);
+    if (err != ESP_OK) {
+        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        return OTAIN_ERR_BEGIN;
+    }
+    ic->open = true;
+    wfota_dl_begin(&ic->dl, m);
+
+    esp_http_client_config_t cfg = {
+        .url                   = m->url,
+        .method                = HTTP_METHOD_GET,
+        .timeout_ms            = HTTP_TIMEOUT_MS,
+        /* ADR-0006: the bundle, never a pinned certificate. */
+        .crt_bundle_attach     = esp_crt_bundle_attach,
+        .event_handler         = image_event,
+        .user_data             = ic,
+        .buffer_size           = IMAGE_BUF,
+        .keep_alive_enable     = false,
+        /* The manifest's url is a github.com release asset, which redirects
+         * to the object store the bytes actually live in. */
+        .disable_auto_redirect = false,
+    };
+
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c == NULL) {
+        snprintf(r->detail, sizeof(r->detail), "no client");
+        return OTAIN_ERR_FETCH;
+    }
+    err = esp_http_client_perform(c);
+    int status = esp_http_client_get_status_code(c);
+    esp_http_client_cleanup(c);
+
+    r->written = ic->dl.got;
+
+    /* Read in the order that names the cause rather than the symptom: a
+     * handler that said no makes perform() fail too, so what the handler was
+     * unhappy about is asked first. */
+    if (ic->write_err != ESP_OK) {
+        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(ic->write_err));
+        return OTAIN_ERR_WRITE;
+    }
+    if (ic->dl.err == WFOTA_DL_ERR_LONG) {
+        snprintf(r->detail, sizeof(r->detail), "over %u bytes", (unsigned)m->size);
+        return OTAIN_ERR_SIZE;
+    }
+    if (err != ESP_OK) {
+        /* The dropped hotspot. Nothing here retries: otadata still points at
+         * the running app, so the slot is dead weight and the rider is the
+         * one who decides whether to try again (ADR-0006). */
+        snprintf(r->detail, sizeof(r->detail), "%s at %d%%", esp_err_to_name(err),
+                 wfota_dl_percent(&ic->dl));
+        return OTAIN_ERR_FETCH;
+    }
+    if (status != 200) {
+        snprintf(r->detail, sizeof(r->detail), "http %d", status);
+        return OTAIN_ERR_FETCH;
+    }
+
+    /*
+     * The digest, complete and compared, before anything makes this image
+     * bootable. A body that got this far and does not hash to what the
+     * manifest said is the one case a length check on its own would install.
+     */
+    wfota_dl_err_t derr = wfota_dl_end(&ic->dl);
+    snprintf(r->sha256, sizeof(r->sha256), "%s", ic->dl.got_sha);
+    if (derr == WFOTA_DL_ERR_SHORT) {
+        snprintf(r->detail, sizeof(r->detail), "%u of %u bytes",
+                 (unsigned)ic->dl.got, (unsigned)m->size);
+        return OTAIN_ERR_SIZE;
+    }
+    if (derr != WFOTA_DL_OK) {
+        ESP_LOGE(TAG, "sha256 %s, manifest says %s", ic->dl.got_sha, m->sha256);
+        snprintf(r->detail, sizeof(r->detail), "got %.16s", ic->dl.got_sha);
+        return OTAIN_ERR_SHA256;
+    }
+
+    /*
+     * esp_ota_end() checks the image's own header and checksum, so a block
+     * that reached flash wrong is caught here. That pairing is why the slot
+     * is not read back and hashed a second time: the streamed digest proves
+     * the bytes that arrived are the image, and this proves what is in the
+     * slot is something the bootloader will load.
+     */
+    err = esp_ota_end(ic->handle);
+    ic->open = false;               /* the handle is spent either way */
+    if (err != ESP_OK) {
+        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        return OTAIN_ERR_END;
+    }
+
+    /* The one irreversible line in this file, and the last one. */
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        return OTAIN_ERR_BOOT;
+    }
+
+    ESP_LOGW(TAG, "%s installed into %s: the next boot runs it on probation, "
+                  "and rolls back unless it passes the health check",
+             m->version, part->label);
+    return OTAIN_OK;
+}
+
+static int install_job(void *arg)
+{
+    install_ctx_t *ic  = arg;
+    otain_err_t    err = install(ic);
+
+    if (err != OTAIN_OK) {
+        /* Abandoning the write is what leaves otadata pointing at the running
+         * app: the slot keeps whatever half-image is in it, harmlessly, until
+         * the next attempt erases it again. */
+        if (ic->open) {
+            esp_ota_abort(ic->handle);
+            ic->open = false;
+        }
+        ESP_LOGE(TAG, "install: %s (%s)", otain_err_str(err),
+                 ic->r->detail[0] ? ic->r->detail : "-");
+        /* Left failed and left tidy, exactly as the check is. */
+        teardown();
+    }
+    return (int)err;
+}
+
+otain_err_t otaup_install(const wfota_manifest_t *m, otain_result_t *out,
+                          otain_progress_fn progress)
+{
+    install_ctx_t ic;
+    int           rc = 0;
+
+    if (out == NULL || m == NULL) {
+        return OTAIN_ERR_STATE;
+    }
+    memset(out, 0, sizeof(*out));
+    memset(&ic, 0, sizeof(ic));
+    ic.m         = m;
+    ic.r         = out;
+    ic.progress  = progress;
+    ic.write_err = ESP_OK;
+
+    if (!run_on_own_task("otainstall", install_job, &ic, &rc)) {
+        snprintf(out->detail, sizeof(out->detail), "no task");
+        return OTAIN_ERR_STATE;
+    }
+    return (otain_err_t)rc;
 }
 
 void otaup_stop(void)
@@ -590,6 +866,23 @@ const char *otaup_err_str(otaup_err_t err)
     case OTAUP_ERR_JOIN:      return "join failed";
     case OTAUP_ERR_FETCH:     return "fetch failed";
     case OTAUP_ERR_MANIFEST:  return "bad manifest";
+    }
+    return "unknown";
+}
+
+const char *otain_err_str(otain_err_t err)
+{
+    switch (err) {
+    case OTAIN_OK:          return "ok";
+    case OTAIN_ERR_STATE:   return "no link";
+    case OTAIN_ERR_SLOT:    return "no slot for it";
+    case OTAIN_ERR_BEGIN:   return "slot would not open";
+    case OTAIN_ERR_FETCH:   return "download failed";
+    case OTAIN_ERR_SIZE:    return "wrong size";
+    case OTAIN_ERR_SHA256:  return "wrong sha256";
+    case OTAIN_ERR_WRITE:   return "write refused";
+    case OTAIN_ERR_END:     return "not a valid image";
+    case OTAIN_ERR_BOOT:    return "otadata refused";
     }
     return "unknown";
 }
