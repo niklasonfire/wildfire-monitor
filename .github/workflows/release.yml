@@ -32,7 +32,9 @@ jobs:
             "$IDF_IMAGE" bash -lc '
               idf.py set-target esp32
               idf.py build
-              idf.py merge-bin -o "build/${APP_NAME}-${VERSION}-merged.bin"
+              # -o is resolved relative to the build dir (idf.py runs esptool there),
+              # so use a bare filename — it lands in build/.
+              idf.py merge-bin -o "${APP_NAME}-${VERSION}-merged.bin"
             '
 
       - name: Collect release assets
