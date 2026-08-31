@@ -698,10 +698,23 @@ static void advice_step(wf_est_t *e, uint32_t dt_ms)
 
     /* Saturating, because these only ever have to outgrow two constants and a
      * ride longer than a month of milliseconds must not wrap one of them back
-     * under a threshold. */
-    uint32_t hold = flipping ? e->advice_hold_ms + dt_ms : 0u;
-    uint32_t age  = e->advice_state_ms + dt_ms;
-    e->advice_hold_ms  = hold < e->advice_hold_ms ? 0xffffffffu : hold;
+     * under a threshold.
+     *
+     * The overflow test only applies to a counter that grew. A frame the
+     * condition did not hold on RESETS advice_hold_ms, and a reset is a
+     * decrease by construction - testing it for overflow would read the reset
+     * as a wrap and saturate the timer instead of clearing it, which is the
+     * one failure that would disable the arming outright: a saturated
+     * advice_hold_ms is permanently past WF_EST_ADVICE_ARM_MS, so the advice
+     * would appear on the first agreeing frame for the rest of the ride.
+     * advice_state_ms needs no such guard - it only ever grows. */
+    if (flipping) {
+        uint32_t hold = e->advice_hold_ms + dt_ms;
+        e->advice_hold_ms = hold < e->advice_hold_ms ? 0xffffffffu : hold;
+    } else {
+        e->advice_hold_ms = 0;
+    }
+    uint32_t age = e->advice_state_ms + dt_ms;
     e->advice_state_ms = age < e->advice_state_ms ? 0xffffffffu : age;
 
     if (!flipping) {

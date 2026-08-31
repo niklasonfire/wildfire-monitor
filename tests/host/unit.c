@@ -3919,6 +3919,103 @@ static void test_the_advice_does_not_flicker(void)
           (unsigned)shortest_hidden, (unsigned)WF_EST_ADVICE_ARM_MS);
 }
 
+/* THE ARMING IS A TIMER AND HAS TO BE RESETTABLE, which is a property the test
+ * above cannot see. Its two phases each hold the flip condition steady for
+ * minutes at a time, so an arming timer that never cleared would still produce
+ * the same episodes; what that test proves is that the advice does not follow
+ * the throttle, not that ten seconds of agreement were ever actually required.
+ *
+ * This one drives the case that separates them: agreement that keeps being
+ * interrupted. A rider on a low Pack works their way up from a speed the
+ * ladder has nothing to say about to one it does, with the throttle moving the
+ * way a throttle moves, so the cruise average sits on the ladder's own
+ * boundary for a couple of minutes and crosses it back and forth. Every one of
+ * those agreeing runs is shorter than WF_EST_ADVICE_ARM_MS, and none of them
+ * may put the row on the screen.
+ *
+ * The assertion is made against the condition rather than against a clock: the
+ * test recomputes the same pick the estimator makes, from the same figures it
+ * is shown, and requires that when the advice finally appears the condition
+ * had held without interruption for the full arming time. A timer that
+ * saturated instead of resetting - which is what an overflow test applied to
+ * the reset does - shows the advice one frame after an interruption, and this
+ * fails by 9800 ms. */
+static void test_the_advice_arms_only_on_unbroken_agreement(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    wf_est_set_curve(&e, &c);
+    feed_soc(&e, 0, 29.0);
+
+    const uint32_t ride_end = 20u * 60u * 1000u;
+    bool     seen = false, agreed_prev = false;
+    uint32_t run_t0 = 0, last_disagreed = 0;
+    long     runs = 0, short_runs = 0;
+
+    for (uint32_t t = SAMPLE_MS; t <= ride_end; t += SAMPLE_MS) {
+        /* A base speed climbing 30 to 46 km/h over the ride, with an
+         * eight-second +-9 km/h swing on it. The cruise average follows the
+         * base and jitters by about a km/h, which is what walks it across the
+         * boundary repeatedly instead of once. */
+        double base = 30.0 + 16.0 * (double)t / (double)ride_end;
+        double kmh  = base + (((t / 4000u) % 2u) ? 9.0 : -9.0);
+        /* The power frame first and the motion frame second, so that the
+         * snapshot below is the state the advice was decided on rather than
+         * one power block past it - the decision is taken at the end of the
+         * motion block. */
+        feed_power(&e, t, CONS_VOLTS, amps_on_curve(&c, kmh));
+        feed_speed(&e, t, kmh);
+
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        check_no_second_number(&o, "a rider on the boundary of the ladder");
+
+        /* The estimator's own question, asked again here from the figures the
+         * rider is being shown. While the advice is hidden this is exactly
+         * what advice_step() tests. */
+        wf_est_advice_t a;
+        bool agreed = o.range_valid && o.cruise_valid &&
+                      wf_est_advice_pick(&c, o.cruise_kmh, o.range_km,
+                                         o.usable_frac, &a);
+        if (agreed && !agreed_prev) {
+            run_t0 = t;
+        }
+        if (!agreed) {
+            if (agreed_prev) {
+                runs++;
+                if (t - run_t0 < WF_EST_ADVICE_ARM_MS) {
+                    short_runs++;
+                }
+            }
+            last_disagreed = t;
+        }
+        agreed_prev = agreed;
+
+        if (o.advice_valid) {
+            seen = true;
+            CHECK(t - last_disagreed >= WF_EST_ADVICE_ARM_MS,
+                  "the advice appeared after %u ms of agreement, under the "
+                  "%u ms of arming - the timer was not cleared by the %ld "
+                  "runs that came before it",
+                  (unsigned)(t - last_disagreed),
+                  (unsigned)WF_EST_ADVICE_ARM_MS, runs);
+            break;
+        }
+    }
+
+    CHECK(seen, "the advice never appeared, so the arming was never completed "
+                "and nothing here was tested");
+    /* And the ride really did interrupt the agreement, repeatedly, before it
+     * finally held. Without this the test above could pass on a ride that
+     * simply agreed once and armed. */
+    CHECK(short_runs >= 8,
+          "only %ld agreeing runs ended before the arming completed, so this "
+          "ride is not driving the reset", short_runs);
+}
+
 /* The hysteresis band on the low-Pack condition, driven directly rather than
  * inferred from a ride that never crosses back.
  *
@@ -4109,6 +4206,7 @@ int main(void)
     test_the_suggested_speed_is_holdable();
     test_the_advice_arrives_when_the_pack_is_low();
     test_the_advice_does_not_flicker();
+    test_the_advice_arms_only_on_unbroken_agreement();
     test_the_advice_holds_through_its_own_band();
     test_the_advice_retires_when_it_is_taken();
 
