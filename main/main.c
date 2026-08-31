@@ -306,7 +306,7 @@ bool app_readout_enter(void)
 /* Menu timings. Up here because the update screen below borrows the idle one:
  * a screen the rider walked away from should fall out of the way on the same
  * schedule wherever it came from. */
-#define MENU_IDLE_MS    10000   /* long enough to read two entries in a helmet */
+#define MENU_IDLE_MS    10000   /* long enough to read the list in a helmet */
 #define MENU_REFUSE_MS  2500    /* the refusal is a sentence, not a screen */
 #define MENU_LABEL_MAX  12      /* "> " plus the longest label, plus the NUL */
 
@@ -523,6 +523,81 @@ static bool app_update_enter(void)
     return app_update_run(false);
 }
 
+/* ---- the info page ------------------------------------------------------
+ *
+ * Which firmware is this? Until now the only answer was `ota` on the console,
+ * which needs the cable ADR-0006 exists to avoid - and the rider who most
+ * wants the answer is the one standing at the bike wondering whether the
+ * update they just ran is the thing now running. So this is the one menu
+ * entry that takes nothing down: no radio, no BLE shutdown, and no refusal
+ * while a Capture is recording, because reading a version costs the recording
+ * nothing.
+ *
+ * The version is a `git describe` string, so an untagged build reads
+ * "v0.1.0-1-gd6515cc-dirty" - 23 characters where the panel fits 22 at scale
+ * 1, and the message screen clips rather than wraps. A version that has
+ * quietly lost its "-dirty" is worse than no version at all, so it is split
+ * here: after a '-' where one falls within reach, so both halves read as
+ * pieces of one string rather than as a word cut in half. Two lines cover
+ * every case because esp_app_desc_t caps the version at 31 characters.
+ *
+ * The running slot goes under it. It is one line from the same API and it is
+ * the one thing the version does not say: the same tag reaches ota_0 over a
+ * cable and ota_1 over the air. Nothing else belongs here - this is a label,
+ * not the `ota` dump.
+ */
+#define INFO_COLS ((size_t)(DISP_W / DISP_CHAR_W(1)))   /* 22 at scale 1 */
+
+static bool app_info_enter(void)
+{
+    const char *ver = esp_app_get_description()->version;
+    size_t      len = strlen(ver);
+    size_t      cut = len;
+    char        v1[INFO_COLS + 1], v2[INFO_COLS + 1];
+    char        slot[INFO_COLS + 1];
+
+    if (len > INFO_COLS) {
+        cut = INFO_COLS;        /* the fallback: a break mid-token still reads */
+        /* Back from the last character that fits, looking for a '-' to break
+         * after, and no further back than leaves a tail that still fits. */
+        for (size_t i = INFO_COLS; i > 0 && len - i <= INFO_COLS; i--) {
+            if (ver[i - 1] == '-') {
+                cut = i;
+                break;
+            }
+        }
+    }
+    snprintf(v1, sizeof(v1), "%.*s", (int)cut, ver);
+    snprintf(v2, sizeof(v2), "%s", ver + cut);
+    snprintf(slot, sizeof(slot), "slot %s", ota_running_label());
+
+    /* Packed rather than placed: draw_message() holds a line's y position even
+     * when it is empty, so a short version that needs no second line must not
+     * leave a gap where the wrap would have been. */
+    const char *line[3] = {v1, NULL, NULL};
+    int         n = 1;
+
+    if (v2[0]) {
+        line[n++] = v2;
+    }
+    line[n] = slot;
+    ui_message("INFO", line[0], line[1], line[2], "any: BACK");
+    ESP_LOGI(TAG, "info: %s from %s", ver, ota_running_label());
+
+    board_btn_evt_t evt;
+    if (!board_btn_wait(&evt, MENU_IDLE_MS)) {
+        /* Nobody is reading it: fall out of the way on the menu's own
+         * schedule, and do not put the menu back in front of an absent
+         * rider. */
+        ui_message_clear();
+        return true;
+    }
+    /* Dismissed by hand, so the rider is still there and the menu is where
+     * they were. menu_run() paints straight over this screen, so there is
+     * nothing to clear first. */
+    return false;
+}
+
 /* ---- the B menu ---------------------------------------------------------
  *
  * Two buttons cannot carry a gesture per mode, so held-B stopped being the
@@ -546,19 +621,31 @@ static bool app_update_enter(void)
 typedef struct {
     const char *label;
     bool      (*enter)(void);   /* true once the panel is somebody else's */
+    /* A page hands the panel back rather than keeping it, so a false from one
+     * means "the rider dismissed it" and the menu returns. The flag is what
+     * keeps that reading off the modes: readout mode returns false when it
+     * failed, with its own screen up and BLE already spent, and painting the
+     * menu over that would hide the only explanation there is. */
+    bool        page;
 } menu_entry_t;
 
 static const menu_entry_t s_menu[] = {
-    {"READOUT", app_readout_enter},
-    {"UPDATE",  app_update_enter},
+    {"READOUT", app_readout_enter, false},
+    {"UPDATE",  app_update_enter,  false},
+    {"INFO",    app_info_enter,    true},
 };
 #define MENU_COUNT ((int)(sizeof(s_menu) / sizeof(s_menu[0])))
 
 /* The message screen takes four lines, and the fourth is the button hint, so
- * three entries is the ceiling before this needs a scrolling window. The
- * two-character cursor prefix also keeps every row at the same text scale:
- * fit_scale() in ui.c drops from 3 to 2 above seven characters, so a short
- * label and a long one would otherwise be drawn at different sizes. */
+ * three entries is the ceiling before this needs a scrolling window - and
+ * INFO is the third. A fourth entry is not a table edit: it is a scrolling
+ * window, or a second screen, and the assert is here to make that a decision
+ * rather than a surprise on the panel.
+ *
+ * The rows are padded to a common width for the same reason the cursor is two
+ * characters wide: fit_scale() in ui.c drops from 3 to 2 above seven
+ * characters, so "> INFO" would be drawn half again as large as "> READOUT"
+ * sitting under it. */
 _Static_assert(MENU_COUNT <= 3, "the message screen has three lines for entries");
 
 static void menu_draw(int sel)
@@ -567,7 +654,7 @@ static void menu_draw(int sel)
     const char *line[3] = {NULL, NULL, NULL};
 
     for (int i = 0; i < MENU_COUNT; i++) {
-        snprintf(row[i], sizeof(row[i]), "%c %s", i == sel ? '>' : ' ',
+        snprintf(row[i], sizeof(row[i]), "%c %-7s", i == sel ? '>' : ' ',
                  s_menu[i].label);
         line[i] = row[i];
     }
@@ -613,11 +700,15 @@ static void menu_run(void)
 
         case BOARD_BTN_A_ID:
             if (evt.press == BOARD_PRESS_SHORT) {
-                /* Whichever entry this is, the menu is over: the mode it
-                 * starts owns the panel from here - readout mode never gives
-                 * it back, and a failure has its own screen to show. */
-                (void)s_menu[sel].enter();
-                return;
+                /* For a mode the menu is over: the one it starts owns the
+                 * panel from here - readout mode never gives it back, and a
+                 * failure has its own screen to show. A page that the rider
+                 * dismissed is the one case that comes back to the list, so
+                 * INFO does not cost a second long-press of B to leave. */
+                if (s_menu[sel].enter() || !s_menu[sel].page) {
+                    return;
+                }
+                menu_draw(sel);
             }
             break;
 
@@ -638,9 +729,10 @@ leave:
 /* ---- buttons ------------------------------------------------------------
  *
  * A is the whole capture workflow - scan, start, stop - because it is the one
- * button a rider can find with a glove on. B is the display and, held, the
- * menu. PWR short is otherwise idle time on a button already under the thumb
- * for power-off, so it toggles the live telemetry screen.
+ * button a rider can find with a glove on. B is the Marker while a Capture is
+ * recording and, held, the menu, and nothing at all otherwise. PWR short is
+ * otherwise idle time on a button already under the thumb for power-off, so
+ * it toggles the live telemetry screen.
  */
 static uint32_t s_markers;
 
@@ -675,9 +767,6 @@ static void button_task(void *arg)
              * get the firmware back into a state that can. */
             if (evt.btn == BOARD_BTN_A_ID) {
                 esp_restart();
-            }
-            if (evt.btn == BOARD_BTN_B_ID) {
-                disp_backlight(!disp_backlight_get());
             }
             continue;
         }
@@ -727,17 +816,18 @@ static void button_task(void *arg)
             } else if (cap_state() == CAP_RECORDING) {
                 /* While recording, B is the marker: the rider rides a defined
                  * manoeuvre and stamps it, which is what turns a stream of
-                 * undecoded bytes into labelled sections. The backlight is not
-                 * worth the button here - a marker is. */
+                 * undecoded bytes into labelled sections. */
                 char text[32];
                 snprintf(text, sizeof(text), "marker %" PRIu32, ++s_markers);
                 cap_marker(text);
-            } else {
-                /* The backlight is the biggest single draw on this board, so
-                 * turning it off is what makes a long ride possible. */
-                disp_backlight(!disp_backlight_get());
-                ui_redraw();
             }
+            /* And otherwise nothing, deliberately. B-short used to toggle the
+             * backlight, which put an unlit panel one accidental press away
+             * from a rider who then had no way of knowing the Monitor was
+             * still alive - and the same press is the Marker as soon as a
+             * Capture starts, so the button meant two unrelated things. The
+             * backlight is still `disp on|off` on the console, where nothing
+             * brushes against it. */
             break;
 
         case BOARD_BTN_PWR_ID:

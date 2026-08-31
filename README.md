@@ -197,16 +197,25 @@ flashed image is running.
 
 ## The button menu
 
-A is the capture workflow - scan, start, stop - and short B is the backlight,
-or a Marker while a Capture is recording. Holding B opens a menu instead of
-going straight to readout mode as it used to: B cycles the entries, A picks
-one, and holding B again, a short press of the power button, or ten seconds of
-nothing at all closes it.
+A is the capture workflow - scan, start, stop - and short B is a Marker while
+a Capture is recording, and nothing otherwise. It used to toggle the backlight
+and no longer does: an unlit panel was one stray press away, and the same
+press means Marker as soon as a Capture starts. The backlight is `disp on|off`
+on the console. Holding B opens a menu instead of going straight to readout
+mode as it used to: B cycles the entries, A picks one, and holding B again, a
+short press of the power button, or ten seconds of nothing at all closes it.
 
 | Entry | What it does |
 | --- | --- |
 | `READOUT` | Wi-Fi access point, Captures over HTTP, back only by reboot |
 | `UPDATE` | joins a hotspot it knows and installs the published release |
+| `INFO` | the running firmware version and app slot; any key goes back |
+
+`INFO` is the one entry that takes nothing down - no radio, no BLE shutdown,
+and no refusal while a Capture is recording - so the version can be read on
+the bike without a cable. A `git describe` version is wider than the panel, so
+it is wrapped at a `-` rather than clipped, which is what keeps a `-dirty` on
+screen.
 
 The menu will not open while a Capture is recording or connecting, and says so
 on the panel: both modes need the radio the Capture is using. See ADR-0006.
