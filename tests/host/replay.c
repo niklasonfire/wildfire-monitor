@@ -17,11 +17,23 @@
  *
  *   ./replay [fixture-dir]           default: tests/fixtures
  *   ./replay --fields <capture.wfl>  every generated field of every record
+ *   ./replay --samples [capture-dir] Consumption against speed, segment by
+ *                                    segment, for scripts/fit_consumption.py
  *
  * The second mode is the other half of ADR-0002. It prints what the generated
  * C decoder makes of every record, in a canonical form the generated Python
  * decoder prints identically, so tests/test_field_table.py can assert the
  * two languages agree byte for byte rather than by inspection.
+ *
+ * The third mode is the same argument one level up, for main/wfest. Issue #19
+ * fits Consumption against speed across the archive, and the obvious way to do
+ * that - walk the Captures in Python and integrate energy and distance there -
+ * would put a second energy-and-distance integrator in the project, beside the
+ * one ADR-0004 spent four tickets making single-source. So the integration
+ * stays where it is: this mode replays a Capture through the real wf_est_*
+ * code and prints DIFFERENCES of the estimator's own totals over short spans
+ * of road. The fitting tool consumes those and does arithmetic no heavier than
+ * a 2x2 solve. One integrator, and the tool stays a curve fitter.
  *
  * Every Capture also goes through main/wfest, the estimation seam, and the
  * whole Remaining Energy curve is hashed. Each fixture is replayed twice and
@@ -80,6 +92,69 @@ static const metric_t *find(const metrics_t *ms, const char *name)
     }
     return NULL;
 }
+
+/* ------------------------------------------ Consumption samples, for #19
+ *
+ * WHAT A SAMPLE IS. One short span of road, described by four numbers the
+ * estimator already holds: how long it took, how far it went, how much energy
+ * left the Pack over it, and how fast the bike was going. Nothing here
+ * integrates anything. `distance_m` and `alltime_wh` are read out of
+ * wf_est_out_t at the two ends of the span and subtracted, so the metres are
+ * the fused Distance the rider watches and the watt-hours are the same
+ * numerator Consumption's own window divides - see ADR-0004. A second
+ * integrator written in Python would have been a second answer to a question
+ * this project has one answer to.
+ *
+ * WHY A SPAN OF ROAD AND NOT A SPAN OF TIME. The quantity being fitted is
+ * energy per unit DISTANCE, so a fixed distance makes every sample carry the
+ * same weight in its own denominator; a fixed time would weight fast riding
+ * more heavily than slow riding for no reason but the clock. SEG_M is the
+ * estimator's own bucket, WF_EST_CONS_BUCKET_M, which is the finest cut of
+ * road anything downstream of Consumption already reasons about.
+ *
+ * WHY THERE IS A TIME CAP TOO. A stationary bike never covers 50 m, so
+ * without one the segment would stay open across a coffee stop and come out
+ * as a single sample averaging the stop with the riding. SEG_MAX_MS closes it
+ * anyway and marks it `time`, which is what the fitting tool drops as
+ * stationary. The pair is also the crawl threshold said as a fraction:
+ * 50 m in 30 s is 6 km/h, and anything slower than that cannot close a
+ * segment on distance at all.
+ *
+ * WHAT IS NOT DECIDED HERE. Whether a segment is fit to fit on. This prints
+ * every segment it closes, with the facts that decide it - how it closed, the
+ * longest gap in the Controller's stream inside it, how many frames arrived
+ * with a live block invalid, and the spread of instantaneous speed across it
+ * - and scripts/fit_consumption.py applies the acceptance rules. Extraction
+ * is a property of the recording; acceptance is a judgement about the fit,
+ * and the judgement is where the tests for it live.
+ */
+#define WF_SAMPLE_SEG_M       WF_EST_CONS_BUCKET_M
+#define WF_SAMPLE_SEG_MAX_MS  30000u
+
+/* Where samples go, and under what name. NULL through replay() means this
+ * run is one of the assertion runs and prints nothing. */
+typedef struct {
+    FILE       *out;
+    const char *name;
+} sample_cfg_t;
+
+typedef struct {
+    bool     open;
+    uint32_t t0_ms;
+    double   dist0_m;
+    double   wh0;
+    /* Instantaneous decoded speed across the span. The fitting tool needs the
+     * spread and not just the mean: Wh/km = a + c*v^2 is a steady-state force
+     * balance, and a span the bike accelerated across put some of its energy
+     * into kinetic energy rather than into drag. */
+    double   min_kmh, max_kmh;
+    long     speed_samples;
+    uint32_t gap_ms;      /* longest Controller record gap inside the span */
+    long     invalid;     /* frames whose motion or power block was not valid */
+    long     emitted;
+    uint32_t prev_ctrl_t_ms;
+    bool     prev_ctrl_valid;
+} seg_t;
 
 /* --------------------------------------------------------------- the run */
 
@@ -195,6 +270,10 @@ typedef struct {
      * this run. See power_cycle() and the criterion it exists for. */
     long     records;
     bool     cycled;
+    /* The Consumption sampler. `smp` is NULL on every run but the one
+     * --samples asked for, and then none of this moves. */
+    const sample_cfg_t *smp;
+    seg_t    seg;
 } run_t;
 
 /* FNV-1a over the raw bytes of every point on the curve. The comparison is
@@ -240,12 +319,122 @@ static void dist_point(run_t *r, double m)
     r->dist_points++;
 }
 
+/* ------------------------------------------------ the Consumption sampler */
+
+/* Opens a span at this instant, remembering the two totals it will be the
+ * difference of. */
+static void seg_open(run_t *r, const wf_est_out_t *o)
+{
+    seg_t *s = &r->seg;
+    s->open          = true;
+    s->t0_ms         = r->duration_ms;
+    s->dist0_m       = o->distance_m;
+    s->wh0           = o->alltime_wh;
+    s->min_kmh       = 0.0;
+    s->max_kmh       = 0.0;
+    s->speed_samples = 0;
+    s->gap_ms        = 0;
+    s->invalid       = 0;
+}
+
+/* One line per closed span. Everything on it is either a difference of two
+ * estimator outputs or a count of what arrived in between; nothing on it is a
+ * verdict. `closed` says why the span ended - `dist` when it covered its road,
+ * `time` when it ran out of patience waiting, `eof` when the Capture did. */
+static void seg_emit(run_t *r, const wf_est_out_t *o, const char *closed)
+{
+    seg_t *s = &r->seg;
+    uint32_t dt_ms  = r->duration_ms - s->t0_ms;
+    double   dist_m = o->distance_m - s->dist0_m;
+    double   wh     = o->alltime_wh - s->wh0;
+    /* The mean over the span, from the same metres and the same clock the two
+     * halves of Wh/km came from - not an average of the instantaneous
+     * readings, which would be a different bike's speed from the distance. */
+    double mean_kmh = (dt_ms > 0) ? dist_m / ((double)dt_ms / 1000.0) * 3.6
+                                  : 0.0;
+    fprintf(r->smp->out,
+            "sample %s %s %u %u %.6f %.6f %.4f %.4f %.4f %ld %u %ld\n",
+            r->smp->name, closed, (unsigned)s->t0_ms, (unsigned)r->duration_ms,
+            dist_m, wh, mean_kmh, s->min_kmh, s->max_kmh, s->speed_samples,
+            (unsigned)s->gap_ms, s->invalid);
+    s->emitted++;
+    s->open = false;
+}
+
+/* Called after every record the estimator was fed. Closes the open span when
+ * it has covered its road or run out of time, and opens the next one at the
+ * same instant so no metre of the ride falls between two spans. */
+static void seg_step(run_t *r, const wf_est_out_t *o)
+{
+    seg_t *s = &r->seg;
+    if (!o->distance_valid) {
+        /* Nothing has said how far the bike has gone yet, so there is no
+         * denominator to open a span on. */
+        return;
+    }
+    if (!s->open) {
+        seg_open(r, o);
+        return;
+    }
+    if (o->distance_m - s->dist0_m >= WF_SAMPLE_SEG_M) {
+        seg_emit(r, o, "dist");
+        seg_open(r, o);
+        return;
+    }
+    if ((uint32_t)(r->duration_ms - s->t0_ms) >= WF_SAMPLE_SEG_MAX_MS) {
+        seg_emit(r, o, "time");
+        seg_open(r, o);
+    }
+}
+
+/* Called on every Controller record, before the estimator is fed it: the two
+ * things a span has to know about the link it was recorded over.
+ *
+ * A gap longer than WF_EST_DT_MAX_MS is the estimator's own definition of a
+ * link that dropped - it is the point at which wfest stops booking metres and
+ * watt-hours at the last reading it saw - so a span containing one is a span
+ * whose distance came partly from the Odometer catching up afterwards and
+ * whose energy is missing whatever was drawn during it. Both halves of Wh/km
+ * are wrong there, and in the same direction as each other only by luck. */
+static void seg_note_ctrl(run_t *r, bool motion_frame)
+{
+    seg_t *s = &r->seg;
+    if (s->prev_ctrl_valid) {
+        uint32_t gap = r->duration_ms - s->prev_ctrl_t_ms;
+        if (s->open && gap > WF_EST_DT_MAX_MS && gap > s->gap_ms) {
+            s->gap_ms = gap;
+        }
+    }
+    s->prev_ctrl_t_ms  = r->duration_ms;
+    s->prev_ctrl_valid = true;
+    if (!s->open) {
+        return;
+    }
+    if (!r->live.speed_valid || !r->live.power_valid) {
+        s->invalid++;
+        return;
+    }
+    if (motion_frame) {
+        double v = (double)r->live.cur_speed_kmh;
+        if (s->speed_samples == 0 || v < s->min_kmh) {
+            s->min_kmh = v;
+        }
+        if (s->speed_samples == 0 || v > s->max_kmh) {
+            s->max_kmh = v;
+        }
+        s->speed_samples++;
+    }
+}
+
 /* Sampled after every record the estimator was fed, so the curve is what the
  * live screen would have shown at each of those instants. */
 static void est_sample(run_t *r)
 {
     wf_est_out_t o;
     wf_est_get(&r->est, &o);
+    if (r->smp != NULL) {
+        seg_step(r, &o);
+    }
     if (o.sag_v > r->sag_v_max) {
         r->sag_v_max = o.sag_v;
     }
@@ -489,10 +678,11 @@ static void power_cycle(run_t *r)
 }
 
 /* cycle_at is the record index to simulate a power cycle before, or 0 for a
- * run with no break in it. */
+ * run with no break in it. smp is NULL unless this run is printing Consumption
+ * samples, which is --samples and nothing else. */
 static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
                    const odo_synth_t *synth, const cell_synth_t *cells,
-                   long cycle_at)
+                   long cycle_at, const sample_cfg_t *smp)
 {
     wfl_reader_t rd;
     if (!wfl_open(&rd, buf, len, hdr)) {
@@ -501,6 +691,7 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
     }
 
     run_init(r);
+    r->smp = smp;
     unsigned odo_tick = 0;
     uint8_t scratch[WF_CTRL_FRAME_LEN];
     uint8_t bms_scratch[BMS_MAX_FRAME];
@@ -563,6 +754,9 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
                 if (r->live.line_current_a > r->ctrl_current_a_max) {
                     r->ctrl_current_a_max = r->live.line_current_a;
                 }
+            }
+            if (r->smp != NULL) {
+                seg_note_ctrl(r, motion_frame);
             }
             /* Exactly what main/capture.c does on the bike, in the same place:
              * decode, then hand the decoded state and the record's own
@@ -708,6 +902,16 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
             r->other_records++;
             break;
         }
+    }
+
+    /* The span the Capture ended in the middle of. Printed rather than
+     * dropped, so that the count of segments in the summary line accounts for
+     * every metre of the ride; `eof` is not `dist`, so the fitting tool does
+     * not fit on it. */
+    if (r->smp != NULL && r->seg.open) {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        seg_emit(r, &o, "eof");
     }
 }
 
@@ -1579,8 +1783,107 @@ static void report(const wflog_hdr_t *h, const run_t *r)
     }
 }
 
+/* `tests/fixtures/cap0007.wfl` -> `cap0007`. The identity a sample carries
+ * into the fit's provenance: short enough to read in a report, stable across
+ * machines, and the name the fixture README already calls the ride by. */
+static void capture_name(const char *path, char *out, size_t cap)
+{
+    const char *base = strrchr(path, '/');
+    base = (base != NULL) ? base + 1 : path;
+    size_t len = strlen(base);
+    if (len > 4 && strcmp(base + len - 4, ".wfl") == 0) {
+        len -= 4;
+    }
+    if (len >= cap) {
+        len = cap - 1;
+    }
+    memcpy(out, base, len);
+    out[len] = '\0';
+}
+
+/* --samples: every Capture in the directory, as spans of road the fitting
+ * tool can regress. The archive is discovered the same way the fixtures are,
+ * so a new Capture is a file dropped in and no change to any code - which is
+ * an acceptance criterion of #19 and is met by not writing a list anywhere. */
+static int samples_main(const char *dir)
+{
+    char **paths;
+    int n = list_fixtures(dir, &paths);
+    if (n < 0) {
+        return 2;
+    }
+
+    printf("# wf-samples 1\n");
+    printf("# Consumption samples out of main/wfest, one span of road each.\n");
+    printf("# Produced by tests/host/replay.c --samples; read by "
+           "scripts/fit_consumption.py.\n");
+    printf("# span closes at %.0f m of Distance or %.0f s, whichever comes "
+           "first.\n", (double)WF_SAMPLE_SEG_M,
+           WF_SAMPLE_SEG_MAX_MS / 1000.0);
+    printf("# sample <capture> <closed> <t0_ms> <t1_ms> <dist_m> <energy_wh> "
+           "<mean_kmh> <min_kmh> <max_kmh> <speed_samples> <gap_ms> "
+           "<invalid>\n");
+    printf("# capture <capture> <records> <duration_ms> <distance_m> "
+           "<energy_wh> <speed_kmh_max> <segments>\n");
+
+    int rc = 0;
+    for (int i = 0; i < n; i++) {
+        size_t len = 0;
+        uint8_t *buf = slurp(paths[i], &len);
+        if (buf == NULL) {
+            /* Stop, and stop loudly. A Capture that cannot be read leaves a
+             * samples file that is missing a ride without saying so, and a
+             * fit taken over it would carry provenance naming an archive it
+             * did not actually see. The non-zero exit is what makes
+             * scripts/fit_consumption.py refuse the whole run rather than
+             * regress what did get printed. */
+            fprintf(stderr, "%s cannot be read\n", paths[i]);
+            rc = 2;
+            break;
+        }
+        char name[64];
+        capture_name(paths[i], name, sizeof(name));
+
+        const odo_synth_t  off     = { .on = false, .start = 0 };
+        const cell_synth_t no_weak = { .on = false, .index = 0, .drop_mv = 0 };
+        const sample_cfg_t cfg     = { .out = stdout, .name = name };
+        wflog_hdr_t hdr;
+        run_t r;
+        replay(buf, len, &hdr, &r, &off, &no_weak, 0, &cfg);
+
+        wf_est_out_t o;
+        wf_est_get(&r.est, &o);
+        /* Printed for every Capture, including one that produced no sample at
+         * all. A ride that contributed nothing is a fact about the archive
+         * and belongs in the fit's provenance next to the rides that did. */
+        printf("capture %s %ld %u %.3f %.6f %.4f %ld\n",
+               name, r.records, (unsigned)r.duration_ms, o.distance_m,
+               o.alltime_wh, r.speed_kmh_max, r.seg.emitted);
+
+        free(buf);
+        free(paths[i]);
+        paths[i] = NULL;
+    }
+    /* Every path, not just the ones walked: the loop above may have stopped
+     * early. free(NULL) is a no-op, so the ones already released are safe to
+     * name again. */
+    for (int i = 0; i < n; i++) {
+        free(paths[i]);
+    }
+    free(paths);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "--samples") == 0) {
+        if (argc > 3) {
+            fprintf(stderr, "usage: replay --samples [capture-dir]\n");
+            return 2;
+        }
+        return samples_main(argc == 3 ? argv[2] : "tests/fixtures");
+    }
+
     if (argc > 1 && strcmp(argv[1], "--fields") == 0) {
         if (argc != 3) {
             fprintf(stderr, "usage: replay --fields <capture.wfl>\n");
@@ -1623,7 +1926,7 @@ int main(int argc, char **argv)
         const cell_synth_t no_weak  = { .on = false, .index = 0, .drop_mv = 0 };
         wflog_hdr_t hdr;
         run_t r;
-        replay(buf, len, &hdr, &r, &off, &no_weak, 0);
+        replay(buf, len, &hdr, &r, &off, &no_weak, 0, NULL);
         report(&hdr, &r);
         if (hdr.version != WFLOG_VERSION) {
             /* Not a warning: a Capture from a format this build does not know
@@ -1641,7 +1944,7 @@ int main(int argc, char **argv)
          * outside the file would show up here. */
         wflog_hdr_t hdr2;
         run_t again;
-        replay(buf, len, &hdr2, &again, &off, &no_weak, 0);
+        replay(buf, len, &hdr2, &again, &off, &no_weak, 0, NULL);
         if (again.est_hash != r.est_hash || again.est_points != r.est_points) {
             fail(paths[i], "replaying it twice produced two different "
                            "Remaining Energy curves: %ld points hash %016llx, "
@@ -1666,8 +1969,8 @@ int main(int argc, char **argv)
         const odo_synth_t wrapped = { .on = true, .start = 65530 };
         wflog_hdr_t hdr3, hdr4;
         run_t a, b;
-        replay(buf, len, &hdr3, &a, &clear, &no_weak, 0);
-        replay(buf, len, &hdr4, &b, &wrapped, &no_weak, 0);
+        replay(buf, len, &hdr3, &a, &clear, &no_weak, 0, NULL);
+        replay(buf, len, &hdr4, &b, &wrapped, &no_weak, 0, NULL);
         if (a.dist_points == 0) {
             fail(paths[i], "the synthesised Odometer ramp produced no distance "
                            "at all");
@@ -1703,7 +2006,7 @@ int main(int argc, char **argv)
                                     .drop_mv = CELL_SYNTH_DROP_MV };
         wflog_hdr_t hdr6;
         run_t sick;
-        replay(buf, len, &hdr6, &sick, &off, &weak, 0);
+        replay(buf, len, &hdr6, &sick, &off, &weak, 0, NULL);
         if (r.bms_responses_ok == 0) {
             /* Nothing to rewrite: a Capture with no BMS in it says nothing
              * about Cells either way, which is honest and not a failure. */
@@ -1788,7 +2091,8 @@ int main(int argc, char **argv)
          * a Monitor which quietly forgot its window would fail it. */
         wflog_hdr_t hdr5;
         run_t cyc;
-        replay(buf, len, &hdr5, &cyc, &off, &no_weak, r.records / 2);
+        replay(buf, len, &hdr5, &cyc, &off, &no_weak, r.records / 2,
+               NULL);
         if (!cyc.cycled) {
             fail(paths[i], "the simulated power cycle never happened, so the "
                            "continuity assertion is measuring nothing");

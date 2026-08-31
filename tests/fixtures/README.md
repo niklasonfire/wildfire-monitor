@@ -40,6 +40,19 @@ Drop the `.wfl` in here with a `.expect` beside it and a paragraph above. The
 runner discovers `*.wfl` in this directory; it needs no change, and a fixture
 without a `.expect` fails rather than passing quietly.
 
+Then run `make fit` and commit `main/wfest/wf_fit.h` with it. This directory is
+also the archive issue #19's fit is taken over: `./replay --samples` walks
+every `.wfl` here through the real estimator and prints Consumption against
+speed span by span, and `scripts/fit_consumption.py` regresses those. It
+discovers the Captures the same way this runner does, so a new ride reaches
+the fit by being dropped in here and by nothing else. `make test` fails if
+`wf_fit.h` has drifted from what the archive now produces.
+
+Today every span of every Capture here is excluded - the one ride we hold
+crawls 16.7 m at under 6 km/h - and the fit refuses. That is the honest answer
+until the calibration ride (#6) lands, and the generated header says so in
+those words.
+
 `.expect` is `name value` lines, compared to within ±0.05, `#` starts a
 comment. The names are the measurements `tests/host/replay.c` collects
 (`ctrl_frames_bad`, `pack_v_min`, `speed_kmh_max`, …); a name it does not

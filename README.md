@@ -59,6 +59,15 @@ Adding a Capture to the suite is a `.wfl` and a `.expect` file dropped into
 `tests/fixtures/README.md`. `make fixtures` rebuilds the `.wfl` files from the
 dumps in `captures/` via `scripts/dump2wfl.py`.
 
+`make fit` refits Consumption against speed across that same archive and
+rewrites `main/wfest/wf_fit.h`, the constants the firmware compiles in. The
+samples come out of the real estimator - `./build-host/replay --samples`
+walks every Capture through `main/wfest` and prints differences of its own
+totals, so there is no second energy-and-distance integrator anywhere - and
+`scripts/fit_consumption.py` does nothing but the least-squares regression of
+`Wh/km = a + c*v^2`. It refuses rather than inventing coefficients when the
+archive cannot support a fit, which is what it does today.
+
 ## What the firmware does
 
 Stage one of the project: a BLE central that finds the two devices on the

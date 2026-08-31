@@ -1054,3 +1054,46 @@ void wf_est_save(const wf_est_t *e, wf_est_persist_t *out)
     out->ir_ohm    = (float)e->ir_ohm;
     out->ir_weight = (uint16_t)e->ir_weight;
 }
+
+/* ------------------------------------------- Consumption at a chosen speed */
+
+double wf_est_fit_eval(double a, double b, double c, double speed_kmh)
+{
+    /* Horner, and not because it is faster on three terms - because it is one
+     * multiply-add chain rather than two independent products summed, which
+     * is one fewer place for -ffp-contract to have been the difference
+     * between the Monitor's answer and the harness's. The fit is a straight
+     * a + b*v + c*v^2 either way. */
+    return a + speed_kmh * (b + speed_kmh * c);
+}
+
+void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->fitted        = false;
+    out->extrapolated  = false;
+    out->wh_per_km     = 0.0;
+    out->speed_min_kmh = WF_FIT_SPEED_MIN_KMH;
+    out->speed_max_kmh = WF_FIT_SPEED_MAX_KMH;
+
+    if (!WF_FIT_FITTED) {
+        /* No fit at all. Nothing is produced at any speed, and the range
+         * stays the pair of zeroes wf_fit.h holds - so a caller that checks
+         * the range instead of the flag also finds no speed inside it. */
+        return;
+    }
+    out->fitted = true;
+
+    /* Written the way round that rejects a NaN as outside the range, since a
+     * NaN compares false against both bounds and the honest answer to "is
+     * this speed supported" for a speed that is not a number is no. */
+    if (!(speed_kmh >= WF_FIT_SPEED_MIN_KMH &&
+          speed_kmh <= WF_FIT_SPEED_MAX_KMH)) {
+        out->extrapolated = true;
+    }
+    out->wh_per_km = wf_est_fit_eval(WF_FIT_A_WH_PER_KM,
+                                     WF_FIT_B_WH_PER_KM_PER_KMH,
+                                     WF_FIT_C_WH_PER_KM_PER_KMH2, speed_kmh);
+}

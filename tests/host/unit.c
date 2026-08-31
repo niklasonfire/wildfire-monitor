@@ -3280,6 +3280,122 @@ static void test_range_is_monotone_with_a_weak_cell(void)
 
 /* ------------------------------------------------------------------- main */
 
+/* ============================================ Consumption at a chosen speed
+ *
+ * The evaluator #19 leaves behind for #20. The archive cannot exercise the
+ * fitted half of it - there is no fit, and there will not be one until the
+ * calibration ride happens - so the polynomial is driven directly against
+ * coefficients chosen here, and the wiring around it is driven against
+ * whatever wf_fit.h currently holds. Both halves matter: a branch that only
+ * ever runs one way is a branch nobody has tested, and the way it currently
+ * runs is the refusal.
+ */
+
+static void test_the_fit_polynomial_is_what_it_claims(void)
+{
+    /* a + c*v^2, with the drag term explicit and no linear term. Numbers of
+     * the right order for a light electric motorbike, chosen here so the
+     * expected value can be worked out by hand: 18 + 0.0045*3600 = 34.2. */
+    CHECK(close_to(wf_est_fit_eval(18.0, 0.0, 0.0045, 60.0), 34.2),
+          "a + c*v^2 at 60 km/h gave %.6f, expected 34.2",
+          wf_est_fit_eval(18.0, 0.0, 0.0045, 60.0));
+    /* At rest the drag term vanishes and the constant is all there is, which
+     * is what makes `a` the rolling-and-driveline term rather than a fitting
+     * artefact. */
+    CHECK(close_to(wf_est_fit_eval(18.0, 0.0, 0.0045, 0.0), 18.0),
+          "the constant term is not what the curve reads at zero: %.6f",
+          wf_est_fit_eval(18.0, 0.0, 0.0045, 0.0));
+    /* Quadratic and not cubic, which is the distinction the whole ticket
+     * turns on: doubling the speed quadruples the drag term. Power would
+     * have gone up eightfold. */
+    double at30 = wf_est_fit_eval(0.0, 0.0, 0.0045, 30.0);
+    double at60 = wf_est_fit_eval(0.0, 0.0, 0.0045, 60.0);
+    CHECK(close_to(at60, 4.0 * at30),
+          "doubling speed changed the drag term by %.3fx, not 4x",
+          at30 > 0.0 ? at60 / at30 : 0.0);
+    /* The linear term is carried through when there is one, so a fit that
+     * justified one is evaluated and not silently dropped. */
+    CHECK(close_to(wf_est_fit_eval(1.0, 2.0, 3.0, 10.0), 321.0),
+          "a + b*v + c*v^2 gave %.6f, expected 321",
+          wf_est_fit_eval(1.0, 2.0, 3.0, 10.0));
+}
+
+static void test_the_monitor_produces_nothing_without_a_fit(void)
+{
+    /* Whatever wf_fit.h holds today, the two flags have to agree with it and
+     * the unfitted case has to produce exactly nothing. When the calibration
+     * ride lands and the header is regenerated, this test follows the header
+     * rather than needing to be rewritten. */
+    wf_est_fit_t f;
+    wf_est_consumption_at_speed(50.0, &f);
+
+    CHECK(f.fitted == (WF_FIT_FITTED != 0),
+          "wf_fit.h says FITTED=%d and the evaluator says %d",
+          WF_FIT_FITTED, (int)f.fitted);
+    CHECK(f.speed_min_kmh == WF_FIT_SPEED_MIN_KMH &&
+          f.speed_max_kmh == WF_FIT_SPEED_MAX_KMH,
+          "the supported range did not come from wf_fit.h: %.3f-%.3f km/h",
+          f.speed_min_kmh, f.speed_max_kmh);
+
+    if (!f.fitted) {
+        /* Exactly zero, not something small: the proof that no polynomial
+         * was evaluated rather than that one was and came out low. The same
+         * discipline `range_km` follows when there is no Range. */
+        CHECK(f.wh_per_km == 0.0,
+              "an unfitted archive produced %.6f Wh/km at 50 km/h",
+              f.wh_per_km);
+        CHECK(f.speed_min_kmh == 0.0 && f.speed_max_kmh == 0.0,
+              "an unfitted archive claims to support %.1f-%.1f km/h",
+              f.speed_min_kmh, f.speed_max_kmh);
+        /* And no speed at all is inside a zero-width range, so a caller that
+         * checks the range instead of the flag reaches the same answer. */
+        wf_est_consumption_at_speed(0.0, &f);
+        CHECK(f.wh_per_km == 0.0, "zero km/h produced %.6f Wh/km",
+              f.wh_per_km);
+    }
+}
+
+static void test_extrapolation_is_flagged_and_not_hidden(void)
+{
+    /* The flag is a property of the range in wf_fit.h, so this asserts the
+     * rule the range implies rather than a number it does not yet hold. With
+     * no fit, every speed is outside a zero-width range and nothing is
+     * produced at all; with one, inside is clear and outside is flagged but
+     * still answered - #20 has to be able to tell a supported suggestion from
+     * an unsupported one, which needs both. */
+    wf_est_fit_t lo, mid, hi;
+    double span = WF_FIT_SPEED_MAX_KMH - WF_FIT_SPEED_MIN_KMH;
+
+    wf_est_consumption_at_speed(WF_FIT_SPEED_MIN_KMH - 1.0, &lo);
+    wf_est_consumption_at_speed(WF_FIT_SPEED_MIN_KMH + span / 2.0, &mid);
+    wf_est_consumption_at_speed(WF_FIT_SPEED_MAX_KMH + 1.0, &hi);
+
+    CHECK(lo.extrapolated == (WF_FIT_FITTED != 0),
+          "a km/h below the fitted range was not flagged");
+    CHECK(hi.extrapolated == (WF_FIT_FITTED != 0),
+          "a km/h above the fitted range was not flagged");
+    if (WF_FIT_FITTED && span > 0.0) {
+        CHECK(!mid.extrapolated,
+              "the middle of the fitted range was flagged as extrapolation");
+        CHECK(mid.wh_per_km != 0.0,
+              "a supported speed produced no Consumption at all");
+        CHECK(hi.wh_per_km != 0.0,
+              "an extrapolated speed was refused outright - it is meant to be "
+              "flagged, not withheld");
+    }
+
+    /* A speed no bike reaches is outside every range this fit could ever
+     * hold, so it is flagged whatever the header says next year. The
+     * comparison is written the way round that rejects it - and rejects a
+     * NaN with it, since a NaN compares false against both bounds and the
+     * honest answer to "is this speed supported" for a speed that is not a
+     * number is no. */
+    wf_est_fit_t absurd;
+    wf_est_consumption_at_speed(1e9, &absurd);
+    CHECK(absurd.extrapolated == (WF_FIT_FITTED != 0),
+          "a million km/h was not flagged as extrapolation");
+}
+
 int main(void)
 {
     test_odo_metres();
@@ -3336,6 +3452,10 @@ int main(void)
     test_a_healthy_pack_at_low_charge_does_not_warn();
     test_bad_cell_readings_do_not_clamp_range();
     test_range_is_monotone_with_a_weak_cell();
+
+    test_the_fit_polynomial_is_what_it_claims();
+    test_the_monitor_produces_nothing_without_a_fit();
+    test_extrapolation_is_flagged_and_not_hidden();
 
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();

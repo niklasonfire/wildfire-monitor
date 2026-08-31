@@ -467,6 +467,10 @@
 #include <stdint.h>
 
 #include "wfdecode.h"
+/* Consumption against speed, as constants. Generated offline by
+ * scripts/fit_consumption.py over the whole Capture archive and committed;
+ * see wf_est_consumption_at_speed() at the bottom of this file. */
+#include "wf_fit.h"
 
 /* ------------------------------------------------------------ the Limp Point
  *
@@ -1234,5 +1238,61 @@ double wf_est_sag_reserve_wh(double sag_v);
  * re-based every time the rider's wrist moves; Sag is subtracted from the
  * result at read time instead. */
 double wf_est_energy_above_limp_wh(double soc_pct);
+
+/* ------------------------------------------- Consumption at a chosen speed
+ *
+ * What the archive says the bike costs per kilometre at a speed the rider is
+ * not currently riding at. Everything above answers "what is happening"; this
+ * answers "what would happen", and it is the only thing here that does.
+ *
+ * NOTHING FITS ON THE MONITOR, and this is where that is enforced rather than
+ * asserted. The coefficients come out of wf_fit.h, which
+ * scripts/fit_consumption.py writes offline from the whole Capture archive
+ * (issue #19). This evaluates a polynomial in two constants. There is no
+ * state, no accumulator, no adaptation and nothing that could become one: it
+ * is a function of its argument and of two #defines, and a Monitor that has
+ * been running for a month gives the same answer as one just switched on.
+ *
+ * THE FORM is a + c*v^2, with the quadratic drag term explicit. Energy per
+ * unit distance is force; rolling resistance and driveline loss are roughly
+ * constant with speed and aerodynamic drag goes as the square of it. Note it
+ * is the per-kilometre figure and not power, which is force times speed and
+ * would go as v^3 - two curves that look alike and are different quantities.
+ *
+ * THE TWO WAYS IT DECLINES TO ANSWER, and they are different:
+ *
+ *   `fitted` false     there is no fit at all. The archive has never held a
+ *                      ride this could be fitted from - see wf_fit.h, which
+ *                      says why in the words the tool refused in - and
+ *                      `wh_per_km` is left at exactly zero, which is the
+ *                      proof that no polynomial was evaluated rather than
+ *                      that one was and came out small.
+ *   `extrapolated`     there is a fit, and the speed asked about is outside
+ *                      the range the data covers. The number IS produced -
+ *                      an extrapolated quadratic is still the best guess
+ *                      available - but it is flagged, so a caller cannot show
+ *                      it as though it were supported. Issue #20 suggests a
+ *                      slower speed to the rider and must only suggest one
+ *                      this comes back clear for.
+ *
+ * A caller that ignores both flags is asking for a number the archive did not
+ * earn, which is exactly what the Confidence discipline in CONTEXT.md exists
+ * to make visible.
+ */
+typedef struct {
+    bool   fitted;          /* WF_FIT_FITTED: a real fit, not the placeholder */
+    bool   extrapolated;    /* asked outside the fitted speed range */
+    double wh_per_km;       /* exactly zero when !fitted */
+    double speed_min_kmh;   /* the range the fit is supported over, both zero */
+    double speed_max_kmh;   /* when there is no fit, so nothing is inside it */
+} wf_est_fit_t;
+
+void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out);
+
+/* The polynomial alone, with the coefficients handed in. Exposed because the
+ * archive cannot exercise the fitted path - there is no fit to exercise it
+ * with - and a branch that only ever runs one way is a branch nobody has
+ * tested. tests/host/unit.c drives it against coefficients it chose. */
+double wf_est_fit_eval(double a, double b, double c, double speed_kmh);
 
 #endif /* WFEST_H */

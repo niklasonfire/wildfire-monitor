@@ -6,6 +6,7 @@
 #   make test        generate, build, unit-test and replay every fixture
 #   make gen         just run the Field Table through the generator
 #   make docs        regenerate docs/field-table.md from the Field Table
+#   make fit         refit Consumption against speed over the whole archive
 #   make fixtures    rebuild the .wfl fixtures from the checked-in dumps
 #   make clean
 #
@@ -49,7 +50,10 @@ INC       = -I$(WFDECODE) -I$(WFEST) -I$(GEN)
 REPLAY    = $(BUILD)/replay
 UNIT      = $(BUILD)/unit
 
-.PHONY: test test-unit test-replay test-scripts gen docs fixtures clean
+FITTER    = scripts/fit_consumption.py
+FIT_H     = $(WFEST)/wf_fit.h
+
+.PHONY: test test-unit test-replay test-scripts gen docs fit fixtures clean
 
 test: test-unit test-replay test-scripts
 
@@ -71,6 +75,18 @@ gen: $(GEN_STAMP)
 
 docs:
 	$(PYTHON) $(GENERATOR) $(TABLE) --doc $(DOC)
+
+# Issue #19. The samples come out of the real estimator - $(REPLAY) --samples
+# walks every Capture through main/wfest and prints differences of its own
+# totals - and the Python does nothing but the regression. That split is the
+# point: a Python energy-and-distance integrator would be a second answer to
+# a question ADR-0004 gives one answer to.
+#
+# Not part of `make test`, because it writes a committed file. `make test`
+# checks instead that the committed file is still what today's archive
+# produces, which is the same discipline docs/field-table.md is held to.
+fit: $(REPLAY)
+	$(PYTHON) $(FITTER) --captures $(FIXTURES) --header $(FIT_H)
 
 $(BUILD):
 	mkdir -p $(BUILD)
