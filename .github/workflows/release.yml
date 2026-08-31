@@ -1,0 +1,72 @@
+name: release
+# Cut a firmware release on the self-hosted runner when a version tag is pushed.
+#   git tag v1.2.3 && git push origin v1.2.3
+# Builds wildfire_monitor for esp32 inside espressif/idf:v6.1 (same image idf.sh uses),
+# then publishes a GitHub Release with the firmware binaries.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write        # create the Release and upload assets
+
+jobs:
+  build-and-release:
+    runs-on: [self-hosted, linux, x64, dind]
+    env:
+      IDF_IMAGE: espressif/idf:v6.1
+      VERSION: ${{ github.ref_name }}     # the tag, e.g. v1.2.3
+      APP_NAME: wildfire_monitor
+    steps:
+      - name: Checkout (full history so ESP-IDF derives the version from the tag)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build firmware in the ESP-IDF container
+        run: |
+          set -eux
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" -w /project \
+            -e HOME=/tmp -e VERSION="$VERSION" -e APP_NAME="$APP_NAME" \
+            "$IDF_IMAGE" bash -lc '
+              idf.py set-target esp32
+              idf.py build
+              idf.py merge-bin -o "build/${APP_NAME}-${VERSION}-merged.bin"
+            '
+
+      - name: Collect release assets
+        run: |
+          set -eux
+          mkdir -p release
+          cp "build/${APP_NAME}-${VERSION}-merged.bin"     "release/"
+          cp "build/${APP_NAME}.bin"                        "release/${APP_NAME}-${VERSION}-app-ota.bin"
+          cp "build/bootloader/bootloader.bin"             "release/bootloader-${VERSION}.bin"
+          cp "build/partition_table/partition-table.bin"   "release/partition-table-${VERSION}.bin"
+          ls -l release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: release/*
+          body: |
+            ESP32 firmware for **wildfire_monitor** (M5StickC PLUS2 / ESP32-PICO-V3-02).
+            Built in `espressif/idf:v6.1` on the self-hosted runner from tag `${{ github.ref_name }}`.
+
+            ### Flash — single merged image (easiest)
+            ```
+            esptool.py -p <PORT> write_flash 0x0 wildfire_monitor-${{ github.ref_name }}-merged.bin
+            ```
+            or drag `*-merged.bin` into ESP Web Tools / https://espressif.github.io/esptool-js .
+
+            ### Flash — separate files (esp32 offsets)
+            ```
+            esptool.py -p <PORT> write_flash \
+              0x1000  bootloader-${{ github.ref_name }}.bin \
+              0x8000  partition-table-${{ github.ref_name }}.bin \
+              0x10000 wildfire_monitor-${{ github.ref_name }}-app-ota.bin
+            ```
+            `*-app-ota.bin` is the app-only image to serve for OTA updates.
