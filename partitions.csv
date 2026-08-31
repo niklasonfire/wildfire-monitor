@@ -1,0 +1,30 @@
+# Partition table for the Monitor.
+#
+# 8 MB flash with two app slots and the bootloader's rollback, so a firmware
+# written over the air can be undone without a cable; see ADR-0006. A slot is
+# 1.875 MB against an app of about 1.16 MB today, and update mode's certificate
+# bundle and mbedtls come out of that headroom. An app that ever outgrows a
+# slot needs another partition table, which is another USB flash - so the
+# margin is a number to watch and not a number to spend.
+#
+# Everything left over is the capture store: 4.125 MB, which at the ~780 B/s a
+# ride writes on both links is about ninety minutes. That is sized above the
+# forty minutes a ride is expected to need, because when the store fills it is
+# the tail that is lost, and the tail is the low State of Charge part that the
+# Consumption and Usable Capacity work needs most.
+#
+# The store moved from 0x210000 to 0x3E0000 when this table replaced the single
+# factory slot, so its old contents became unreachable and it reformatted on
+# the first boot: every Capture had to be off the board before that flash. A
+# partition table cannot be replaced over the air, so that was the last cable.
+#
+# The offsets total exactly 0x800000; nothing here may be nudged without
+# checking that again.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xF000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x1E0000,
+ota_1,      app,  ota_1,   0x200000, 0x1E0000,
+storage,    data, fat,     0x3E0000, 0x420000,

@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "esp_err.h"
 #include "host/ble_gap.h"
@@ -28,6 +29,45 @@
 #define BLEX_MAX_DSCS      96
 #define BLEX_MAX_NSTAT     32
 #define BLEX_MAX_ATT_LEN   512
+
+/* Match a discovered UUID against a 16-bit assigned number.
+ *
+ * ble_uuid_cmp() compares type-strictly, so a peer that reports an assigned
+ * UUID in its long form - 0000fff1-0000-1000-8000-00805f9b34fb rather than
+ * 0xfff1 - never compares equal to a BLE_UUID16_DECLARE() literal even though
+ * it is the same UUID. The Daly BMS does exactly that where the Fardriver
+ * uses the short form, so every local match has to fold the long form back
+ * first. NimBLE keeps 128-bit UUIDs least significant byte first, which puts
+ * the assigned number in bytes 12..13 of the Bluetooth base UUID. */
+static inline bool blex_uuid_is16(const ble_uuid_t *uuid, uint16_t val)
+{
+    /* The Bluetooth base UUID, LSB first, with the assigned number zeroed. */
+    static const uint8_t base[16] = {
+        0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const ble_uuid128_t *u128;
+
+    if (uuid == NULL) {
+        return false;
+    }
+    switch (uuid->type) {
+    case BLE_UUID_TYPE_16:
+        return BLE_UUID16(uuid)->value == val;
+    case BLE_UUID_TYPE_32:
+        return BLE_UUID32(uuid)->value == (uint32_t)val;
+    case BLE_UUID_TYPE_128:
+        u128 = BLE_UUID128(uuid);
+        if (memcmp(u128->value, base, 12) != 0 ||
+            u128->value[14] != 0 || u128->value[15] != 0) {
+            return false;
+        }
+        return ((uint16_t)u128->value[12] |
+                ((uint16_t)u128->value[13] << 8)) == val;
+    default:
+        return false;
+    }
+}
 
 /* One advertiser seen during a scan. Advertising and scan response payloads
  * are kept raw; the parsed view is only ever printed, never relied upon. */
