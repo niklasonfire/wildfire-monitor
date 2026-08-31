@@ -44,15 +44,42 @@ static const char *TAG = "otaup";
 #define CHECK_STACK     10240
 #define CHECK_PRIO      3
 /*
- * The receive buffer for the image, which is also the header buffer, and it
- * is the headers that size it: GitHub's redirect carries a
- * Content-Security-Policy line of about 3.6 KB, and
- * CONFIG_ESP_HTTP_CLIENT_STRICT_HEADER_BUFFER makes a header that does not
- * fit an error rather than a truncation. Larger than the manifest fetch's
- * only because every buffer-full here is an esp_ota_write() call, and there
- * are a thousand of them.
+ * The receive buffer for the image, which is also where the response headers
+ * land, and it is the headers that size it: github.com answers a release
+ * download with a header block of about 5 KB, most of it one
+ * Content-Security-Policy line of about 3.6 KB. Larger than the manifest
+ * fetch's only because every buffer-full here is an esp_ota_write() call, and
+ * there are a thousand of them.
  */
 #define IMAGE_BUF       8192
+/*
+ * The transmit buffer, which is a different problem and was the one that
+ * broke. The request line and every request header are assembled in this one
+ * buffer before anything goes out, so it is sized by the URL and not by the
+ * answer. ESP-IDF leaves it at 512 bytes unless it is asked, and 512 is
+ * enough for the two github.com hops and not for the third: the release asset
+ * redirects to a signed release-assets.githubusercontent.com URL of about
+ * 1030 characters - fourteen query parameters, one of them a JWT - and "GET "
+ * plus that plus " HTTP/1.1" plus Host, User-Agent, Accept and Connection
+ * comes to roughly 1250. One byte over and esp_http_client logs "Out of
+ * buffer" and gives up in prepare_first_line(), before a single byte of the
+ * response is read: a certificate validated, then ESP_FAIL, which is exactly
+ * what the board showed.
+ *
+ * 2048 is that 1250 with about 800 bytes to spare. Not the measured figure,
+ * because the signature is GitHub's to lengthen and the failure when it is
+ * one byte short is total; not more, because this is heap held while Wi-Fi
+ * and TLS are both up. The cost over the default is 1.5 KB for the few
+ * seconds the client is open, against the ~160 KB free at that moment.
+ *
+ * CONFIG_ESP_HTTP_CLIENT_STRICT_HEADER_BUFFER (default y, and y here) is
+ * about this buffer too, despite reading like a response setting: with it a
+ * request header that does not fit is ESP_ERR_HTTP_HEADER_TOO_LONG, and
+ * without it the request goes out without its terminator and the server times
+ * the connection out instead. It does not guard the request line, which is
+ * where this one overflowed, so it would not have named the fault either way.
+ */
+#define REQ_BUF         2048
 
 #define BIT_GOT_IP  BIT0
 #define BIT_FAILED  BIT1
@@ -275,9 +302,10 @@ static esp_err_t http_event(esp_http_client_event_t *evt)
     if (evt == NULL || evt->event_id != HTTP_EVENT_ON_DATA || b == NULL) {
         return ESP_OK;
     }
-    /* GitHub answers the release URL with a redirect to its object store, and
-     * that redirect has a short body of its own. Only the body of the 200 is
-     * the manifest, so the status decides what is collected. */
+    /* GitHub answers the release URL with two redirects - to the newest tag's
+     * own download URL, and from there to release-assets.githubusercontent.com
+     * - and each of them has a short body of its own. Only the body of the 200
+     * is the manifest, so the status decides what is collected. */
     if (esp_http_client_get_status_code(evt->client) != 200) {
         return ESP_OK;
     }
@@ -318,12 +346,14 @@ static otaup_err_t fetch_manifest(otaup_result_t *r)
         .crt_bundle_attach     = esp_crt_bundle_attach,
         .event_handler         = http_event,
         .user_data             = &b,
-        /* Sized for GitHub's headers, not for the manifest. The redirect from
-         * github.com carries a Content-Security-Policy line of about 3.6 KB
-         * on its own, and CONFIG_ESP_HTTP_CLIENT_STRICT_HEADER_BUFFER makes a
-         * header that does not fit an error rather than a truncation. The
-         * buffer is freed with the client, a few seconds later. */
+        /* Sized for GitHub's headers, not for the manifest: the redirect from
+         * github.com carries a Content-Security-Policy line of about 3.6 KB on
+         * its own. The transmit buffer is sized by the signed URL of the last
+         * hop and is the reason this fetch used to die before it read
+         * anything; see REQ_BUF. Both are freed with the client, a few seconds
+         * later. */
         .buffer_size           = 6144,
+        .buffer_size_tx        = REQ_BUF,
         .keep_alive_enable     = false,
         /* Following the redirect is the point: the URL the Monitor knows is a
          * redirect to whichever release is newest. */
@@ -348,7 +378,13 @@ static otaup_err_t fetch_manifest(otaup_result_t *r)
         snprintf(r->detail, sizeof(r->detail), "over %d bytes", WFOTA_BODY_MAX);
         res = OTAUP_ERR_MANIFEST;
     } else if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        /* The esp_err_t goes to the log and the words go to the panel. A
+         * rider standing next to the bike can do something about a hotspot
+         * that stopped answering and nothing whatever about "ESP_FAIL"; the
+         * name is only worth having where there is a keyboard to look it up
+         * with. Every detail below is split the same way. */
+        ESP_LOGE(TAG, "manifest: transport: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "github did not answer");
         res = OTAUP_ERR_FETCH;
     } else if (status != 200) {
         /* 404 is the ordinary one: no release has been cut, or the pinned tag
@@ -403,7 +439,8 @@ static otaup_err_t join(const wifi_net_t *net, otaup_result_t *r)
         err = esp_wifi_connect();
     }
     if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "join: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "radio refused it");
         return OTAUP_ERR_JOIN;
     }
 
@@ -448,7 +485,8 @@ static otaup_err_t run_check(otaup_result_t *r, otaup_progress_fn progress)
     say(progress, "starting", "wifi");
     esp_err_t err = wifi_up();
     if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "wifi up: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "radio would not start");
         return OTAUP_ERR_WIFI;
     }
     s_running = true;
@@ -459,7 +497,8 @@ static otaup_err_t run_check(otaup_result_t *r, otaup_progress_fn progress)
      * phone picked, and there is nothing else for this radio to do. */
     err = esp_wifi_scan_start(&sc, true);
     if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "scan: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "scan would not start");
         return OTAUP_ERR_WIFI;
     }
 
@@ -633,9 +672,9 @@ static esp_err_t image_event(esp_http_client_event_t *evt)
     if (evt == NULL || evt->event_id != HTTP_EVENT_ON_DATA || ic == NULL) {
         return ESP_OK;
     }
-    /* Same rule as the manifest fetch: GitHub answers with a redirect to its
-     * object store and that redirect carries a body of its own. Only the body
-     * of the 200 is the image. */
+    /* Same rule as the manifest fetch: GitHub answers with redirects that end
+     * at release-assets.githubusercontent.com, and each of them carries a body
+     * of its own. Only the body of the 200 is the image. */
     if (esp_http_client_get_status_code(evt->client) != 200) {
         return ESP_OK;
     }
@@ -695,7 +734,8 @@ static otain_err_t install(install_ctx_t *ic)
      * of a minute of the rider's time, spent erasing flash nothing writes. */
     esp_err_t err = esp_ota_begin(part, m->size, &ic->handle);
     if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "ota begin: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "slot would not erase");
         return OTAIN_ERR_BEGIN;
     }
     ic->open = true;
@@ -710,9 +750,13 @@ static otain_err_t install(install_ctx_t *ic)
         .event_handler         = image_event,
         .user_data             = ic,
         .buffer_size           = IMAGE_BUF,
+        /* The same signed last hop the manifest fetch takes, so the same
+         * transmit buffer: see REQ_BUF. */
+        .buffer_size_tx        = REQ_BUF,
         .keep_alive_enable     = false,
         /* The manifest's url is a github.com release asset, which redirects
-         * to the object store the bytes actually live in. */
+         * to the release-assets.githubusercontent.com URL the bytes actually
+         * live behind. */
         .disable_auto_redirect = false,
     };
 
@@ -731,7 +775,8 @@ static otain_err_t install(install_ctx_t *ic)
      * handler that said no makes perform() fail too, so what the handler was
      * unhappy about is asked first. */
     if (ic->write_err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(ic->write_err));
+        ESP_LOGE(TAG, "ota write: %s", esp_err_to_name(ic->write_err));
+        snprintf(r->detail, sizeof(r->detail), "flash refused a block");
         return OTAIN_ERR_WRITE;
     }
     if (ic->dl.err == WFOTA_DL_ERR_LONG) {
@@ -742,7 +787,8 @@ static otain_err_t install(install_ctx_t *ic)
         /* The dropped hotspot. Nothing here retries: otadata still points at
          * the running app, so the slot is dead weight and the rider is the
          * one who decides whether to try again (ADR-0006). */
-        snprintf(r->detail, sizeof(r->detail), "%s at %d%%", esp_err_to_name(err),
+        ESP_LOGE(TAG, "download: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "stopped at %d%%",
                  wfota_dl_percent(&ic->dl));
         return OTAIN_ERR_FETCH;
     }
@@ -779,14 +825,19 @@ static otain_err_t install(install_ctx_t *ic)
     err = esp_ota_end(ic->handle);
     ic->open = false;               /* the handle is spent either way */
     if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "ota end: %s", esp_err_to_name(err));
+        /* The one failure here with an obvious next move, so the line is the
+         * move and not the diagnosis: the bytes hashed right and the slot
+         * still will not boot, which a second download is what to try. */
+        snprintf(r->detail, sizeof(r->detail), "try the download again");
         return OTAIN_ERR_END;
     }
 
     /* The one irreversible line in this file, and the last one. */
     err = esp_ota_set_boot_partition(part);
     if (err != ESP_OK) {
-        snprintf(r->detail, sizeof(r->detail), "%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "set boot partition: %s", esp_err_to_name(err));
+        snprintf(r->detail, sizeof(r->detail), "otadata would not take it");
         return OTAIN_ERR_BOOT;
     }
 

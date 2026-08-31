@@ -52,7 +52,11 @@ typedef struct {
     wfota_manifest_t manifest;
     bool             have_manifest;
     bool             differs;    /* the manifest names another version */
-    char             detail[40]; /* second line of whatever went wrong */
+    /* The second line of whatever went wrong, and it goes straight onto the
+     * message screen, so it is words a rider can act on and never an
+     * esp_err_t name: "ESP_FAIL" under a headlamp is a dead end. The precise
+     * error is logged where there is a keyboard to look it up with. */
+    char             detail[40];
 } otaup_result_t;
 
 /* Called as the check moves on, so the rider sees a screen change rather than
@@ -108,7 +112,7 @@ typedef struct {
     char     slot[17];    /* the partition written - esp_partition_t's label */
     uint32_t written;
     char     sha256[WFOTA_SHA256_HEX + 1];  /* of what actually arrived */
-    char     detail[40];
+    char     detail[40];   /* the rider's words, as above - never an esp_err_t */
 } otain_result_t;
 
 /* Called once per whole percent, on the install's own task. */

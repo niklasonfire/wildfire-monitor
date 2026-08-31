@@ -339,7 +339,10 @@ static void update_stage(const char *l1, const char *l2)
 /* One line per failure, in the words a rider can act on: which of them it was
  * decides whether they move the bike, open the hotspot on their phone, or go
  * and look at what was published. The second line is whatever detail the check
- * collected - a disconnect reason, an HTTP status, why the JSON was refused. */
+ * collected - a disconnect reason, an HTTP status, why the JSON was refused -
+ * and it too is words rather than an esp_err_t name, which ota_update.c logs
+ * instead. The console is for whoever is debugging this; the panel is for
+ * whoever is standing next to the bike. */
 static const char *update_fail_line(otaup_err_t err)
 {
     switch (err) {
@@ -372,7 +375,8 @@ static void install_stage(int percent, uint32_t got, uint32_t want)
 
 /* As with the check: which failure it was decides what the rider does next -
  * move closer to the phone, look at what was published, or reach for the
- * cable. The detail line carries the number that goes with it. */
+ * cable. The detail line carries the number that goes with it, and the
+ * esp_err_t behind it stays in the log. */
 static const char *install_fail_line(otain_err_t err)
 {
     switch (err) {
