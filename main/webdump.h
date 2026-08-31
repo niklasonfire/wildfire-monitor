@@ -6,6 +6,9 @@
  * the capture files over HTTP: connect a phone or a laptop, open the page,
  * download. BLE has to be down before this starts - the two do not fit in RAM
  * together - so the only way back to capturing is a reboot.
+ *
+ * The same server also carries a settings page, which is where the networks
+ * update mode may join are edited without a cable. See webdump.c.
  */
 #pragma once
 
