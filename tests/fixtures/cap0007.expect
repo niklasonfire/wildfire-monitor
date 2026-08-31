@@ -176,3 +176,23 @@ est_alltime_wh        1.73
 # that never produces the figure cannot assert anything about it without
 # pretending to.
 est_range_source      0
+
+# Internal Resistance, and the honest zero again. This ride's line current runs
+# -0.25..8.75 A over 47 s, so its largest load step is 9 A against the 21 A
+# WF_EST_IR_MIN_DI_A demands - and that threshold is not a preference, it is
+# what the 0.1 V voltage quantisation costs on a Pack of tens of milliohms. So
+# no pair of samples in this Capture is a load step: nothing is measured,
+# nothing is refused, and the Limp Point does not move a millivolt off its
+# provisional 84.0 V.
+#
+# Which is what makes every estimate above unchanged by issue #17. A ride with
+# hard launches in it moves these three and takes watt-hours off the figures
+# with them; this one cannot, and that is the fact being pinned.
+#
+#   est_ir_steps      load steps accepted and averaged in
+#   est_ir_rejected   sharp enough to try, refused for want of an Anchor or
+#                     for implying a resistance no Pack has
+#   est_sag_v_max     the most the Limp Point ever moved, over the whole ride
+est_ir_steps          0
+est_ir_rejected       0
+est_sag_v_max         0.00

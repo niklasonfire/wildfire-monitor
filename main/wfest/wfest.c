@@ -51,6 +51,23 @@ double wf_est_energy_above_limp_wh(double soc_pct)
     return ah * v_mean;
 }
 
+double wf_est_sag_reserve_wh(double sag_v)
+{
+    /* Written the way round that rejects a NaN as well as a negative: no Sag,
+     * no reserve. */
+    if (!(sag_v > 0.0)) {
+        return 0.0;
+    }
+    /* How much of the Pack the band is worth. The line is straight, so a band
+     * of a given width in volts is the same number of amp-hours wherever it
+     * sits - which is why this needs no State of Charge. */
+    double pct = sag_v / WF_EST_PACK_V_PER_SOC_PCT;
+    double ah  = (pct / 100.0) * WF_EST_RATED_CAPACITY_AH;
+    /* Times the mean voltage that charge would have come out at: the band runs
+     * from the Limp Point up to one Sag above it. */
+    return ah * (WF_EST_LIMP_POINT_V + sag_v / 2.0);
+}
+
 static double anchor_coulomb_ah(double soc_pct)
 {
     return (soc_pct / 100.0) * WF_EST_RATED_CAPACITY_AH;
@@ -113,8 +130,24 @@ bool wf_est_persist_encode(const wf_est_persist_t *p, uint8_t *buf, size_t cap)
     put_f32(&buf[26], p->alltime_m);
     put_f32(&buf[30], p->window_wh);
     put_f32(&buf[34], p->window_m);
-    put_u16(&buf[38], wf_crc16(buf, WF_EST_PERSIST_BYTES - 2, PERSIST_CRC_INIT));
+    put_f32(&buf[38], p->ir_ohm);           /* version 4 from here down */
+    put_u16(&buf[42], p->ir_weight);
+    put_u16(&buf[44], wf_crc16(buf, WF_EST_PERSIST_BYTES - 2, PERSIST_CRC_INIT));
     return true;
+}
+
+/* How long a blob of a given version is. The length is what selects the layout
+ * and the version has to agree with it, which is what stops a field ever being
+ * read out of bytes the writer did not write. */
+static size_t persist_bytes_for(uint16_t version)
+{
+    if (version >= 4) {
+        return WF_EST_PERSIST_BYTES;
+    }
+    if (version >= 3) {
+        return WF_EST_PERSIST_BYTES_V3;
+    }
+    return WF_EST_PERSIST_BYTES_V2;
 }
 
 bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out)
@@ -122,7 +155,8 @@ bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out
     if (buf == NULL || out == NULL) {
         return false;
     }
-    if (len != WF_EST_PERSIST_BYTES && len != WF_EST_PERSIST_BYTES_V2) {
+    if (len != WF_EST_PERSIST_BYTES && len != WF_EST_PERSIST_BYTES_V3 &&
+        len != WF_EST_PERSIST_BYTES_V2) {
         return false;
     }
     if (buf[0] != PERSIST_MAGIC_0 || buf[1] != PERSIST_MAGIC_1) {
@@ -132,15 +166,15 @@ bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out
      * no field is ever read out of bytes the writer did not write. A version
      * this build has never written is rejected outright; an older layout it
      * knows is migrated - version 1 is version 2 without distance_m, version 2
-     * is version 3 without Consumption, and in both cases the migration is to
-     * restore what that build actually knew and no more. */
+     * is version 3 without Consumption, version 3 is version 4 without
+     * Internal Resistance, and in every case the migration is to restore what
+     * that build actually knew and no more. */
     uint16_t version = get_u16(&buf[2]);
     if (version < WF_EST_PERSIST_VERSION_MIN ||
         version > WF_EST_PERSIST_VERSION) {
         return false;
     }
-    bool v3 = len == WF_EST_PERSIST_BYTES;
-    if (v3 != (version >= 3)) {
+    if (len != persist_bytes_for(version)) {
         return false;
     }
     if (get_u16(&buf[len - 2]) !=
@@ -155,11 +189,15 @@ bool wf_est_persist_decode(const uint8_t *buf, size_t len, wf_est_persist_t *out
     out->rated_capacity_ah = get_f32(&buf[14]);
     out->distance_valid    = version >= 2 && buf[5] != 0;
     out->distance_m        = version >= 2 ? get_f32(&buf[18]) : 0.0f;
-    if (v3) {
+    if (version >= 3) {
         out->alltime_wh = get_f32(&buf[22]);
         out->alltime_m  = get_f32(&buf[26]);
         out->window_wh  = get_f32(&buf[30]);
         out->window_m   = get_f32(&buf[34]);
+    }
+    if (version >= 4) {
+        out->ir_ohm    = get_f32(&buf[38]);
+        out->ir_weight = get_u16(&buf[42]);
     }
     return true;
 }
@@ -227,6 +265,26 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
         e->cons_filled = WF_EST_CONS_BUCKETS;
     }
 
+    /* Internal Resistance, on its own terms again: it is a fact about the Pack
+     * and needs neither an Anchor nor the Rated Capacity guard below. Both
+     * halves or neither, and only inside the plausibility bound - a blob that
+     * passed its CRC and still holds two ohms is not a Pack, and restoring it
+     * would put a Sag reserve of the whole battery on the rider's screen. The
+     * weight is capped on the way in as well as on the way out, so a corrupted
+     * count cannot freeze the estimate.
+     *
+     * Restored at full weight and therefore at full confidence: the fade-in is
+     * for a Monitor learning its Pack for the first time, not for one that
+     * already knows it and has just been switched off and on. */
+    if (restored->ir_weight > 0 &&
+        (double)restored->ir_ohm >= WF_EST_IR_MIN_OHM &&
+        (double)restored->ir_ohm <= WF_EST_IR_MAX_OHM) {
+        e->ir_ohm    = (double)restored->ir_ohm;
+        e->ir_weight = restored->ir_weight > WF_EST_IR_SAMPLES_MAX
+                           ? WF_EST_IR_SAMPLES_MAX
+                           : (uint32_t)restored->ir_weight;
+    }
+
     if (!restored->valid) {
         return;
     }
@@ -280,6 +338,127 @@ static void cons_window(const wf_est_t *e, double *wh, double *m)
     }
     *wh = sum_wh;
     *m  = sum_m;
+}
+
+/* ------------------------------------------------- Internal Resistance and Sag
+ *
+ * One pair of consecutive power-block samples, and the question is whether it
+ * is a load step worth measuring a Pack with. Every answer here is "no" except
+ * on a real launch or a real throttle release, which is the point: a mean of
+ * everything the stream offers is a mean of quantisation noise.
+ *
+ * The rules, in the order they are cheapest to apply, and every one of them
+ * drops the pair rather than folding a weakened version of it in:
+ *
+ *   not consecutive     the two samples must be at most WF_EST_IR_MAX_DT_MS
+ *                       apart. A pair straddling a dropped frame is a ramp
+ *                       that looks like a step, and there is no way to tell
+ *                       from the numbers which it was.
+ *   too small           |dI| below WF_EST_IR_MIN_DI_A cannot beat the two
+ *                       quantisations - see the derivation in wfest.h. This is
+ *                       the rule that rejects almost every pair, and it is
+ *                       supposed to.
+ *   a BMS gap           a resistance with no State of Charge attached to it is
+ *                       not a State of Health reading, because resistance
+ *                       depends strongly on charge and on temperature. If the
+ *                       Anchor is stale the step is thrown away rather than
+ *                       recorded against a State of Charge nobody vouches for.
+ *   not a Pack          the ratio has to land inside the plausibility bound.
+ *                       This is also what rejects a step where the voltage
+ *                       moved the wrong way - that gives a negative ratio,
+ *                       which is below the floor - and any step where the
+ *                       voltage did not move at all.
+ *
+ * What survives is folded into a running mean whose weight is capped, so an
+ * estimate that has seen a few launches stops moving with any one of them.
+ */
+static void ir_fold(wf_est_t *e, uint32_t t_ms, uint32_t dt_ms, double volts,
+                    double amps)
+{
+    if (dt_ms == 0 || dt_ms > WF_EST_IR_MAX_DT_MS) {
+        return;
+    }
+    double di = amps - e->ir_prev_a;
+    double adi = di < 0.0 ? -di : di;
+    if (!(adi >= WF_EST_IR_MIN_DI_A)) {
+        return;
+    }
+    /* Sharp enough to try. From here on a refusal is worth counting: a Pack
+     * that produces launches and nothing but rejections is a decode problem or
+     * a wiring problem, and a silent zero would hide it. */
+    if (!e->acquired || !e->anchor_seen ||
+        (uint32_t)(t_ms - e->anchor_t_ms) > WF_EST_ANCHOR_STALE_MS) {
+        e->ir_rejected++;
+        return;
+    }
+    /* Sag per amp. The minus is the physics: voltage falls as current rises,
+     * and both directions of step give the same positive resistance. */
+    double r = -(volts - e->ir_prev_v) / di;
+    if (!(r >= WF_EST_IR_MIN_OHM) || r > WF_EST_IR_MAX_OHM) {
+        e->ir_rejected++;
+        return;
+    }
+
+    if (e->ir_weight < WF_EST_IR_SAMPLES_MAX) {
+        e->ir_weight++;
+    }
+    e->ir_ohm += (r - e->ir_ohm) / (double)e->ir_weight;
+    e->ir_soc_pct  = e->anchor_soc_pct;
+    e->ir_steps++;
+}
+
+/* The load Sag is taken at: the line current, averaged over WF_EST_SAG_TAU_S.
+ *
+ * This is the whole of why a Sag-corrected Limp Point does not make Range
+ * jitter. The Limp Point moves with this number rather than with the last
+ * frame, so one noisy sample moves it by dt/TAU - about a hundredth - of what
+ * the same current held for a minute does, while a launch the rider is
+ * actually holding walks it up frame by frame and easing off walks it back
+ * down. The filter is in the input, one level below the quotient, exactly
+ * where Consumption's is; Range still has none of its own.
+ *
+ * The first sample assigns rather than pulls, the same acquisition the Anchor
+ * and the Odometer make: there is no previous average to preserve, and
+ * starting from zero would spend the first twenty seconds of every ride
+ * understating the Sag the rider is already paying.
+ */
+static void load_step(wf_est_t *e, uint32_t dt_ms, double amps)
+{
+    if (!e->load_valid) {
+        e->load_a     = amps;
+        e->load_valid = true;
+        return;
+    }
+    if (dt_ms == 0) {
+        return;
+    }
+    if (dt_ms > WF_EST_DT_MAX_MS) {
+        dt_ms = WF_EST_DT_MAX_MS;
+    }
+    double k = ((double)dt_ms / 1000.0) / WF_EST_SAG_TAU_S;
+    if (k > 1.0) {
+        k = 1.0;
+    }
+    e->load_a += (amps - e->load_a) * k;
+}
+
+/* One power sample into both, then remembered as the previous one. Called
+ * before the energy integration so that the pair it measures across is the
+ * pair the stream delivered, whatever the integration then decides to do with
+ * the interval. */
+static void sag_step(wf_est_t *e, uint32_t t_ms, double volts, double amps)
+{
+    uint32_t dt_ms = 0;
+    if (e->ir_prev_valid) {
+        dt_ms = t_ms - e->ir_prev_t_ms;   /* modular, like every other delta */
+        ir_fold(e, t_ms, dt_ms, volts, amps);
+    }
+    load_step(e, dt_ms, amps);
+
+    e->ir_prev_v     = volts;
+    e->ir_prev_a     = amps;
+    e->ir_prev_t_ms  = t_ms;
+    e->ir_prev_valid = true;
 }
 
 /* ---------------------------------------------------------------- distance */
@@ -436,6 +615,12 @@ void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
     e->last_power_w = volts * amps;
     e->power_samples++;
 
+    /* The Pack under load: a step measured against the previous sample, and
+     * the load average the Limp Point is moved by. Both before the integration
+     * and independent of it - a sample that starts the clock rather than
+     * closing an interval is still a voltage and a current the Pack showed. */
+    sag_step(e, t_ms, volts, amps);
+
     if (!e->power_t_valid) {
         /* Nothing to integrate over yet: the first sample only starts the
          * clock. */
@@ -541,11 +726,46 @@ void wf_est_get(const wf_est_t *e, wf_est_out_t *out)
     out->valid    = e->acquired || e->restored;
     out->anchored = e->acquired;
 
+    /* Sag, and the Limp Point it moves. The estimate is faded in over its
+     * first WF_EST_IR_CONFIDENT_SAMPLES accepted steps so that the first one
+     * of a Monitor's life - which arrives mid-launch, because that is what
+     * makes it acceptable - does not take several kilometres off the Range in
+     * a single frame. A restored estimate comes back at full weight and so at
+     * full confidence.
+     *
+     * The load is the averaged one and never the last frame's, which is the
+     * whole of why this cannot make Range twitch; see load_step(). */
+    if (e->ir_weight > 0) {
+        uint32_t w = e->ir_weight < WF_EST_IR_CONFIDENT_SAMPLES
+                         ? e->ir_weight
+                         : WF_EST_IR_CONFIDENT_SAMPLES;
+        double conf = (double)w / (double)WF_EST_IR_CONFIDENT_SAMPLES;
+        out->ir_valid = true;
+        out->ir_ohm   = e->ir_ohm;
+        out->sag_v    = e->ir_ohm * conf * e->load_a;
+        if (out->sag_v < 0.0) {
+            out->sag_v = 0.0;
+        }
+    }
+    out->ir_weight    = e->ir_weight;
+    out->ir_steps     = e->ir_steps;
+    out->ir_rejected  = e->ir_rejected;
+    out->ir_soc_pct   = e->ir_soc_pct;
+    out->load_a       = e->load_a;
+    out->limp_point_v = WF_EST_LIMP_POINT_V + out->sag_v;
+
     /* Clamped at zero for the rider. Past the Limp Point there is no model
      * here worth showing a number from - issue #8 measures what actually
      * happens down there - and "0 Wh" is the honest thing to say meanwhile.
-     * The unclamped value stays in the state for the harness to look at. */
-    out->remaining_wh = e->remaining_wh > 0.0 ? e->remaining_wh : 0.0;
+     * The unclamped value stays in the state for the harness to look at.
+     *
+     * The Sag reserve comes off here and nowhere else. The integrated figure
+     * counts down to the resting Limp Point; what the rider has left is that
+     * minus the band between the resting Limp Point and the one their right
+     * wrist is currently holding. With no measured resistance the reserve is
+     * exactly zero and this is the figure it always was. */
+    double rem = e->remaining_wh - wf_est_sag_reserve_wh(out->sag_v);
+    out->remaining_wh = rem > 0.0 ? rem : 0.0;
 
     out->coulomb_ah     = e->coulomb_ah;
     out->soc_pct        = (e->coulomb_ah / WF_EST_RATED_CAPACITY_AH) * 100.0;
@@ -665,4 +885,11 @@ void wf_est_save(const wf_est_t *e, wf_est_persist_t *out)
         out->window_wh = (float)win_wh;
         out->window_m  = (float)win_m;
     }
+
+    /* Internal Resistance, with the weight it was averaged over, which is what
+     * makes it improve across rides rather than start again: the next ride
+     * folds its steps into this mean at this weight. The load average behind
+     * Sag is deliberately not here - it is riding, not a Pack. */
+    out->ir_ohm    = (float)e->ir_ohm;
+    out->ir_weight = (uint16_t)e->ir_weight;
 }

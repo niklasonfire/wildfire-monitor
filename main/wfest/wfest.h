@@ -256,12 +256,96 @@
  * at all and the screen shows a dash, which is the same answer Consumption
  * itself gives below its own floor.
  *
- * WARNING, and it is the big one: every watt-hour below is scaled by
- * WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 % - upstream says 4 LSB
- * per amp, regression against the BMS says 4.77. That uncertainty propagates
- * undiminished into every figure this header produces. Issue #12 closes it
- * against Ride 1. Until then, treat the watt-hours as accurate to about a
- * fifth.
+ * ---------------------------------------------------------------------------
+ * Internal Resistance, and the Limp Point that moves with it
+ * ---------------------------------------------------------------------------
+ *
+ *   Internal Resistance  the Pack's opposition to current, in ohms, as Sag per
+ *                        amp: the ratio of a voltage change to the current
+ *                        change that caused it, at a sharp load step
+ *   Sag                  Internal Resistance times the load the rider is
+ *                        holding, in volts
+ *
+ * The Limp Point is a voltage event, and a voltage event under load. The
+ * Controller cuts to walking pace when the Pack voltage it sees falls below
+ * its threshold, and the voltage it sees is the rested voltage minus Sag. So a
+ * rider holding 150 A reaches that threshold with a fifth of the Pack still in
+ * it, and the same rider easing off gets it back. A Range built on a fixed
+ * 84.0 V cannot say either thing, and is wrong in the direction that strands
+ * people.
+ *
+ * So the fixed Limp Point stays exactly where it was, and Sag is applied on
+ * top of it as a reserve: the watt-hours lying between WF_EST_LIMP_POINT_V and
+ * WF_EST_LIMP_POINT_V + Sag are subtracted from Remaining Energy at the moment
+ * it is read. The integration and the Anchor are untouched - they still count
+ * down to the fixed line, so no integrated state has to be re-based when the
+ * load changes, and a change to the Sag model can never corrupt a Coulomb
+ * Count. wf_est_sag_reserve_wh() is the whole of the model and is exposed so it
+ * can be checked on its own.
+ *
+ * Estimating the resistance is a rejection problem, not an averaging problem.
+ * Voltage arrives quantised to 0.1 V and current to a quarter of an amp, both
+ * at ~5.2 Hz, and a ratio of two small quantised differences is mostly noise -
+ * so the design is in what is refused. WF_EST_IR_MIN_DI_A is derived from the
+ * two quantisations rather than chosen; the rules are written out where the
+ * constants are.
+ *
+ * Two things this rate costs, and they are worth being straight about. At one
+ * sample per ~192 ms the ohmic step and the Pack's fast polarisation cannot be
+ * told apart, so what is measured is the resistance seen over about a fifth of
+ * a second and not the pure ohmic value - larger than an instantaneous one,
+ * and the right one for predicting Sag under a load the rider is holding.
+ * And the peak of a transient is never seen at all, so the Sag modelled here
+ * is the Sag of sustained riding rather than the dip of one throttle stab.
+ *
+ * Which is also, deliberately, what keeps Range steady. The load fed into the
+ * Sag model is not the last frame's current but an average of it over
+ * WF_EST_SAG_TAU_S, so a single frame moves the Limp Point by about a
+ * hundredth of what a sustained load does. The smoothing lives in the input,
+ * one level down, exactly as Consumption's does - Range still has no filter of
+ * its own.
+ *
+ * ---------------------------------------------------------------------------
+ * WARNING: the 19 %, and which way it goes in each figure
+ * ---------------------------------------------------------------------------
+ *
+ * WF_CTRL_CURRENT_LSB_PER_A is uncertain by 19 % - upstream says 4 LSB per
+ * amp, regression against the BMS says 4.77 - so every current this file
+ * integrates may be a fifth too high. Issue #12 closes it against Ride 1.
+ * Until then the magnitude is a fifth everywhere and the *direction is not the
+ * same in every figure*, which is the part a reader will otherwise get wrong:
+ *
+ *   Consumption, used_wh, used_ah and the two all-time totals scale DIRECTLY
+ *   with the constant. They are integrals of current and nothing corrects
+ *   them. If the true scale is 4.77, they read 19 % high.
+ *
+ *   Remaining Energy is Anchored to the BMS's State of Charge, and the BMS
+ *   knows nothing about the Controller's current scale. With a live Anchor the
+ *   figure is therefore largely INDEPENDENT of the constant: the exposure is
+ *   only what the integration accumulates between one BMS answer and the next,
+ *   about a second of it, which the pull then takes back out. Through a long
+ *   BMS gap that protection is gone and the figure drifts with the scale like
+ *   any other integral - which is exactly the case
+ *   test_a_bms_gap_produces_no_step() drives.
+ *
+ *   Range is Remaining Energy over Consumption, so the error enters ONCE,
+ *   through the denominator alone. A 19 % overestimate of current makes
+ *   Consumption 19 % high and Range 1 - 1/1.19 = 16 % PESSIMISTIC. It does not
+ *   enter twice, and the two halves do not cancel: the numerator is not scaled
+ *   by it at all.
+ *
+ *   Internal Resistance is Sag per amp, and current is in its denominator, so
+ *   it sits where Range sits and not where Consumption sits: a 19 % high
+ *   current scale reads a 16 % LOW resistance. Issue #21 reads this number as
+ *   a State of Health signal and has to carry that bias with it.
+ *
+ *   Sag is the one figure here that the constant CANCELS out of, and it is the
+ *   one that moves the Limp Point. The resistance is measured as dV/dI in the
+ *   Controller's own amps and is then multiplied by a load measured in the
+ *   same amps: the scale appears once in a denominator and once in a numerator
+ *   and leaves. The Sag-corrected Limp Point, and the watt-hours Range gives
+ *   up because of it, are as good as the voltage readings alone - the one part
+ *   of this file that does not have to wait for Ride 1.
  */
 #ifndef WFEST_H
 #define WFEST_H
@@ -281,8 +365,12 @@
  * Provenance: 28 Cells in series at 3.00 V per Cell, the conventional
  * under-load floor for this chemistry. It is NOT read from the Controller -
  * its cutback parameter appears in no Capture we hold - and it is NOT
- * measured. Issue #8, the full-discharge ride, measures the real value; issue
- * #17 makes it move with load, because Sag is what decides when it arrives.
+ * measured. Issue #8, the full-discharge ride, measures the real value.
+ *
+ * It is the Limp Point at rest. What Range counts down to is this plus Sag at
+ * the load the rider is holding, which is issue #17 and is the Internal
+ * Resistance section below; the constant itself did not move and does not move
+ * with load. `limp_point_v` in wf_est_out_t is the moving figure.
  *
  * Change this one number and every watt-hour below moves with it. That is the
  * point of it being one number.
@@ -425,6 +513,101 @@
  */
 #define WF_EST_RANGE_MIN_CONS_WH_PER_KM  5.0
 
+/* ------------------------------------------- Internal Resistance's thresholds
+ *
+ * What counts as a load step sharp enough to measure a Pack with, and what a
+ * measured Pack is allowed to look like. Every number here is derived from an
+ * instrument's quantisation or from what a 28-Cell Pack can physically be;
+ * none of them is a round number picked because it looked reasonable.
+ *
+ * THE TWO QUANTISATIONS. Internal Resistance is dV/dI and both are quantised,
+ * so both land straight in the estimate. Pack voltage is a u16 scaled by 0.1
+ * (field-table.json, Controller `pack_v`), so a reading is up to half a
+ * quantum out and a *difference* of two readings up to a whole one: 0.1 V.
+ * Line current is scaled by WF_CTRL_CURRENT_LSB_PER_A, so the same argument
+ * gives a whole quantum on the difference: 0.25 A at 4 LSB per amp.
+ *
+ * THE PLAUSIBILITY BOUND. A 28-Cell, ~5 kWh lithium Pack with its cabling and
+ * connectors is tens of milliohms. 20 mOhm is about as stiff as this Pack
+ * could be when new and warm; 200 mOhm is a Pack that is cold, old, or being
+ * measured through a bad connection, and is where a believable reading stops.
+ * An estimate outside that has found noise, a decode error or a stationary
+ * transient, and is thrown away rather than averaged in - which also throws
+ * away every step where the voltage moved the wrong way, since that gives a
+ * negative ratio and negative is below the floor.
+ *
+ * THE STEP THRESHOLD, which follows from the three above rather than being
+ * chosen. For one step,
+ *
+ *   dR/R  <=  q_V / |dV|  +  q_I / |dI|  =  q_V / (R |dI|)  +  q_I / |dI|
+ *
+ * and the worst case over a plausible Pack is the stiffest one, R = MIN_OHM,
+ * because that is where a given current step produces the smallest voltage
+ * step to measure. Demanding no worse than WF_EST_IR_STEP_ERR from one step
+ * rearranges to the minimum current step below - 21 A on today's numbers, and
+ * it moves on its own if the current scale is corrected or the bound on the
+ * Pack changes. At the Pack's likely 50 mOhm the same step carries about 11 %,
+ * and the running mean takes that down further.
+ *
+ * Note which quantisation dominates: 0.1 V over a 20 mOhm Pack is 5 A of
+ * equivalent current error against the current channel's own 0.25 A. The
+ * voltage's tenth of a volt is twenty times the problem the current's quarter
+ * of an amp is, and a threshold reasoned from the current channel alone would
+ * be twenty times too permissive.
+ *
+ * MAX_DT_MS is what "sharp" means in time. Voltage and current arrive together
+ * every ~192 ms (ADR-0003), so two consecutive samples is the sharpest thing
+ * this stream can show; 400 ms allows one jittered interval and refuses a pair
+ * that straddles a dropped frame, where a ramp would be indistinguishable from
+ * a step. Together with MIN_DI_A that makes the acceptance rule "at least 21 A
+ * within 400 ms", or at least 52 A/s - which a launch from rest clears easily
+ * and a rider rolling on the throttle does not.
+ */
+#define WF_EST_IR_V_QUANTUM_V     0.1
+#define WF_EST_IR_I_QUANTUM_A     (1.0 / WF_CTRL_CURRENT_LSB_PER_A)
+#define WF_EST_IR_MIN_OHM         0.020
+#define WF_EST_IR_MAX_OHM         0.200
+#define WF_EST_IR_STEP_ERR        0.25
+#define WF_EST_IR_MIN_DI_A        ((WF_EST_IR_V_QUANTUM_V / WF_EST_IR_MIN_OHM + \
+                                    WF_EST_IR_I_QUANTUM_A) / WF_EST_IR_STEP_ERR)
+#define WF_EST_IR_MAX_DT_MS       400u
+
+/* ------------------------------------------------ Internal Resistance's knobs
+ *
+ * Not physics: how the accepted steps are turned into one number, and how fast
+ * that number is allowed to move the rider's Range.
+ *
+ * SAMPLES_MAX is the weight cap on the running mean. Each accepted step moves
+ * the estimate by 1/n of the way to itself, with n capped here, so the first
+ * launch of a Monitor's life settles it and the two hundredth cannot wander it
+ * - a step is worth at most a sixty-fourth once the estimate is grown up. That
+ * is the "stable, not wandering with each step" criterion as arithmetic, and
+ * it is a cap rather than a freeze because a Pack's resistance genuinely rises
+ * with age and the estimate has to be able to follow it. Sixty-four steps is a
+ * few spirited rides.
+ *
+ * CONFIDENT_SAMPLES is how the Sag correction fades in, and it exists to keep
+ * one number off the rider's screen: a step. The first accepted step of a
+ * Monitor's life arrives in the middle of a hard launch - that is what makes
+ * it acceptable - and applying a full Sag reserve at that instant would take
+ * several kilometres off the Range in one frame. So the reserve is scaled by
+ * min(n, CONFIDENT) / CONFIDENT, which is the same instinct as the Anchor's
+ * pull: never assign, always approach. A launch and the release at the end of
+ * it are two steps, so eight is four launches - the first few minutes of any
+ * ride that involves a throttle.
+ *
+ * SAG_TAU_S is the load average the Sag model is driven by, and it is the
+ * whole of the anti-jitter design. At 5.2 Hz a single frame moves it by
+ * dt/TAU, about 1 %, so one noisy frame moves the Limp Point by a hundredth of
+ * what the same current sustained does; ten seconds of real acceleration moves
+ * it by 39 % of the way. Long enough that the number is riding style and not
+ * throttle position, short enough that easing off is repaid while the rider is
+ * still easing off.
+ */
+#define WF_EST_IR_SAMPLES_MAX        64u
+#define WF_EST_IR_CONFIDENT_SAMPLES  8u
+#define WF_EST_SAG_TAU_S             20.0
+
 /* ----------------------------------------------------------- sign convention
  *
  * Positive current is discharge - the Controller's own convention, kept
@@ -475,6 +658,21 @@
  * - which is exactly what a build that did not compute Consumption knew - so
  * the first ride after the update rebuilds both.
  *
+ * Version 4 grew it again, 40 bytes to 46, for Internal Resistance: the
+ * estimate and the weight it was averaged over. Same migration rule, same
+ * reason - a version 3 blob restores no resistance and no Sag correction,
+ * which is what a build without one knew, and the first hard launch after the
+ * update measures one.
+ *
+ * The weight is what makes the estimate improve across rides rather than start
+ * again each morning: a Monitor that comes back with sixty-four steps behind
+ * its number treats the next step as a sixty-fourth, and one that comes back
+ * with three treats the next as a quarter. What is deliberately NOT persisted
+ * is the load average behind Sag. That is riding and not a fact about the
+ * Pack; a Monitor that comes back mid-ride re-acquires it from the first power
+ * frame, and one that comes back after a coffee stop should be starting from
+ * the standing load it actually has.
+ *
  * The window summary, window_wh over window_m, is the one piece of state here
  * that is a filter rather than a fact. It is saved only when the ring was full
  * and it is restored by spreading it evenly across the ring, so the Monitor
@@ -488,9 +686,10 @@
  * figure at all; the Rated Capacity guard in wf_est_init() throws away a
  * charge count and has nothing to say about a distance or a Consumption.
  */
-#define WF_EST_PERSIST_VERSION      3
+#define WF_EST_PERSIST_VERSION      4
 #define WF_EST_PERSIST_VERSION_MIN  1   /* the oldest layout still readable */
-#define WF_EST_PERSIST_BYTES        40
+#define WF_EST_PERSIST_BYTES        46
+#define WF_EST_PERSIST_BYTES_V3     40  /* the version 3 layout */
 #define WF_EST_PERSIST_BYTES_V2     24  /* the version 1 and 2 layout */
 
 typedef struct {
@@ -508,6 +707,12 @@ typedef struct {
     float    alltime_m;         /* Distance over every ride, in metres */
     float    window_wh;
     float    window_m;
+    /* Internal Resistance, version 4: the estimate in ohms and the number of
+     * accepted load steps it is the running mean of, capped at
+     * WF_EST_IR_SAMPLES_MAX. Zero weight means no estimate, and then the ohms
+     * mean nothing and no Sag is applied. */
+    float    ir_ohm;
+    uint16_t ir_weight;
 } wf_est_persist_t;
 
 /* Writes exactly WF_EST_PERSIST_BYTES into buf, little endian, with a magic,
@@ -564,6 +769,25 @@ typedef struct {
     uint16_t odo_counts;        /* the last raw count differenced against */
     bool     odo_seen;          /* the Odometer has been acquired */
     bool     speed_seen;        /* a road speed has been integrated */
+
+    /* Internal Resistance, and the load average Sag is computed at. Both move
+     * only on power-block frames, because both are about the Pack under load
+     * and that is the only block that carries a voltage and a current.
+     *
+     * The previous power sample is kept in full - value and timestamp - rather
+     * than leaning on power_t_ms, so that what a step is measured across is
+     * visibly the pair of samples and not whatever else has been going on. */
+    double   ir_ohm;            /* the running mean over accepted steps */
+    double   ir_soc_pct;        /* the Anchor when that step was accepted */
+    uint32_t ir_weight;         /* steps in the mean, capped at SAMPLES_MAX */
+    uint32_t ir_steps;          /* accepted steps this power-on, uncapped */
+    uint32_t ir_rejected;       /* sharp enough to try, refused anyway */
+    double   ir_prev_v;
+    double   ir_prev_a;
+    uint32_t ir_prev_t_ms;
+    bool     ir_prev_valid;
+    double   load_a;            /* the load Sag is taken at, averaged */
+    bool     load_valid;
 
     /* the clock, entirely as fed */
     uint32_t last_t_ms;         /* most recent t_ms of any feed */
@@ -656,6 +880,37 @@ typedef struct {
     bool     range_valid;
     double   range_km;
 
+    /* Internal Resistance and the Limp Point it moves.
+     *
+     * `ir_valid` is false until a load step has been accepted or a persisted
+     * estimate restored, and then `ir_ohm` is exactly zero and no Sag is
+     * applied at all - the Monitor does not invent a Pack resistance, and a
+     * ride that never launches hard counts down to the fixed Limp Point
+     * exactly as it did before this existed.
+     *
+     * `ir_ohm` is the running mean over `ir_weight` accepted steps; `ir_steps`
+     * counts every step accepted since power-on and `ir_rejected` counts those
+     * that were sharp enough to try and were refused anyway - a Pack that
+     * produces nothing but rejections is a decode problem, not a quiet zero.
+     * `ir_soc_pct` is the State of Charge the last accepted step was taken at,
+     * because resistance depends on it and issue #21 compares readings over
+     * months.
+     *
+     * `load_a` is the averaged load Sag is taken at, `sag_v` is the volts it
+     * costs, and `limp_point_v` is what Range is actually counting down to:
+     * WF_EST_LIMP_POINT_V plus Sag. Remaining Energy above is already net of
+     * the reserve between the two, so Range needs no further correction and
+     * main/ui.c needs no arithmetic. */
+    bool     ir_valid;
+    double   ir_ohm;
+    uint32_t ir_weight;
+    uint32_t ir_steps;
+    uint32_t ir_rejected;
+    double   ir_soc_pct;
+    double   load_a;
+    double   sag_v;
+    double   limp_point_v;
+
     uint32_t power_samples;
     uint32_t anchor_samples;
     uint32_t distance_samples;
@@ -670,7 +925,9 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored);
  *
  * frame_type is the frame's own type byte, and it decides what this does:
  *
- *   the power block's eight types   integrate energy and charge
+ *   the power block's eight types   integrate energy and charge, measure a
+ *                                   load step against the previous sample, and
+ *                                   move the load average Sag is taken at
  *   the motion block's eight types  integrate distance, and pull it toward
  *                                   the Odometer
  *   the Odometer's type, 0x94       move the Odometer Anchor, nothing else
@@ -716,14 +973,32 @@ double wf_est_limp_soc_pct(void);
 
 /* Pack voltage the line predicts at a given State of Charge. Deliberately not
  * the Controller's live reading: that sags under load, and Remaining Energy
- * must not fall by a hundred watt-hours because the rider opened the throttle.
- * Making the Limp Point move with the live voltage is issue #17. */
+ * must not fall by a hundred watt-hours because the rider opened the throttle
+ * for one frame. Sag reaches the figure through wf_est_sag_reserve_wh() below,
+ * driven by an averaged load and a measured resistance, which is the same
+ * physics with the noise taken out of it. */
 double wf_est_pack_v_at_soc(double soc_pct);
+
+/* The watt-hours lying between the Limp Point and one Sag above it: the energy
+ * a rider gives up by holding the load that produces that Sag, and the whole
+ * of the Sag model.
+ *
+ * On the straight line above, the charge in a band of the Pack depends only on
+ * how many volts wide the band is, so this is a function of Sag alone and not
+ * of where the State of Charge happens to be. Zero for a Sag of zero or less -
+ * regeneration raises the terminal voltage, and crediting a rider with extra
+ * Range for a downhill would be optimistic in exactly the wrong direction. */
+double wf_est_sag_reserve_wh(double sag_v);
 
 /* Energy above the Limp Point at a given State of Charge, in watt-hours: the
  * charge between here and the Limp Point, times the mean voltage it will be
  * delivered at along the line. Zero at and below the Limp Point. This is what
- * the Anchor pulls Remaining Energy toward. */
+ * the Anchor pulls Remaining Energy toward.
+ *
+ * Against the fixed WF_EST_LIMP_POINT_V, always. The integration and the
+ * Anchor are defined against the resting line so that they do not have to be
+ * re-based every time the rider's wrist moves; Sag is subtracted from the
+ * result at read time instead. */
 double wf_est_energy_above_limp_wh(double soc_pct);
 
 #endif /* WFEST_H */

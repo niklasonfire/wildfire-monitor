@@ -733,13 +733,25 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      *            where the star's other end is.
      *
      * The tilde is there on both, because the figure is provisional twice
-     * over and the hint line says so in words: it counts down to a Limp Point
-     * of 84.0 V that is assumed rather than measured (WF_EST_LIMP_POINT_V;
-     * issue #8 measures it, issue #17 makes it move with Sag), and every
-     * watt-hour behind it is scaled by a line current whose LSB is uncertain
-     * by 19 % until Ride 1 settles it. That 19 % goes into Range twice - once
-     * through Remaining Energy and once through Consumption - so these
-     * kilometres are worth about a fifth less or a fifth more than they say.
+     * over and the hint line says so in words.
+     *
+     * It counts down to a Limp Point whose resting value, 84.0 V, is assumed
+     * rather than measured (WF_EST_LIMP_POINT_V; issue #8 measures it). What
+     * that Limp Point does under load is no longer assumed: once a hard launch
+     * has measured the Pack's Internal Resistance - or a previous ride's has
+     * been restored from NVS - it moves with the Sag the rider's own throttle
+     * is producing, so this number falls on a sustained hard pull and comes
+     * back on easing off. Until then there is no measured resistance and no
+     * invented one, and it counts down to the resting 84.0 V exactly as it
+     * always did. `limp_point_v` in the estimate is where it currently sits.
+     *
+     * And every watt-hour behind it is scaled by a line current whose LSB is
+     * uncertain by 19 % until Ride 1 settles it. That 19 % enters Range ONCE,
+     * through Consumption in the denominator - Remaining Energy is Anchored to
+     * the BMS, which knows nothing of the Controller's current scale - so a
+     * current scale 19 % high makes these kilometres about 16 % pessimistic.
+     * It does not enter twice and the two halves do not cancel; wfest.h works
+     * the whole propagation out, figure by figure.
      *
      * Dim rather than hint-coloured while the figure rests on state restored
      * from NVS that no BMS answer has confirmed yet, exactly as the energy

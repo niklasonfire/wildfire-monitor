@@ -23,6 +23,14 @@ of the recorded stream even though it behaves like a filter. It is fused from
 two sources the same way charge is, integration Anchored to something slower
 and more trustworthy, so it is the same code shape as well as the same seam.
 
+The load average behind Sag is inside the seam on the same terms, and it is the
+one filter here that is indexed by time rather than by metres — because load is
+a time phenomenon and a rider holding the throttle open at a standstill is
+still sagging their Pack. It stays replayable all the same: its step is
+`dt / TAU` on a `dt` that came out of the record, so it is still a function of
+the recorded stream and not of when anything was read. It is what lets the Limp
+Point move with riding style without moving with individual frames.
+
 Range is in the seam too, and it is the one figure there that holds no state of
 its own: it is Remaining Energy divided by Consumption, computed where both
 already are, guarded by a floor on the divisor. That is deliberate rather than

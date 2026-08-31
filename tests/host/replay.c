@@ -156,6 +156,14 @@ typedef struct {
      * .expect file - which is where a per-ride fact goes. It is deliberately
      * not an invariant here: a Range that rises when the rider slows down is
      * the figure working, and an invariant would forbid it on every Capture. */
+    /* Internal Resistance and the Sag it puts on the Limp Point. cap0007
+     * cannot produce either - its largest load step is under half of
+     * WF_EST_IR_MIN_DI_A - and "this ride measured no Pack" is exactly the
+     * fact worth pinning on it, so these are collected unconditionally. On a
+     * ride with hard launches in it they are the per-ride record of what the
+     * Pack looked like that day, which is what issue #21 will compare across
+     * months. */
+    double   sag_v_max;
     long     range_points;
     double   range_km_first, range_km_last;
     double   range_km_prev;
@@ -215,6 +223,9 @@ static void est_sample(run_t *r)
 {
     wf_est_out_t o;
     wf_est_get(&r->est, &o);
+    if (o.sag_v > r->sag_v_max) {
+        r->sag_v_max = o.sag_v;
+    }
     if (o.distance_valid) {
         dist_point(r, o.distance_m);
         r->dist_odo_last = o.odo_distance_m;
@@ -606,6 +617,25 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "est_anchor_samples", (double)o.anchor_samples);
     }
 
+    /* Internal Resistance. Unconditional for the same reason Consumption's
+     * source is: on a ride that never launched, "no steps, no estimate, no
+     * Sag" is the fact worth pinning, and if a future change ever measures a
+     * Pack off 47 s of crawling these three move off zero and say so. The ohms
+     * appear only when there is an estimate, so a fixture cannot pin a
+     * resistance that was never measured. */
+    {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        put(ms, "est_ir_steps", (double)o.ir_steps);
+        put(ms, "est_ir_rejected", (double)o.ir_rejected);
+        put(ms, "est_sag_v_max", r->sag_v_max);
+        if (o.ir_valid) {
+            put(ms, "est_ir_ohm", o.ir_ohm);
+            put(ms, "est_ir_weight", (double)o.ir_weight);
+            put(ms, "est_ir_soc_pct", o.ir_soc_pct);
+        }
+    }
+
     if (r->dist_points > 0) {
         wf_est_out_t o;
         wf_est_get(&r->est, &o);
@@ -770,6 +800,46 @@ static void check_invariants(const char *fixture, const run_t *r)
     if (r->est_soc_gap_samples > 0 && r->est_soc_gap_max > 5.0) {
         fail(fixture, "the Coulomb Count drifted %.2f %% from its Anchor over "
                       "%ld samples", r->est_soc_gap_max, r->est_soc_gap_samples);
+    }
+
+    /* ---- Internal Resistance and the Limp Point it moves ----
+     *
+     * Two invariants, and they hold on any Capture whatever the ride did.
+     *
+     * A Pack that was measured has to look like a Pack: the estimate lands
+     * inside the plausibility bound the estimator itself refuses to average
+     * outside of, so a number that got in by another route would show here.
+     *
+     * A Pack that was not measured has to leave the Limp Point exactly where
+     * it was. This is the "no invented resistance" rule as arithmetic: with no
+     * accepted step and nothing restored there is no Sag, no reserve, and the
+     * fixed 84.0 V is what Remaining Energy counts down to - which is what
+     * makes every figure on a ride like cap0007 identical to what it was
+     * before any of this existed. */
+    if (o.ir_valid) {
+        if (o.ir_ohm < WF_EST_IR_MIN_OHM || o.ir_ohm > WF_EST_IR_MAX_OHM) {
+            fail(fixture, "an Internal Resistance of %.4f Ohm, outside the "
+                          "%.3f-%.3f Ohm a 28-Cell Pack can be",
+                 o.ir_ohm, WF_EST_IR_MIN_OHM, WF_EST_IR_MAX_OHM);
+        }
+        if (o.ir_weight == 0 || o.ir_weight > WF_EST_IR_SAMPLES_MAX) {
+            fail(fixture, "an Internal Resistance averaged over a weight of "
+                          "%u", o.ir_weight);
+        }
+    } else if (o.ir_ohm != 0.0 || o.sag_v != 0.0 ||
+               o.limp_point_v != WF_EST_LIMP_POINT_V) {
+        fail(fixture, "no Internal Resistance was measured, and yet the Limp "
+                      "Point moved to %.3f V on %.3f V of Sag from %.4f Ohm",
+             o.limp_point_v, o.sag_v, o.ir_ohm);
+    }
+    if (o.sag_v < 0.0) {
+        fail(fixture, "Sag of %.3f V: the Limp Point moved the wrong way",
+             o.sag_v);
+    }
+    if (o.limp_point_v != WF_EST_LIMP_POINT_V + o.sag_v) {
+        fail(fixture, "the Limp Point is %.6f V against the %.6f V its own Sag "
+                      "implies", o.limp_point_v,
+             WF_EST_LIMP_POINT_V + o.sag_v);
     }
 
     /* ---- distance ---- */
@@ -1140,6 +1210,21 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                r->est_wh_first, r->est_wh_last, WF_EST_LIMP_POINT_V,
                wf_est_limp_soc_pct(), o.used_wh, o.soc_pct, o.anchor_soc_pct,
                r->est_points, (unsigned long long)r->est_hash);
+    }
+    {
+        wf_est_out_t o;
+        wf_est_get(&r->est, &o);
+        if (o.ir_valid) {
+            printf("  pack: %.1f mOhm over %u load steps (%lu refused), Sag "
+                   "<=%.2f V, Limp Point %.1f V at %.1f A\n",
+                   o.ir_ohm * 1000.0, o.ir_weight,
+                   (unsigned long)o.ir_rejected, r->sag_v_max, o.limp_point_v,
+                   o.load_a);
+        } else {
+            printf("  pack: no load step over %.1f A in this ride, so no "
+                   "Internal Resistance and no Sag - the Limp Point stays at "
+                   "%.1f V\n", WF_EST_IR_MIN_DI_A, WF_EST_LIMP_POINT_V);
+        }
     }
     if (r->dist_points > 0) {
         printf("  distance: %.1f m fused from %.1f m of Odometer, %ld curve "

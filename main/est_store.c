@@ -45,10 +45,11 @@ bool est_store_load(wf_est_persist_t *out)
         return false;
     }
     ESP_LOGI(TAG, "restored v%u: %.2f Ah / %.0f Wh / %.0f m, all-time "
-                  "%.0f Wh over %.0f m",
+                  "%.0f Wh over %.0f m, pack %.1f mOhm over %u steps",
              out->version, (double)out->coulomb_ah, (double)out->remaining_wh,
              (double)out->distance_m, (double)out->alltime_wh,
-             (double)out->alltime_m);
+             (double)out->alltime_m, (double)out->ir_ohm * 1000.0,
+             out->ir_weight);
     return true;
 }
 

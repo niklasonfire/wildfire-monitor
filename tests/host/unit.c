@@ -1583,7 +1583,7 @@ static void test_a_version_2_blob_is_migrated(void)
     };
     CHECK(wf_est_persist_encode(&cur, wide, sizeof(wide)), "encode failed");
     CHECK(!wf_est_persist_decode(wide, sizeof(wide), &p),
-          "a 40-byte blob claiming version 2 decoded");
+          "a %d-byte blob claiming version 2 decoded", WF_EST_PERSIST_BYTES);
 
     /* And a version this build has never written is not read at all, however
      * good its checksum is. */
@@ -1591,6 +1591,79 @@ static void test_a_version_2_blob_is_migrated(void)
     CHECK(wf_est_persist_encode(&cur, wide, sizeof(wide)), "encode failed");
     CHECK(!wf_est_persist_decode(wide, sizeof(wide), &p),
           "a blob from a future version decoded");
+}
+
+/* Version 3 is the layout Internal Resistance replaced: 40 bytes, everything
+ * this build knows except a resistance and the weight behind it. Migrated for
+ * the same reason version 2 was - a rider should not lose their Distance,
+ * their charge and their Consumption history to the firmware update that
+ * started measuring their Pack.
+ *
+ * Built as a prefix of the current layout rather than field by field, because
+ * that is exactly what it is: bytes 0..37 are identical and only the CRC moves
+ * to the end of the shorter record. If that ever stopped being true this test
+ * would be the thing that noticed. */
+static void build_v3_blob(uint8_t blob[WF_EST_PERSIST_BYTES],
+                          const wf_est_persist_t *from)
+{
+    wf_est_persist_t v3 = *from;
+    v3.version = 3;
+    if (!wf_est_persist_encode(&v3, blob, WF_EST_PERSIST_BYTES)) {
+        return;
+    }
+    uint16_t crc = wf_crc16(blob, WF_EST_PERSIST_BYTES_V3 - 2, 0xffff);
+    blob[WF_EST_PERSIST_BYTES_V3 - 2] = (uint8_t)(crc & 0xff);
+    blob[WF_EST_PERSIST_BYTES_V3 - 1] = (uint8_t)(crc >> 8);
+}
+
+static void test_a_version_3_blob_is_migrated(void)
+{
+    wf_est_persist_t saved;
+    memset(&saved, 0, sizeof(saved));
+    saved.valid             = true;
+    saved.coulomb_ah        = 30.0f;
+    saved.remaining_wh      = 1500.0f;
+    saved.rated_capacity_ah = (float)WF_EST_RATED_CAPACITY_AH;
+    saved.distance_valid    = true;
+    saved.distance_m        = 8000.0f;
+    saved.alltime_wh        = 4000.0f;
+    saved.alltime_m         = 50000.0f;
+    /* A version 3 build could not have written these two, and this is the
+     * check that they are not read out of the bytes it did write. */
+    saved.ir_ohm            = 0.050f;
+    saved.ir_weight         = 40;
+
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    build_v3_blob(blob, &saved);
+
+    wf_est_persist_t p;
+    CHECK(wf_est_persist_decode(blob, WF_EST_PERSIST_BYTES_V3, &p),
+          "a version 3 blob was rejected rather than migrated");
+    CHECK_U(p.version, 3, "the version the blob was written at");
+    CHECK_D(p.distance_m, 8000.0, 1e-6, "the migrated Distance");
+    CHECK_D(p.alltime_m, 50000.0, 1e-6, "the migrated all-time distance");
+    CHECK_D(p.ir_ohm, 0.0, 0.0,
+            "a version 3 blob carried an Internal Resistance it cannot have "
+            "written");
+    CHECK_U(p.ir_weight, 0, "a version 3 blob carried a weight");
+
+    wf_est_t e;
+    wf_est_init(&e, &p);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.valid, "the migrated charge figures were not restored");
+    CHECK_D(o.distance_m, 8000.0, 1e-6, "the restored Distance");
+    CHECK(!o.ir_valid,
+          "a version 3 blob produced an Internal Resistance out of nothing");
+    CHECK_D(o.sag_v, 0.0, 0.0, "Sag from a blob that carried no resistance");
+
+    /* The length and the version have to agree, both ways round. */
+    CHECK(!wf_est_persist_decode(blob, WF_EST_PERSIST_BYTES, &p),
+          "a %d-byte blob claiming version 3 decoded", WF_EST_PERSIST_BYTES);
+    saved.version = 4;
+    CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)), "encode failed");
+    CHECK(!wf_est_persist_decode(blob, WF_EST_PERSIST_BYTES_V3, &p),
+          "a %d-byte blob claiming version 4 decoded", WF_EST_PERSIST_BYTES_V3);
 }
 
 /* ---- Range -------------------------------------------------------------- *
@@ -2171,6 +2244,659 @@ static void test_range_survives_a_power_cycle(void)
             "less than the Range before it");
 }
 
+/* ---- Internal Resistance and the Limp Point that moves --------------------
+ *
+ * cap0007 cannot say a word about any of this. Its line current runs
+ * -0.25..8.75 A over 47 s of crawling, so the largest load step in the whole
+ * ride is under half of WF_EST_IR_MIN_DI_A and the fixture's own expected
+ * values pin exactly that: no steps, no estimate, no Sag. Writing a test that
+ * appeared to exercise step detection against a ride that never launched would
+ * assert nothing at all, so - as with Consumption and Range before it - the
+ * physics is driven with synthesised streams here.
+ *
+ * The synthesis is a Pack with a known Internal Resistance seen through the
+ * two instruments' real quantisation: the terminal voltage is the open-circuit
+ * voltage less IR_TRUE_OHM per amp, rounded to the 0.1 V the Controller
+ * reports, and the current is rounded to WF_CTRL_CURRENT_LSB_PER_A. So every
+ * ratio these tests measure carries the same quantisation error a real one
+ * would, and the thresholds are being tested against the thing they were
+ * derived from rather than against clean arithmetic.
+ */
+
+#define IR_TRUE_OHM   0.050     /* what the synthesised Pack really is */
+#define IR_OPEN_V     105.30    /* cap0007's rested Pack, near enough */
+#define IR_REST_A     5.0       /* hotel load, between launches */
+#define IR_SOC        66.7
+
+/* Round half away from zero, which is what both instruments do to their own
+ * readings and what makes these streams quantised rather than merely coarse. */
+static double quantise(double x, double step)
+{
+    double n = x / step;
+    long   k = (long)(n + (n >= 0.0 ? 0.5 : -0.5));
+    return (double)k * step;
+}
+
+static double pack_amps(double amps)
+{
+    return quantise(amps, 1.0 / WF_CTRL_CURRENT_LSB_PER_A);
+}
+
+/* The terminal voltage this Pack shows at that current, as the Controller
+ * would report it. `open_v` varies between launches in the tests below so the
+ * quantisation error is not the same on every step - a running mean that only
+ * ever sees one rounding is not being averaged, it is being repeated. */
+static double pack_volts(double open_v, double amps, double ohm)
+{
+    return quantise(open_v - ohm * pack_amps(amps), 0.1);
+}
+
+/* One tick of a Pack under load: the power-block frame, and a BMS answer once
+ * a second so the Anchor stays fresh - which is one of the acceptance rules a
+ * load step has to pass. */
+static void feed_pack(wf_est_t *e, uint32_t t_ms, double open_v, double amps,
+                      double ohm)
+{
+    if (t_ms % POLL_MS < SAMPLE_MS) {
+        feed_soc(e, t_ms, IR_SOC);
+    }
+    feed_power(e, t_ms, pack_volts(open_v, amps, ohm), pack_amps(amps));
+}
+
+/* A launch and the release at the end of it: two sharp steps, which is what a
+ * rider gives the estimator for free every time they open the throttle. Held
+ * for `hold_ms` in between, at `peak_a`. Returns the time it ended at. */
+static uint32_t ir_launch(wf_est_t *e, uint32_t t0_ms, double open_v,
+                          double peak_a, uint32_t hold_ms, double ohm)
+{
+    uint32_t t = t0_ms;
+    feed_pack(e, t, open_v, IR_REST_A, ohm);
+    for (uint32_t held = 0; held < hold_ms; held += SAMPLE_MS) {
+        t += SAMPLE_MS;
+        feed_pack(e, t, open_v, peak_a, ohm);
+    }
+    t += SAMPLE_MS;
+    feed_pack(e, t, open_v, IR_REST_A, ohm);
+    return t;
+}
+
+/* The same launch with the BMS silent: the Controller stream is identical and
+ * the Anchor goes stale underneath it, which is the gap case. */
+static uint32_t ir_launch_no_bms(wf_est_t *e, uint32_t t0_ms, double open_v,
+                                 double peak_a, uint32_t hold_ms, double ohm)
+{
+    uint32_t t = t0_ms;
+    feed_power(e, t, pack_volts(open_v, IR_REST_A, ohm), pack_amps(IR_REST_A));
+    for (uint32_t held = 0; held < hold_ms; held += SAMPLE_MS) {
+        t += SAMPLE_MS;
+        feed_power(e, t, pack_volts(open_v, peak_a, ohm), pack_amps(peak_a));
+    }
+    t += SAMPLE_MS;
+    feed_power(e, t, pack_volts(open_v, IR_REST_A, ohm), pack_amps(IR_REST_A));
+    return t;
+}
+
+/* The estimate itself: measured from load steps, stable, and inside the
+ * plausibility bound.
+ *
+ * Twenty launches, each at a different peak and each on a slightly different
+ * open-circuit voltage, so the forty steps carry forty different roundings
+ * rather than one repeated. What comes out has to be the Pack that was
+ * synthesised, and - the criterion that matters for a figure on a screen - it
+ * has to stop moving once it has seen a few of them. */
+static void test_internal_resistance_comes_from_load_steps(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(!o.ir_valid, "an Internal Resistance before a single load step");
+    CHECK_D(o.ir_ohm, 0.0, 0.0, "an estimate out of no steps at all");
+    CHECK_D(o.sag_v, 0.0, 0.0, "Sag with no resistance behind it");
+    CHECK_D(o.limp_point_v, WF_EST_LIMP_POINT_V, 1e-9,
+            "the Limp Point with no resistance measured");
+
+    /* The Monitor sees the BMS before the rider opens the throttle, which is
+     * what a bike being switched on does. Without it the first launch would be
+     * refused for want of an Anchor, and rightly. */
+    feed_soc(&e, 0, IR_SOC);
+
+    uint32_t t = 0;
+    double   prev = 0.0;
+    double   worst_move = 0.0;      /* largest relative move once settled */
+    uint32_t settled_steps = 0;
+
+    for (int i = 0; i < 20; i++) {
+        double peak = 90.0 + 6.0 * (double)i;        /* 90 A up to 204 A */
+        double open = IR_OPEN_V - 0.05 * (double)i;  /* the Pack emptying */
+        uint32_t before = e.ir_steps;
+        t = ir_launch(&e, t + SAMPLE_MS, open, peak, 3000u, IR_TRUE_OHM);
+        wf_est_get(&e, &o);
+        CHECK_U(o.ir_steps - before, 2,
+                "accepted steps from one launch and its release");
+        if (o.ir_weight > WF_EST_IR_CONFIDENT_SAMPLES) {
+            double move = (o.ir_ohm - prev) / prev;
+            if (move < 0.0) {
+                move = -move;
+            }
+            if (move > worst_move) {
+                worst_move = move;
+            }
+            settled_steps++;
+        }
+        prev = o.ir_ohm;
+    }
+
+    wf_est_get(&e, &o);
+    CHECK(o.ir_valid, "twenty launches produced no Internal Resistance");
+    CHECK_U(o.ir_steps, 40, "accepted steps over twenty launches");
+    CHECK_U(o.ir_rejected, 0,
+            "steps that were sharp enough to try and were refused");
+    CHECK_U(o.ir_weight, 40, "the weight the running mean carries");
+
+    /* The Pack that was synthesised, to within what the 0.1 V quantisation can
+     * do to a ratio. */
+    CHECK_D(o.ir_ohm, IR_TRUE_OHM, 0.005,
+            "the Internal Resistance measured off the load steps");
+    CHECK(o.ir_ohm >= WF_EST_IR_MIN_OHM && o.ir_ohm <= WF_EST_IR_MAX_OHM,
+          "the estimate landed outside its own plausibility bound");
+
+    /* Stable, which is the criterion in the ticket: not wandering with each
+     * step. Past the confidence point a whole launch - two steps - may move it
+     * by well under a percent, because the running mean's weight is what
+     * bounds the move and the weight is growing. */
+    CHECK(settled_steps > 10,
+          "only %u launches landed past the confidence point, so stability is "
+          "not being measured", settled_steps);
+    CHECK(worst_move < 0.01,
+          "a single launch moved the settled estimate by %.3f %%, which is a "
+          "figure that wanders", 100.0 * worst_move);
+
+    /* And it is attributed: issue #21 compares readings over months, and a
+     * resistance with no State of Charge against it is not comparable. */
+    CHECK_D(o.ir_soc_pct, IR_SOC, 1e-4,
+            "the State of Charge the last accepted step was recorded at");
+}
+
+/* The rejections, one rule at a time. Every one of them has to leave the
+ * estimate untouched rather than fold a weakened sample in - which is the
+ * difference between a mean of measurements and a mean of noise.
+ *
+ * The two counters tell the two kinds of refusal apart. A pair that never beat
+ * WF_EST_IR_MIN_DI_A was not a load step and is not counted at all; a pair that
+ * was sharp enough to try and failed a later rule is counted, so a Pack that
+ * launches hard and produces nothing but rejections can be diagnosed rather
+ * than guessed at. */
+static void test_bad_load_steps_are_rejected(void)
+{
+    wf_est_out_t o;
+
+    /* 1. Too small to beat the quantisation. 20 A steps, just under the
+     *    threshold, repeated twenty times - a mean of these would be a mean of
+     *    rounding error. Not even counted as a refusal: it is not a step. */
+    wf_est_t small;
+    wf_est_init(&small, NULL);
+    uint32_t t = 0;
+    for (int i = 0; i < 20; i++) {
+        t = ir_launch(&small, t + SAMPLE_MS, IR_OPEN_V,
+                      IR_REST_A + WF_EST_IR_MIN_DI_A - 1.0, 1000u, IR_TRUE_OHM);
+    }
+    wf_est_get(&small, &o);
+    CHECK(!o.ir_valid, "a %.1f A step, under the %.1f A threshold, was measured",
+          WF_EST_IR_MIN_DI_A - 1.0, WF_EST_IR_MIN_DI_A);
+    CHECK_U(o.ir_steps, 0, "steps accepted below the threshold");
+    CHECK_U(o.ir_rejected, 0, "sub-threshold pairs counted as refused steps");
+
+    /* And a hair over it is measured, which is what makes the line above a
+     * threshold rather than a wall. */
+    wf_est_t big;
+    wf_est_init(&big, NULL);
+    ir_launch(&big, 0, IR_OPEN_V, IR_REST_A + WF_EST_IR_MIN_DI_A + 1.0, 1000u,
+              IR_TRUE_OHM);
+    wf_est_get(&big, &o);
+    CHECK(o.ir_valid, "a %.1f A step, over the %.1f A threshold, was refused",
+          WF_EST_IR_MIN_DI_A + 1.0, WF_EST_IR_MIN_DI_A);
+
+    /* 2. A step during a BMS gap. The Controller is launching hard and the
+     *    Anchor has gone stale, so there is no State of Charge to record the
+     *    reading against - and an Internal Resistance that cannot be compared
+     *    with next month's is not a State of Health signal. Refused, and
+     *    counted, because these really were load steps. */
+    wf_est_t gap;
+    wf_est_init(&gap, NULL);
+    feed_soc(&gap, 0, IR_SOC);
+    t = 60000u;   /* a minute later: the Anchor is long stale */
+    for (int i = 0; i < 5; i++) {
+        t = ir_launch_no_bms(&gap, t + SAMPLE_MS, IR_OPEN_V, 150.0, 1000u,
+                             IR_TRUE_OHM);
+    }
+    wf_est_get(&gap, &o);
+    CHECK(!o.anchor_fresh, "the Anchor was fresh, so this is not a BMS gap");
+    CHECK(!o.ir_valid, "a load step during a BMS gap was measured anyway");
+    CHECK_U(o.ir_steps, 0, "steps accepted while the BMS was silent");
+    CHECK_U(o.ir_rejected, 10, "load steps refused for want of an Anchor");
+
+    /* 3. Not a Pack. Two ohms would be a Sag of hundreds of volts at a launch
+     *    current and a tenth of a milliohm would be superconducting; both are
+     *    noise, a decode error or a stationary transient, and neither is
+     *    averaged in. */
+    wf_est_t stiff, soft;
+    wf_est_init(&stiff, NULL);
+    wf_est_init(&soft, NULL);
+    uint32_t ts = 0, tf = 0;
+    for (int i = 0; i < 5; i++) {
+        ts = ir_launch(&stiff, ts + SAMPLE_MS, IR_OPEN_V, 150.0, 1000u, 0.0001);
+        tf = ir_launch(&soft, tf + SAMPLE_MS, 200.0, 60.0, 1000u, 2.0);
+    }
+    wf_est_get(&stiff, &o);
+    CHECK(!o.ir_valid, "a Pack of 0.1 mOhm was believed");
+    CHECK_U(o.ir_steps, 0, "steps accepted from an implausibly stiff Pack");
+    CHECK(o.ir_rejected > 0, "the implausibly stiff steps were not counted");
+    wf_est_get(&soft, &o);
+    CHECK(!o.ir_valid, "a Pack of 2 Ohm was believed");
+    CHECK_U(o.ir_steps, 0, "steps accepted from an implausibly soft Pack");
+
+    /* 4. The voltage moved the wrong way - it rose as the current rose, which
+     *    no Pack does. That is a negative ratio, and negative is below the
+     *    plausibility floor, so no separate sign rule is needed and none
+     *    exists. */
+    wf_est_t backwards;
+    wf_est_init(&backwards, NULL);
+    t = 0;
+    for (int i = 0; i < 5; i++) {
+        t = ir_launch(&backwards, t + SAMPLE_MS, IR_OPEN_V, 150.0, 1000u,
+                      -IR_TRUE_OHM);
+    }
+    wf_est_get(&backwards, &o);
+    CHECK(!o.ir_valid, "a Pack whose voltage rises under load was believed");
+    CHECK(o.ir_rejected > 0, "the backwards steps were not counted as refused");
+
+    /* 5. A pair that straddles a dropped frame. The current really did change
+     *    by 145 A between these two samples, but a second apart there is no
+     *    telling a step from a ramp, and a ramp measured as a step is a
+     *    resistance measured against the wrong voltage. Refused before the
+     *    threshold is even considered, so it is not counted either. */
+    wf_est_t dropped;
+    wf_est_init(&dropped, NULL);
+    feed_soc(&dropped, 0, IR_SOC);
+    feed_pack(&dropped, 0, IR_OPEN_V, IR_REST_A, IR_TRUE_OHM);
+    feed_pack(&dropped, WF_EST_IR_MAX_DT_MS + SAMPLE_MS, IR_OPEN_V, 150.0,
+              IR_TRUE_OHM);
+    wf_est_get(&dropped, &o);
+    CHECK(!o.ir_valid, "a step across a dropped frame was measured");
+    CHECK_U(o.ir_steps, 0, "steps accepted across a gap in the stream");
+    CHECK_U(o.ir_rejected, 0, "a pair too far apart counted as a refused step");
+
+    /* 6. A ramp, which is the cost of a 5.2 Hz stream written down as a test.
+     *    The current climbs from rest to 200 A over four seconds - brisk
+     *    riding, 48 A per second - and no pair of consecutive samples moves by
+     *    WF_EST_IR_MIN_DI_A, so the whole acceleration contributes nothing.
+     *    Only a launch sharper than ~52 A/s is measurable at this rate, and
+     *    pretending otherwise would mean averaging in ratios the quantisation
+     *    has swamped. */
+    wf_est_t ramp;
+    wf_est_init(&ramp, NULL);
+    feed_soc(&ramp, 0, IR_SOC);
+    for (uint32_t k = 0; k <= 20; k++) {
+        double a = IR_REST_A + 9.75 * (double)k;
+        feed_pack(&ramp, k * SAMPLE_MS, IR_OPEN_V, a, IR_TRUE_OHM);
+    }
+    wf_est_get(&ramp, &o);
+    CHECK(!o.ir_valid, "a ramp was measured as a load step");
+    CHECK_U(o.ir_steps, 0, "steps accepted from a ramp");
+}
+
+/* ---- the Limp Point moving with load -------------------------------------
+ *
+ * The ticket's point: Range stops lying precisely when the rider is riding
+ * hardest. Below, a Pack whose resistance is already known - restored from
+ * NVS, which is what a Monitor that has ridden before has - so that the Sag
+ * model can be driven on its own without twenty launches in front of every
+ * assertion.
+ */
+
+/* A Monitor that already knows its Pack: an Internal Resistance at full weight
+ * and no charge state, so the first BMS answer still acquires. */
+static wf_est_persist_t ir_history(double ohm)
+{
+    wf_est_persist_t h;
+    memset(&h, 0, sizeof(h));
+    h.version   = WF_EST_PERSIST_VERSION;
+    h.ir_ohm    = (float)ohm;
+    h.ir_weight = (uint16_t)WF_EST_IR_SAMPLES_MAX;
+    return h;
+}
+
+/* The model itself, and the direction the whole ticket is about. The Limp
+ * Point is a voltage event under load: at 84.0 V of threshold and a Pack that
+ * sags, the rider holding a hundred amps meets it with a fifth of the Pack
+ * still in it, and gets that back on easing off.
+ *
+ * Asserted on Remaining Energy rather than on Range, because Remaining Energy
+ * is the half of the quotient Sag moves and there is no Consumption in it to
+ * confuse the direction. The recovery is the assertion that could not be
+ * faked: energy drawn is monotone, so a figure that rises when the rider eases
+ * off can only be the Limp Point coming back down. */
+static void test_sag_moves_the_limp_point_with_load(void)
+{
+    wf_est_persist_t history = ir_history(IR_TRUE_OHM);
+    wf_est_t e;
+    wf_est_init(&e, &history);
+    feed_soc(&e, 0, IR_SOC);
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.ir_valid, "the restored Internal Resistance was not believed");
+    CHECK_D(o.ir_ohm, IR_TRUE_OHM, 1e-6, "the restored Internal Resistance");
+
+    /* A minute at rest. The load average is the hotel load, so the Limp Point
+     * has moved by a quarter of a volt and Remaining Energy is a few tens of
+     * watt-hours under what a fixed 84.0 V would have claimed. */
+    uint32_t t = 0;
+    for (; t <= 60000u; t += SAMPLE_MS) {
+        feed_pack(&e, t, IR_OPEN_V, IR_REST_A, IR_TRUE_OHM);
+    }
+    wf_est_get(&e, &o);
+    double rest_wh   = o.remaining_wh;
+    double rest_limp = o.limp_point_v;
+    CHECK_D(o.load_a, IR_REST_A, 0.01, "the load average at rest");
+    CHECK_D(o.sag_v, IR_TRUE_OHM * IR_REST_A, 0.01, "Sag at the hotel load");
+    CHECK_D(o.limp_point_v, WF_EST_LIMP_POINT_V + IR_TRUE_OHM * IR_REST_A, 0.01,
+            "the Limp Point at rest");
+    CHECK(rest_wh < wf_est_energy_above_limp_wh(IR_SOC),
+          "a sagging Pack showed as much energy as a perfect one");
+
+    /* Twenty seconds of holding 150 A, which is one long uphill pull. */
+    double drawn_before = o.used_wh;
+    uint32_t hard_end = t + 20000u;
+    for (; t <= hard_end; t += SAMPLE_MS) {
+        feed_pack(&e, t, IR_OPEN_V, 150.0, IR_TRUE_OHM);
+    }
+    wf_est_get(&e, &o);
+    double hard_wh = o.remaining_wh;
+    CHECK(o.load_a > 90.0,
+          "twenty seconds at 150 A left the load average at %.1f A", o.load_a);
+    CHECK(o.limp_point_v > rest_limp + 4.0,
+          "the Limp Point moved from %.2f V to %.2f V under a sustained "
+          "150 A, which is not Sag moving it", rest_limp, o.limp_point_v);
+    /* Against the estimator's own resistance and not the synthesised one,
+     * because the launch into this pull was itself a load step and the running
+     * mean has already folded it in - at a sixty-fourth, which is why the two
+     * are still the same number to three decimals. */
+    CHECK_D(o.ir_ohm, IR_TRUE_OHM, 0.001,
+            "the restored estimate after the ride's own steps landed in it");
+    CHECK_D(o.limp_point_v, WF_EST_LIMP_POINT_V + o.ir_ohm * o.load_a, 1e-9,
+            "the Limp Point against the model it is supposed to be");
+
+    /* And the figure fell by far more than the energy actually drawn, which is
+     * the whole point: the watt-hours are still in the Pack and are no longer
+     * reachable at this throttle. */
+    double drawn = o.used_wh - drawn_before;
+    CHECK(drawn > 0.0 && drawn < 100.0,
+          "twenty seconds at 150 A drew %.1f Wh, so the comparison below is "
+          "not measuring what it claims", drawn);
+    CHECK(rest_wh - hard_wh > 4.0 * drawn,
+          "Remaining Energy fell %.1f Wh under a sustained load that drew "
+          "%.1f Wh - the Limp Point barely moved", rest_wh - hard_wh, drawn);
+
+    /* Easing off. Two minutes back at the hotel load, and the figure rises -
+     * which no integration of current can do while current is positive. */
+    uint32_t easy_end = t + 120000u;
+    for (; t <= easy_end; t += SAMPLE_MS) {
+        feed_pack(&e, t, IR_OPEN_V, IR_REST_A, IR_TRUE_OHM);
+    }
+    wf_est_get(&e, &o);
+    CHECK(o.remaining_wh > hard_wh + 100.0,
+          "easing off took Remaining Energy from %.1f Wh to %.1f Wh, which is "
+          "not a Limp Point coming back down", hard_wh, o.remaining_wh);
+    CHECK_D(o.limp_point_v, rest_limp, 0.05,
+            "the Limp Point after easing off");
+    /* Not all the way back: two minutes at 150 A really did leave the Pack
+     * with less in it than it had. */
+    CHECK(o.remaining_wh < rest_wh,
+          "the Pack came back with more energy than it started with");
+}
+
+/* The risk this whole design is arranged around: a Sag-corrected Limp Point
+ * puts a fast, noisy quantity into Range's numerator, which is exactly where
+ * jitter would come from. #16 bought Range's steadiness by giving it no filter
+ * of its own and putting the smoothing in Consumption's buckets; the answer
+ * here is the same shape, one level down - the Limp Point moves with an
+ * average of the load and never with the last frame.
+ *
+ * So both halves have to be asserted, and they are the two halves of the
+ * acceptance criterion: it must move for a load the rider is actually holding,
+ * and it must not twitch on one frame of it.
+ *
+ * The measurement is a twin: the same stream into a Monitor that knows its
+ * Pack and one that does not, with the difference between their Ranges being
+ * the Sag correction and nothing else. Consumption moves under a hard pull as
+ * well - genuinely, and identically in both - so comparing a Range against its
+ * own past would be measuring both effects at once. */
+static void test_sag_moves_range_with_sustained_load_only(void)
+{
+    const double kmh = 36.0, town = amps_for(30.0, kmh), hard = 150.0;
+
+    wf_est_persist_t history = ir_history(IR_TRUE_OHM);
+    wf_est_t sagging, stiff;
+    wf_est_init(&sagging, &history);
+    wf_est_init(&stiff, NULL);
+    feed_soc(&sagging, 0, RANGE_SOC);
+    feed_soc(&stiff, 0, RANGE_SOC);
+
+    /* Two kilometres of town riding to fill both windows. */
+    uint32_t t = ride(&sagging, 0, 2.0 * WF_EST_CONS_WINDOW_M, kmh, town);
+    ride(&stiff, 0, 2.0 * WF_EST_CONS_WINDOW_M, kmh, town);
+
+    wf_est_out_t a, b;
+    wf_est_get(&sagging, &a);
+    wf_est_get(&stiff, &b);
+    CHECK(a.range_valid && b.range_valid, "neither twin produced a Range");
+    CHECK(a.consumption_windowed && b.consumption_windowed,
+          "two kilometres did not fill the window");
+    double gap0 = b.range_km - a.range_km;
+    CHECK(gap0 > 1.0,
+          "a Pack that sags half a volt at town load cost only %.2f km of "
+          "Range, so the correction is not being applied", gap0);
+
+    /* One frame of 150 A - a throttle stab, or a pothole in the current
+     * reading. The load average moves by dt/TAU of the step, about a
+     * hundredth, and the Range with it. This is the number that says the
+     * figure does not twitch. */
+    double before = a.range_km;
+    t += SAMPLE_MS;
+    feed_ride(&sagging, t, kmh, hard);
+    feed_ride(&stiff, t, kmh, hard);
+    wf_est_get(&sagging, &a);
+    wf_est_get(&stiff, &b);
+    double twitch = gap0 - (b.range_km - a.range_km);
+    if (twitch < 0.0) {
+        twitch = -twitch;
+    }
+    CHECK(twitch < 0.4,
+          "one frame at %.0f A moved the Sag correction by %.3f km", hard,
+          twitch);
+    CHECK(before - a.range_km < 0.5,
+          "one frame at %.0f A took %.3f km off the Range", hard,
+          before - a.range_km);
+
+    /* Fifteen seconds of holding it, which is a slip road. Same current, and
+     * now the figure moves - by ten times what the single frame did. */
+    for (int i = 0; i < 75; i++) {
+        t += SAMPLE_MS;
+        feed_ride(&sagging, t, kmh, hard);
+        feed_ride(&stiff, t, kmh, hard);
+    }
+    wf_est_get(&sagging, &a);
+    wf_est_get(&stiff, &b);
+    double gap1 = b.range_km - a.range_km;
+    CHECK(gap1 > gap0 + 2.0,
+          "fifteen seconds at %.0f A moved the Sag correction from %.2f km to "
+          "%.2f km, which is not a reaction to sustained load", hard, gap0,
+          gap1);
+    CHECK(gap1 - gap0 > 10.0 * twitch,
+          "a sustained pull moved Range by %.2f km and one frame of the same "
+          "current by %.3f km - the two are not far enough apart for the "
+          "figure to be following riding rather than frames",
+          gap1 - gap0, twitch);
+    CHECK(a.range_km < before,
+          "Range did not fall under a sustained hard pull");
+
+    /* And easing off gives it back. A minute of town riding, and the
+     * correction is within half a kilometre of where it was. */
+    for (int i = 0; i < 300; i++) {
+        t += SAMPLE_MS;
+        feed_ride(&sagging, t, kmh, town);
+        feed_ride(&stiff, t, kmh, town);
+    }
+    wf_est_get(&sagging, &a);
+    wf_est_get(&stiff, &b);
+    double gap2 = b.range_km - a.range_km;
+    CHECK(gap2 < gap0 + 0.5,
+          "a minute of easing off left the Sag correction at %.2f km against "
+          "the %.2f km it costs at town load", gap2, gap0);
+}
+
+/* #16's criterion, re-run with the Sag model switched on: under steady riding
+ * Range is monotone non-increasing, sampled at every frame, on the raw double,
+ * and it is still exactly zero rises rather than a tolerance.
+ *
+ * That is not luck. Under a steady load the load average is a constant - the
+ * first power sample acquires it and every later one pulls it toward itself by
+ * zero - so the Sag reserve is a constant too, and a constant subtracted from
+ * a falling numerator falls. The Sag model can only move the figure when the
+ * riding does, which is the whole of what was wanted from it. */
+static void test_range_is_monotone_with_a_sagging_pack(void)
+{
+    const double cost = 30.0, kmh = 36.0;
+
+    wf_est_persist_t history = ir_history(IR_TRUE_OHM);
+    wf_est_t e, stiff;
+    wf_est_init(&e, &history);
+    wf_est_init(&stiff, NULL);
+    feed_soc(&e, 0, RANGE_SOC);
+    feed_soc(&stiff, 0, RANGE_SOC);
+
+    range_watch_t w;
+    memset(&w, 0, sizeof(w));
+    ride_watched(&e, &w, 0, 10.0 * WF_EST_CONS_WINDOW_M, kmh,
+                 amps_for(cost, kmh), 0.0);
+    ride(&stiff, 0, 10.0 * WF_EST_CONS_WINDOW_M, kmh, amps_for(cost, kmh));
+
+    CHECK(w.samples > 4000, "only %ld samples to assert monotonicity on",
+          w.samples);
+    CHECK(w.up_max == 0.0,
+          "Range rose by %.9f km during a steady ride on a sagging Pack",
+          w.up_max);
+    CHECK_D(w.km_up_max, 0.0, 0.0,
+            "the kilometre figure ticked up during a steady ride");
+
+    /* And the Sag correction really was on, so the zero above is a property of
+     * the model and not of a model that did nothing. */
+    wf_est_out_t a, b;
+    wf_est_get(&e, &a);
+    wf_est_get(&stiff, &b);
+    CHECK(a.sag_v > 0.4, "the sagging twin showed %.3f V of Sag", a.sag_v);
+    CHECK(b.range_km - a.range_km > 1.0,
+          "the two twins ended %.3f km apart, so the Sag model was not "
+          "applied", b.range_km - a.range_km);
+
+    /* And the same ten kilometres with the instrument's own noise on it, which
+     * is test_range_does_not_jitter_up_on_a_noisy_current() re-run over a Pack
+     * that sags. Half an LSB of line current dithered onto every sample now
+     * reaches the figure twice - through Consumption, as before, and through
+     * the load average behind the Limp Point - so this is the assertion that
+     * the second path did not undo what #16 bought.
+     *
+     * It cannot, and the reason is worth writing down: the load average moves
+     * by dt/TAU of each sample's error, about a hundredth of it, so the noise
+     * on the Sag reserve is a hundredth of the noise on the current, which is
+     * an order of magnitude below what a bucket of road takes off the Range in
+     * the same instant. */
+    wf_est_t noisy;
+    wf_est_init(&noisy, &history);
+    feed_soc(&noisy, 0, RANGE_SOC);
+    memset(&w, 0, sizeof(w));
+    noise_state = 12345u;
+    ride_watched(&noisy, &w, 0, 10.0 * WF_EST_CONS_WINDOW_M, kmh,
+                 amps_for(cost, kmh), 0.5 / WF_CTRL_CURRENT_LSB_PER_A);
+
+    CHECK(w.up_max < WF_EST_CONS_BUCKET_M / 1000.0,
+          "on a sagging Pack, Range rose by %.6f km on noise alone, more than "
+          "the %.3f km a bucket of road takes off it", w.up_max,
+          WF_EST_CONS_BUCKET_M / 1000.0);
+    CHECK(w.km_up_max <= 1.0,
+          "the displayed Range jumped up by %.0f km on noise", w.km_up_max);
+    CHECK(w.km_ups <= 5,
+          "the displayed Range ticked up %ld times over ten noisy kilometres "
+          "on a sagging Pack, against the three the rounding accounts for",
+          w.km_ups);
+}
+
+/* "Persisted, and improves across rides."
+ *
+ * Two rides with a power cycle between them, and the second one starts from
+ * the first one's estimate rather than from nothing: the weight crosses the
+ * break, so the second ride's launches refine the number instead of
+ * re-measuring it. The Pack is deliberately given a different resistance in
+ * the second ride - a colder morning, a year of ageing - so a Monitor that
+ * quietly discarded the history would land on the new value outright and be
+ * caught. */
+static void test_internal_resistance_improves_across_rides(void)
+{
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, IR_SOC);
+
+    uint32_t t = 0;
+    for (int i = 0; i < 6; i++) {
+        t = ir_launch(&e, t + SAMPLE_MS, IR_OPEN_V, 120.0 + 5.0 * i, 1000u,
+                      0.040);
+    }
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK_U(o.ir_steps, 12, "steps accepted over the first ride");
+    CHECK_D(o.ir_ohm, 0.040, 0.003, "the first ride's Internal Resistance");
+    double first = o.ir_ohm;
+
+    /* Out through the bytes and back, which is all a power cycle is. */
+    wf_est_persist_t saved, back;
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    wf_est_save(&e, &saved);
+    CHECK_D(saved.ir_ohm, first, 1e-6, "the saved Internal Resistance");
+    CHECK_U(saved.ir_weight, 12, "the saved weight");
+    CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)), "encode failed");
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &back), "decode failed");
+    CHECK_U(back.ir_weight, 12, "the weight through the bytes");
+
+    wf_est_t after;
+    wf_est_init(&after, &back);
+    wf_est_get(&after, &o);
+    CHECK(o.ir_valid, "the estimate did not survive the power cycle");
+    CHECK_D(o.ir_ohm, first, 1e-6, "the restored Internal Resistance");
+    CHECK_U(o.ir_weight, 12, "the restored weight");
+    CHECK_U(o.ir_steps, 0, "a restored estimator claimed steps it did not see");
+
+    /* The second ride, on a Pack that now reads 60 mOhm. */
+    feed_soc(&after, 0, IR_SOC);
+    t = 0;
+    for (int i = 0; i < 6; i++) {
+        t = ir_launch(&after, t + SAMPLE_MS, IR_OPEN_V, 120.0 + 5.0 * i, 1000u,
+                      0.060);
+    }
+    wf_est_get(&after, &o);
+    CHECK_U(o.ir_weight, 24, "the weight after two rides");
+    CHECK(o.ir_ohm > first,
+          "the second ride's stiffer Pack did not move the estimate at all");
+    CHECK(o.ir_ohm < 0.060 - 0.004,
+          "the estimate jumped to %.4f Ohm, the second ride's Pack alone - the "
+          "history was discarded rather than improved on", o.ir_ohm);
+    /* Twelve steps at 40 mOhm and twelve at 60 mOhm, equally weighted, is a
+     * running mean sitting between them. */
+    CHECK_D(o.ir_ohm, 0.050, 0.004, "the mean over both rides");
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(void)
@@ -2218,8 +2944,16 @@ int main(void)
     test_range_does_not_jitter_up_on_a_noisy_current();
     test_range_survives_a_power_cycle();
 
+    test_internal_resistance_comes_from_load_steps();
+    test_bad_load_steps_are_rejected();
+    test_sag_moves_the_limp_point_with_load();
+    test_sag_moves_range_with_sustained_load_only();
+    test_range_is_monotone_with_a_sagging_pack();
+    test_internal_resistance_improves_across_rides();
+
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();
+    test_a_version_3_blob_is_migrated();
 
     if (failures != 0) {
         printf("%d failure%s\n", failures, failures == 1 ? "" : "s");
