@@ -109,8 +109,24 @@ static const char *TAG = "ui";
  * and leaving Range to fight for space later would have meant doing this twice.
  *
  * So the screen now has a hero row: scale 3, directly under speed, holding the
- * one derived figure that matters most. Today that is Remaining Energy.
- * Whichever figure sits there, everything below it is evidence for it.
+ * one derived figure that matters most. Everything below it is evidence for it.
+ *
+ * That row now holds Range, which is what it was built for. Range is Remaining
+ * Energy divided by Consumption, and the row directly beneath it is that
+ * divisor - so the screen reads downward as the sum it is: the kilometres, the
+ * cost per kilometre they were worked out at, and then the Pack that is paying.
+ *
+ * One number, and no second one. No band, no best case beside a worst case:
+ * two range figures on a 135 px panel at speed is not more information, it is
+ * a decision handed back to a rider wearing a helmet. The "you would get
+ * further at a lower speed" figure is issue #20 and is conditional on the
+ * rider asking for it.
+ *
+ * Remaining Energy did not leave the screen, it went down to scale 1 beside
+ * the Odometer. It is the hero's numerator and it is worth being able to check
+ * mid-ride - a Range that looks wrong is either a wrong energy or a wrong
+ * Consumption, and both are now on the panel - but it is an engineering figure
+ * and not a riding one. Nobody plans a journey in watt-hours.
  *
  * What went, and why:
  *
@@ -137,9 +153,13 @@ static const char *TAG = "ui";
  * That leaves F_V7 and F_V8 unused and a clear band below y=204. Both are
  * deliberate: the next screen wants room, not a tenth row.
  *
- * The character cell is 6*scale wide, so the budget is 7 columns at scale 3
- * and 11 at scale 2. "~2729WH" is exactly 7 and loses its space to fit;
- * "~128 WH/KM*" is exactly 11. */
+ * The character cell is 6*scale wide, so the budget is 7 columns at scale 3,
+ * 11 at scale 2 and 22 at scale 1. "~91KM*" is 6 of the 7 and cannot need more
+ * than 7: WF_EST_RANGE_MIN_CONS_WH_PER_KM bounds Range at about 917 km, so the
+ * figure is three digits at the very worst. "~128 WH/KM*" is exactly 11.
+ * "ODO 6553500 M ~4585WH" is 21 of the 22, at the Odometer's largest possible
+ * reading and a full Pack - and it is one field and not two, so a shrinking
+ * Odometer cannot leave debris beside a figure drawn at a fixed left edge. */
 #define ROW_LIVE_SPEED  70          /* scale 3 */
 #define ROW_LIVE_HERO   96          /* scale 3: the figure the rider rides by */
 #define ROW_LIVE_CONS   122         /* scale 2 from here down... */
@@ -692,26 +712,49 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
         FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_DIM, "%s", "-- KM/H");
     }
 
-    /* The hero row: Remaining Energy, computed entirely in main/wfest. Nothing
-     * here does arithmetic on it: this is a %.0f of a number the estimator
-     * produced, and that is the whole of the display's involvement in the
-     * figure.
+    /* The hero row: Range, in kilometres, computed entirely in main/wfest.
+     * Nothing here does arithmetic on it. This is a "%.0f" of a number the
+     * estimator produced by dividing Remaining Energy by Consumption, and that
+     * is the whole of the display's involvement in the figure - which is what
+     * ADR-0004 requires and what tests/host/replay.c asserts by multiplying it
+     * back out.
      *
-     * It is drawn in the hint colour and behind a tilde because it is
-     * provisional, and the hint line says so in words. Two separate reasons,
-     * both worth the rider knowing: it counts down to a Limp Point of 84.0 V
-     * that is assumed rather than measured (WF_EST_LIMP_POINT_V, issue #8
-     * measures it), and it is scaled by a line current whose LSB is uncertain
-     * by 19 % until Ride 1 settles it. Dim instead while the figure rests on
-     * state restored from NVS and no BMS answer has confirmed it yet.
+     * Zero on this row means the Limp Point, not zero State of Charge. The
+     * numerator counts down to the Limp Point, so the kilometre of crawling
+     * that follows it is already outside this figure: "0 KM" is "the ride is
+     * over", which is the only thing a zero on a range display may mean.
      *
-     * The space between the number and the unit is what pays for the tilde:
-     * seven columns is the whole of scale 3 and "~2729 WH" is eight. */
-    if (est->valid) {
+     * Two marks, and they say different things:
+     *
+     *   ~91KM    the rolling window's figure - how the rider is riding now.
+     *   ~91KM*   worked out from the persisted all-time average, because the
+     *            ride has not covered a window yet. Same star, same meaning
+     *            and same reason as the Consumption row below it, which is
+     *            where the star's other end is.
+     *
+     * The tilde is there on both, because the figure is provisional twice
+     * over and the hint line says so in words: it counts down to a Limp Point
+     * of 84.0 V that is assumed rather than measured (WF_EST_LIMP_POINT_V;
+     * issue #8 measures it, issue #17 makes it move with Sag), and every
+     * watt-hour behind it is scaled by a line current whose LSB is uncertain
+     * by 19 % until Ride 1 settles it. That 19 % goes into Range twice - once
+     * through Remaining Energy and once through Consumption - so these
+     * kilometres are worth about a fifth less or a fifth more than they say.
+     *
+     * Dim rather than hint-coloured while the figure rests on state restored
+     * from NVS that no BMS answer has confirmed yet, exactly as the energy
+     * figure did on this row before it.
+     *
+     * A dash when there is no Range: no Remaining Energy, no Consumption, or a
+     * Consumption too small to divide by. The estimator declines the division
+     * rather than putting 40000 KM on the handlebars. */
+    if (!est->range_valid) {
+        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, COL_DIM, "%s", "-- KM");
+    } else if (est->consumption_windowed) {
         FIELD(F_V1, 2, ROW_LIVE_HERO, 3, est->anchored ? COL_HINT : COL_DIM,
-              "~%.0fWH", est->remaining_wh);
+              "~%.0fKM", est->range_km);
     } else {
-        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, COL_DIM, "%s", "-- WH");
+        FIELD(F_V1, 2, ROW_LIVE_HERO, 3, COL_DIM, "~%.0fKM*", est->range_km);
     }
 
     /* Consumption, in watt-hours per kilometre, and again the display only
@@ -763,20 +806,43 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
     } else {
         FIELD(F_V5, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
     }
-    /* Metres, not counts: the calibration ride reads this at two landmarks a
-     * known distance apart to settle WF_CTRL_ODO_METRES_PER_COUNT, and a raw
-     * count is useless for that. The step is 100 m wide, so the last two
-     * digits are always zero - that is the Odometer's resolution showing, not
-     * a formatting accident. */
+    /* The reference row, at scale 1: the Odometer and Remaining Energy, both
+     * demoted from riding figures to things worth being able to read.
+     *
+     * The Odometer in metres, not counts: the calibration ride reads this at
+     * two landmarks a known distance apart to settle
+     * WF_CTRL_ODO_METRES_PER_COUNT, and a raw count is useless for that. The
+     * step is 100 m wide, so the last two digits are always zero - that is the
+     * Odometer's resolution showing, not a formatting accident.
+     *
+     * Remaining Energy beside it because it is the hero row's numerator, and
+     * a Range that looks wrong is either a wrong energy or a wrong
+     * Consumption - with both on the panel, the rider can tell which.
+     *
+     * One field and not two. field_at() pads to the right edge to wipe the
+     * debris a shrinking value leaves, which only works for one field per row,
+     * and the Odometer's width really does change ("ODO --" to seven digits).
+     * So the two are composed into one string here; that is formatting, not
+     * arithmetic. */
+    char odo_txt[16], wh_txt[12];
+
     if (lv->odo_valid) {
-        FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "ODO %" PRIu32 " M",
-              wf_ctrl_odo_metres(lv->odometer_raw));
+        snprintf(odo_txt, sizeof(odo_txt), "ODO %" PRIu32 " M",
+                 wf_ctrl_odo_metres(lv->odometer_raw));
     } else {
-        FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s", "ODO --");
+        snprintf(odo_txt, sizeof(odo_txt), "ODO --");
     }
+    if (est->valid) {
+        snprintf(wh_txt, sizeof(wh_txt), "~%.0fWH", est->remaining_wh);
+    } else {
+        snprintf(wh_txt, sizeof(wh_txt), "-- WH");
+    }
+    FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s %s", odo_txt, wh_txt);
     /* The two marks on this screen, explained: the tilde says the figure is
-     * provisional, the star says the Consumption is the all-time average and
-     * not the last kilometre. 19 columns of the 22 scale 1 gives us, so it
+     * provisional, the star says it was worked out from the all-time average
+     * and not from the last kilometre - which is one fact about two rows, the
+     * Range and the Consumption it came from, and so is one legend and not
+     * two. 19 columns of the 22 scale 1 gives us, so it
      * still fits without shrinking the button hint beside it. */
     draw_hint("PWR:BACK ~PROV *AVG");
 }

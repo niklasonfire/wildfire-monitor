@@ -387,7 +387,18 @@ static void distance_step(wf_est_t *e, uint32_t t_ms,
 
     /* Consumption's denominator, and it is the same metres the rider watches
      * accumulate - the fused figure, not the raw integral of speed - so the
-     * two can never disagree about how far the bike has gone. */
+     * two can never disagree about how far the bike has gone.
+     *
+     * The bucket is cut here, on the metres, and the energy that goes with it
+     * is whatever the power block had booked by this instant. Those two
+     * integrals are sampled on different frame types, so the cut lands up to
+     * one frame interval apart in them - a fifth of a second, one part in five
+     * hundred of a window. Once the ring is turning every bucket carries the
+     * same offset and it cancels; on the very first window it does not, and
+     * that is where the Range figure's one legitimate discontinuity comes
+     * from. See the Range section of wfest.h: the handover from the all-time
+     * average to the window is a change of source, not a step in one figure,
+     * and moving this cut only changes which frame order it favours. */
     e->alltime_m   += step;
     e->cons_part_m += step;
     if (e->cons_part_m >= WF_EST_CONS_BUCKET_M) {
@@ -583,6 +594,31 @@ void wf_est_get(const wf_est_t *e, wf_est_out_t *out)
         out->consumption_valid    = true;
         out->consumption_windowed = false;
         out->consumption_wh_per_km = e->alltime_wh / e->alltime_m * 1000.0;
+    }
+
+    /* Range, and it is one division of two numbers this function has already
+     * produced. Nothing is recomputed for it and nothing is filtered: the
+     * steadiness is Consumption's ring, upstream, and the crawl below the Limp
+     * Point is already outside `remaining_wh` and is not subtracted twice. See
+     * the Range section of wfest.h for why that is the whole of it.
+     *
+     * Three things have to hold before the division is allowed, and the third
+     * is the one that matters:
+     *
+     *   there is a Remaining Energy at all - `valid`, so a Monitor that has
+     *   never seen the BMS shows a dash rather than a confident zero;
+     *   there is a Consumption at all, from either source;
+     *   and that Consumption is at least WF_EST_RANGE_MIN_CONS_WH_PER_KM.
+     *
+     * The last comparison is written as `>=` against the floor rather than as
+     * `!= 0`, which rejects a negative Consumption, a Consumption of nearly
+     * nothing and a NaN in one, and is why no zero can reach the denominator.
+     * `remaining_wh` is the clamped figure, so Range is zero at the Limp Point
+     * and never negative below it. */
+    if (out->valid && out->consumption_valid &&
+        out->consumption_wh_per_km >= WF_EST_RANGE_MIN_CONS_WH_PER_KM) {
+        out->range_valid = true;
+        out->range_km    = out->remaining_wh / out->consumption_wh_per_km;
     }
 
     if (e->anchor_seen && e->last_t_valid) {

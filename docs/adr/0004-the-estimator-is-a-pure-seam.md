@@ -5,7 +5,7 @@ status: accepted
 # The estimator is a pure seam and time is a parameter
 
 Everything the Monitor works out - Remaining Energy, the Coulomb Count,
-Distance, Consumption, and the Range and State of Health figures still to come
+Distance, Consumption, Range, and the State of Health figures still to come
 - is computed in `main/wfest`, a module that takes decoded fields plus
 persisted state and returns estimates. No I/O, no BLE, no display, no globals,
 no `esp_*`, no FreeRTOS, no logging, no allocation.
@@ -22,6 +22,15 @@ reach. It is indexed by metres rather than by time, which keeps it a function
 of the recorded stream even though it behaves like a filter. It is fused from
 two sources the same way charge is, integration Anchored to something slower
 and more trustworthy, so it is the same code shape as well as the same seam.
+
+Range is in the seam too, and it is the one figure there that holds no state of
+its own: it is Remaining Energy divided by Consumption, computed where both
+already are, guarded by a floor on the divisor. That is deliberate rather than
+incidental. The steadiness a rider needs from it is already bought by
+Consumption's window, one level down; a second filter on the quotient would buy
+nothing that is not already there and would cost the thing the figure exists
+for, which is reacting when the riding changes. So the only thing on the
+handlebars is a `%.0f`.
 
 And no clock. Every feed function takes an explicit `t_ms` from the record it
 was handed. The estimator never asks what time it is.

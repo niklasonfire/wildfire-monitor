@@ -1593,6 +1593,584 @@ static void test_a_version_2_blob_is_migrated(void)
           "a blob from a future version decoded");
 }
 
+/* ---- Range -------------------------------------------------------------- *
+ *
+ * cap0007 produces no Consumption figure, so it produces no Range either, and
+ * tests/fixtures/cap0007.expect pins exactly that as `est_range_source 0`. Every
+ * behavioural assertion about Range therefore lives here, on synthesised riding,
+ * for the same reason Consumption's do.
+ *
+ * Range needs both halves, so these tests feed both: one BMS answer to acquire
+ * an Anchor and put a Remaining Energy on the board, and enough road to produce
+ * a Consumption. The Anchor is acquired and then deliberately left to go stale -
+ * WF_EST_ANCHOR_STALE_MS is five seconds and these rides are minutes long - so
+ * the pull stops and the numerator is the integration alone. That is what
+ * "absent regeneration" means for a test: nothing puts energy back and nothing
+ * pulls the figure up, so any rise in Range is Consumption falling and nothing
+ * else. The Anchor's own behaviour is asserted above, on its own.
+ */
+
+/* The State of Charge cap0007 sat at all ride, so the Remaining Energy these
+ * tests start from is the same 2729 Wh that fixture pins. */
+#define RANGE_SOC   66.7
+
+/* What the rider actually reads: main/ui.c formats the hero row with "%.0f",
+ * so this is the figure on the screen. Asserting on it as well as on the double
+ * is the difference between "the number is steady" and "the number looks
+ * steady". */
+static double km_shown(double range_km)
+{
+    return (double)(long)(range_km + 0.5);
+}
+
+/* Watches the Range curve the way replay.c watches the energy curve: sampled at
+ * every frame the rider could have looked at the screen, tracking the largest
+ * upward move of both the raw figure and the one on the screen.
+ *
+ * The one sample it does not measure a step across is the handover, where the
+ * ring fills and the window takes over from the persisted all-time average.
+ * Range moves there by whatever the two figures differ by - which on a real
+ * ride is the whole point and is usually large - so a monotonicity assertion
+ * that spanned it would be asserting that the rider's history matches their
+ * riding. It is counted instead, and its size recorded, so a test can assert
+ * that it happened exactly once and how far it moved. */
+typedef struct {
+    bool   started;
+    bool   windowed;
+    double prev;
+    double up_max;       /* largest rise of the raw figure, in km */
+    double km_up_max;    /* largest rise of the whole-kilometre figure */
+    double handover_step;/* signed move across the change of source */
+    long   handovers;
+    long   km_ups;       /* samples where the whole-kilometre figure rose */
+    double first, last;
+    long   samples;
+} range_watch_t;
+
+static void range_watch(range_watch_t *w, const wf_est_t *e)
+{
+    wf_est_out_t o;
+    wf_est_get(e, &o);
+    if (!o.range_valid) {
+        return;
+    }
+    if (!w->started) {
+        w->started  = true;
+        w->first    = o.range_km;
+        w->prev     = o.range_km;
+        w->windowed = o.consumption_windowed;
+    }
+    if (o.consumption_windowed != w->windowed) {
+        w->handover_step = o.range_km - w->prev;
+        w->handovers++;
+        w->windowed = o.consumption_windowed;
+    } else {
+        double up = o.range_km - w->prev;
+        if (up > w->up_max) {
+            w->up_max = up;
+        }
+        double km_up = km_shown(o.range_km) - km_shown(w->prev);
+        if (km_up > 0.0) {
+            w->km_ups++;
+        }
+        if (km_up > w->km_up_max) {
+            w->km_up_max = km_up;
+        }
+    }
+    w->prev = o.range_km;
+    w->last = o.range_km;
+    w->samples++;
+}
+
+/* A tiny deterministic generator, so "noise" is uncorrelated between samples
+ * rather than an alternating pattern that cancels itself and proves nothing.
+ * Same sequence on every machine and every run - these tests are as
+ * reproducible as the replay is. */
+static uint32_t noise_state = 12345u;
+
+static double noise_lsb(void)
+{
+    noise_state = noise_state * 1103515245u + 12345u;
+    /* -1..+1, uniform, in units of whatever the caller scales it by. */
+    return (double)((noise_state >> 16) & 0xffffu) / 32767.5 - 1.0;
+}
+
+/* ride(), but sampling Range at every frame and optionally dithering the line
+ * current by up to `dither` amps each sample. */
+static uint32_t ride_watched(wf_est_t *e, range_watch_t *w, uint32_t t0_ms,
+                             double metres, double kmh, double amps,
+                             double dither)
+{
+    double per_tick = kmh * (1000.0 / 3600.0) * ((double)SAMPLE_MS / 1000.0);
+    long ticks = (long)(metres / per_tick + 0.5);
+    uint32_t t = t0_ms;
+
+    feed_ride(e, t, kmh, amps);
+    range_watch(w, e);
+    for (long i = 0; i < ticks; i++) {
+        t += SAMPLE_MS;
+        feed_ride(e, t, kmh, amps + (dither > 0.0 ? dither * noise_lsb() : 0.0));
+        range_watch(w, e);
+    }
+    return t;
+}
+
+/* The guards, and the assertion in each case is that no division happened at
+ * all: `range_km` is left at exactly zero rather than at an infinity, a NaN or
+ * the 40,000 km a real energy over almost no Consumption produces.
+ *
+ * Four ways to have no Range, and the estimator has to decline all four. */
+static void test_range_declines_the_divisions_it_cannot_make(void)
+{
+    /* 1. No Remaining Energy: the Controller is streaming and the BMS has never
+     *    answered, so there is a Consumption and nothing to divide. A confident
+     *    "0 KM" here would read as "the ride is over". */
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    ride(&e, 0, 2.0 * WF_EST_CONS_WINDOW_M, 36.0, amps_for(30.0, 36.0));
+
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.consumption_valid, "the ride produced no Consumption, so this test "
+                               "is measuring the wrong guard");
+    CHECK(!o.valid, "an estimate without a single BMS answer");
+    CHECK(!o.range_valid, "a Range with no Remaining Energy to divide");
+    CHECK_D(o.range_km, 0.0, 0.0, "something divided into an absent energy");
+
+    /* 2. No Consumption: the bike has a Remaining Energy and has covered
+     *    16.7 m, which is cap0007 exactly. */
+    wf_est_t idle;
+    wf_est_init(&idle, NULL);
+    feed_soc(&idle, 0, RANGE_SOC);
+    ride(&idle, 0, 16.7, 5.0, 2.0);
+    wf_est_get(&idle, &o);
+    CHECK(o.valid, "the BMS answer did not put an energy on the board");
+    CHECK(!o.consumption_valid, "16.7 m produced a Consumption figure");
+    CHECK(!o.range_valid, "a Range from cap0007's 16.7 m");
+    CHECK_D(o.range_km, 0.0, 0.0, "something divided by cap0007's metres");
+
+    /* 3. A Consumption below the floor. A kilometre bought for 2 Wh is not a
+     *    riding style, and 2729 Wh divided by it is 1364 km - the answer the
+     *    guard exists to refuse. */
+    wf_est_t cheap;
+    wf_est_init(&cheap, NULL);
+    feed_soc(&cheap, 0, RANGE_SOC);
+    ride(&cheap, 0, 2.0 * WF_EST_CONS_WINDOW_M, 36.0, amps_for(2.0, 36.0));
+    wf_est_get(&cheap, &o);
+    CHECK(o.consumption_valid && o.consumption_windowed,
+          "the cheap ride produced no windowed Consumption");
+    CHECK_D(o.consumption_wh_per_km, 2.0, 0.2, "the cheap ride's Consumption");
+    CHECK(!o.range_valid, "a Range from %.1f Wh/km, below the %.1f floor",
+          o.consumption_wh_per_km, WF_EST_RANGE_MIN_CONS_WH_PER_KM);
+    CHECK_D(o.range_km, 0.0, 0.0, "a division below the Consumption floor");
+
+    /* 4. A Consumption at or below zero - a window in which regeneration
+     *    outweighed draw, which a long descent really does produce. The
+     *    comparison against the floor is what rejects it, so no separate sign
+     *    test is needed and none exists. */
+    wf_est_t downhill;
+    wf_est_init(&downhill, NULL);
+    feed_soc(&downhill, 0, RANGE_SOC);
+    ride(&downhill, 0, 2.0 * WF_EST_CONS_WINDOW_M, 36.0, amps_for(-20.0, 36.0));
+    wf_est_get(&downhill, &o);
+    CHECK(o.consumption_wh_per_km < 0.0,
+          "the descent produced %.1f Wh/km, so the negative case is untested",
+          o.consumption_wh_per_km);
+    CHECK(!o.range_valid, "a Range from a negative Consumption");
+    CHECK_D(o.range_km, 0.0, 0.0, "a division by a negative Consumption");
+
+    /* And clear of the floor there is a Range again, so the guard is a floor
+     * and not a wall: 6 Wh/km is above it and produces a figure. */
+    wf_est_t ok;
+    wf_est_init(&ok, NULL);
+    feed_soc(&ok, 0, RANGE_SOC);
+    ride(&ok, 0, 2.0 * WF_EST_CONS_WINDOW_M, 36.0, amps_for(6.0, 36.0));
+    wf_est_get(&ok, &o);
+    CHECK(o.range_valid, "no Range from 6 Wh/km, which is above the floor");
+    CHECK_D(o.range_km, o.remaining_wh / o.consumption_wh_per_km, 1e-9,
+            "Range is not Remaining Energy over Consumption");
+}
+
+/* The criterion the whole ticket is about, as one ride: a rider who is told
+ * 91 km and rides steadily reaches the Limp Point after 91 km. Nothing else
+ * asserts the numerator, the denominator and the division are describing the
+ * same riding.
+ *
+ * Three things come out of the one ride.
+ *
+ * Monotonicity, under steady riding, which is the reading of the criterion
+ * this implementation takes. Sampled at every frame, on the double and not on
+ * the rounded figure, the Range never rises - not once in forty-five thousand
+ * samples. It is deliberately not asserted globally: a rider who slows down
+ * can genuinely go further, and test_range_drops_on_the_motorway() below
+ * asserts the same figure moving the other way.
+ *
+ * A kilometre off the Range per kilometre ridden, which is the identity that
+ * catches a numerator and a denominator that have drifted apart.
+ *
+ * And the crawl, which is excluded exactly once. Remaining Energy already
+ * counts down to the Limp Point, so Range reaches zero there and the kilometre
+ * of crawling below it is already outside the figure. If a second subtraction
+ * were ever added here the ride would end a kilometre short of the Range it
+ * started with, and this test would say so. */
+static void test_range_counts_down_to_the_limp_point(void)
+{
+    const double cost = 30.0, kmh = 36.0;
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, RANGE_SOC);
+
+    range_watch_t w;
+    memset(&w, 0, sizeof(w));
+
+    /* The first kilometre, on the persisted-average path: with no history at
+     * all the all-time average is this ride's own, so there is a Range from
+     * a hundred metres in. */
+    uint32_t t = ride_watched(&e, &w, 0, WF_EST_CONS_WINDOW_M, kmh,
+                              amps_for(cost, kmh), 0.0);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.range_valid, "no Range after the first kilometre");
+    CHECK(o.consumption_windowed, "the first kilometre did not fill the window");
+    CHECK_D(o.range_km, wf_est_energy_above_limp_wh(RANGE_SOC) / cost - 1.0, 1.0,
+            "the Range a kilometre into the ride");
+
+    /* The rest of it, in kilometre legs, until the Limp Point. */
+    double start_km = w.first;
+    long legs = 0;
+    while (o.range_km > 0.0 && legs < 400) {
+        t = ride_watched(&e, &w, t, WF_EST_CONS_WINDOW_M, kmh,
+                         amps_for(cost, kmh), 0.0);
+        wf_est_get(&e, &o);
+        legs++;
+    }
+
+    CHECK(o.range_valid, "Range stopped being a figure before the Limp Point");
+    CHECK(o.range_km == 0.0, "the ride ended at %.3f km, not at zero",
+          o.range_km);
+    CHECK(o.remaining_wh == 0.0,
+          "Range reached zero with %.1f Wh still above the Limp Point",
+          o.remaining_wh);
+
+    /* The identity. The Range the rider was shown a kilometre in was 90 km and
+     * the ride lasted another 90 km, to within the kilometre the legs are
+     * measured in - no crawl subtracted twice, no kilometre lost. */
+    CHECK(w.samples > 40000,
+          "only %ld samples: the ride was too short to assert monotonicity on",
+          w.samples);
+    CHECK_D(o.distance_m / 1000.0, start_km + 1.0, 1.5,
+            "the distance ridden against the Range promised at the start");
+
+    /* Monotone, on the raw double, at every one of those samples. Under steady
+     * riding this is exact and not a tolerance: Consumption does not move, so
+     * Range is a falling energy over a constant. */
+    CHECK(w.up_max == 0.0,
+          "Range rose by %.6f km during a steady ride", w.up_max);
+    CHECK_D(w.km_up_max, 0.0, 0.0,
+            "the kilometre figure on the screen ticked up during a steady ride");
+
+    /* The one place the curve is allowed to move upward, and it happens once:
+     * the kilometre mark, where the window takes over from the all-time
+     * average. This ride has no persisted history, so the two figures are the
+     * same riding measured two ways and the step is the frame-interval offset
+     * between the energy and distance integrals - well under a kilometre on a
+     * 90 km Range, and invisible after the screen rounds it. On a ride whose
+     * history is unlike its riding the same step is large and is the figure
+     * being corrected, which is why it is not asserted small in general. */
+    CHECK_U(w.handovers, 1, "changes of Consumption source over the ride");
+    CHECK(w.handover_step > 0.0 && w.handover_step < 0.5,
+          "the handover from the all-time average to the window moved Range by "
+          "%.3f km", w.handover_step);
+}
+
+/* The other half of the tension, and issue #1's fourth user story: the rider
+ * joins a motorway and the Range drops rather than staying optimistic until
+ * they are stranded. This is the case a globally monotone Range would get
+ * right and a globally monotone Range would get the previous test's rise
+ * wrong, which is why the criterion is qualified rather than absolute.
+ *
+ * The reaction has to be visible inside the window, so it is asserted at three
+ * hundred metres - well inside the kilometre - and not merely at the end. */
+static void test_range_drops_on_the_motorway(void)
+{
+    const double town = 30.0, motorway = 70.0;
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, RANGE_SOC);
+
+    uint32_t t = ride(&e, 0, 2.0 * WF_EST_CONS_WINDOW_M, 36.0,
+                      amps_for(town, 36.0));
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.consumption_windowed, "two kilometres did not fill the window");
+    double in_town = o.range_km;
+    CHECK(in_town > 50.0, "the town Range is %.1f km, too small to fall from",
+          in_town);
+
+    /* Three hundred metres of motorway: a third of the window has been
+     * replaced, and the figure has already moved a long way. */
+    t = ride(&e, t, 300.0, 90.0, amps_for(motorway, 90.0));
+    wf_est_get(&e, &o);
+    double early = o.range_km;
+    CHECK(early < in_town * 0.85,
+          "300 m of motorway moved the Range from %.1f to %.1f km, which is "
+          "not a reaction inside the window", in_town, early);
+
+    /* And a full window of it, where the figure is the motorway's alone. */
+    t = ride(&e, t, WF_EST_CONS_WINDOW_M, 90.0, amps_for(motorway, 90.0));
+    wf_est_get(&e, &o);
+    CHECK_D(o.consumption_wh_per_km, motorway, 0.5, "a kilometre of motorway");
+    CHECK(o.range_km < in_town * 0.6,
+          "a kilometre of motorway left the Range at %.1f km against the "
+          "town's %.1f", o.range_km, in_town);
+
+    /* Back into town, and it rises again. That is the feature and not a fault:
+     * the rider really can go further at the lower cost, and a Range that
+     * refused to say so would be a ratchet. */
+    double lowest = o.range_km;
+    ride(&e, t, 2.0 * WF_EST_CONS_WINDOW_M, 36.0, amps_for(town, 36.0));
+    wf_est_get(&e, &o);
+    CHECK(o.range_km > lowest * 1.5,
+          "back in town the Range stayed at %.1f km against %.1f on the "
+          "motorway, so it is a ratchet rather than an estimate",
+          o.range_km, lowest);
+}
+
+/* "Available in the first kilometre via the persisted average" - the whole
+ * reason the all-time totals are persisted at all.
+ *
+ * The history here is deliberately unlike the ride, so a Monitor that quietly
+ * ignored it and waited for its own window would fail: fifty kilometres at
+ * 80 Wh/km, against a ride that costs 30. */
+static void test_range_is_there_in_the_first_kilometre(void)
+{
+    wf_est_persist_t history;
+    memset(&history, 0, sizeof(history));
+    history.version    = WF_EST_PERSIST_VERSION;
+    history.alltime_m  = 50000.0f;
+    history.alltime_wh = 50.0f * 80.0f;
+
+    wf_est_t e;
+    wf_est_init(&e, &history);
+    feed_soc(&e, 0, RANGE_SOC);
+
+    /* Under the Consumption floor there is no Range yet: 50 m is half an
+     * Odometer count and the ride has no window. */
+    uint32_t t = ride(&e, 0, 50.0, 36.0, amps_for(30.0, 36.0));
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.range_valid,
+          "the persisted average did not give a Range in the first 50 m");
+    CHECK(!o.consumption_windowed,
+          "50 m of this ride reported itself as a full window");
+
+    /* Two hundred metres in - a fifth of a window, and nowhere near one - the
+     * Range is the persisted average's and is marked as such, which is the
+     * star on the hero row in main/ui.c. */
+    t = ride(&e, t, 150.0, 36.0, amps_for(30.0, 36.0));
+    wf_est_get(&e, &o);
+    CHECK(!o.consumption_windowed,
+          "200 m of riding claimed a full %.0f m window", WF_EST_CONS_WINDOW_M);
+    CHECK_D(o.range_km, o.remaining_wh / 80.0, 1.0,
+            "the first-kilometre Range is not the persisted average's");
+    CHECK(o.range_km < 40.0,
+          "the Range came out at %.1f km, which is this ride's own cost rather "
+          "than the persisted history's", o.range_km);
+
+    /* A kilometre later the window has filled and the figure is the ride's
+     * own, which is much larger because this ride is far cheaper than the
+     * history. The handover is a change of source and the screen says so. */
+    ride(&e, t, WF_EST_CONS_WINDOW_M, 36.0, amps_for(30.0, 36.0));
+    wf_est_get(&e, &o);
+    CHECK(o.consumption_windowed, "a kilometre did not fill the window");
+    CHECK(o.range_km > 80.0,
+          "the windowed Range is %.1f km, not the ~90 km a 30 Wh/km ride buys",
+          o.range_km);
+}
+
+/* "It cannot jitter upward on noise."
+ *
+ * There is no filter on Range: the steadiness comes from Consumption's ring,
+ * which moves once per fifty metres of road and by at most a twentieth of the
+ * difference between the bucket entering the window and the one leaving it. The
+ * claim being tested is that this is enough, and that nothing further is
+ * needed.
+ *
+ * The noise is the instrument's own and not the rider's: one LSB of line
+ * current, WF_CTRL_CURRENT_LSB_PER_A being 4, dithered independently onto every
+ * one of the ~45000 samples. Anything larger than that is the throttle moving,
+ * which is riding and which the window is supposed to follow.
+ *
+ * The assertion is on the figure the rider reads - main/ui.c's "%.0f" - and it
+ * is that it never ticks up. The raw double may wobble by a few metres at a
+ * bucket boundary, and is allowed to: a rise there is bounded well below the
+ * fifty metres of Range that the same fifty metres of road takes off it. */
+static void test_range_does_not_jitter_up_on_a_noisy_current(void)
+{
+    const double cost = 30.0, kmh = 36.0;
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, RANGE_SOC);
+
+    range_watch_t w;
+    memset(&w, 0, sizeof(w));
+    noise_state = 12345u;
+
+    /* Ten kilometres of it, which is two hundred bucket boundaries - every one
+     * of them an opportunity for the window to step the wrong way. */
+    ride_watched(&e, &w, 0, 10.0 * WF_EST_CONS_WINDOW_M, kmh,
+                 amps_for(cost, kmh), 0.5 / WF_CTRL_CURRENT_LSB_PER_A);
+
+    CHECK(w.samples > 4000, "only %ld samples of noisy riding", w.samples);
+    CHECK_U(w.handovers, 1, "changes of Consumption source over ten kilometres");
+    CHECK(w.last < w.first - 9.0,
+          "ten kilometres of riding took the Range from %.2f km to %.2f km, "
+          "which is not ten kilometres off it", w.first, w.last);
+
+    /* The number that decides whether this works. A bucket of road takes about
+     * 0.05 km off a 90 km Range; the noise moves the window by a fiftieth of a
+     * percent, which is 0.02 km. So the riding outruns the noise by more than
+     * two to one at every bucket boundary, and the trend the rider watches is
+     * the road and not the instrument. */
+    CHECK(w.up_max < WF_EST_CONS_BUCKET_M / 1000.0,
+          "Range rose by %.6f km on noise alone, more than the %.3f km a "
+          "bucket of road takes off it", w.up_max,
+          WF_EST_CONS_BUCKET_M / 1000.0);
+    CHECK(w.up_max / w.first < 0.0005,
+          "the noise moved Range by %.4f %% of itself",
+          100.0 * w.up_max / w.first);
+
+    /* What the rider sees, and the honest limit of the claim, written down
+     * rather than asserted away.
+     *
+     * Ten kilometres of this takes ten kilometres off the Range, so the
+     * displayed figure counts down about ten times. Three times in the same
+     * ten kilometres it ticks back up by one - the raw value happened to be
+     * within 0.02 km of a rounding boundary when a bucket closed. It never
+     * moves up by more than one, and it never moves up twice running.
+     *
+     * That could be removed, and deliberately is not. It would take a filter
+     * on Range itself - a ratchet, or hysteresis wide enough to swallow half a
+     * kilometre - and that filter cannot tell this apart from the rise a rider
+     * earns by easing off, which is the figure moving for exactly the right
+     * reason and is what the acceptance criterion above it asks for. A
+     * hundredth-of-a-percent wobble is also two thousand times smaller than
+     * the 19 % this figure is uncertain by while WF_CTRL_CURRENT_LSB_PER_A is
+     * unsettled. The bound below is a regression guard on that trade, not a
+     * claim that three is the right number. */
+    CHECK(w.km_up_max <= 1.0,
+          "the displayed Range jumped up by %.0f km on noise", w.km_up_max);
+    CHECK(w.km_ups <= 5,
+          "the displayed Range ticked up %ld times in ten kilometres of "
+          "steady riding, against the three the rounding accounts for",
+          w.km_ups);
+}
+
+/* "Range survives a simulated power cycle mid-ride without a jump."
+ *
+ * tests/host/replay.c drives the same break through a real Capture, but
+ * cap0007 has no Range on either side of it, so the figure's continuity is
+ * asserted here. Both halves of the quotient have to cross the break intact -
+ * Remaining Energy from the persisted count, Consumption from the persisted
+ * window - and the trap is the same one the Consumption test avoids: the
+ * persisted history is deliberately a long way from the riding, so a Monitor
+ * that forgot its window and fell back to a lifetime average would show a
+ * different Range rather than the same one. */
+static void test_range_survives_a_power_cycle(void)
+{
+    const double cost = 30.0, kmh = 36.0;
+
+    wf_est_persist_t history;
+    memset(&history, 0, sizeof(history));
+    history.version    = WF_EST_PERSIST_VERSION;
+    history.alltime_m  = 50000.0f;
+    history.alltime_wh = 50.0f * 80.0f;
+
+    wf_est_t e;
+    wf_est_init(&e, &history);
+    feed_soc(&e, 0, RANGE_SOC);
+    uint32_t t = ride(&e, 0, 1.5 * WF_EST_CONS_WINDOW_M, kmh,
+                      amps_for(cost, kmh));
+
+    wf_est_out_t before;
+    wf_est_get(&e, &before);
+    CHECK(before.range_valid && before.consumption_windowed,
+          "the ride before the break produced no windowed Range");
+    CHECK(before.range_km > 80.0,
+          "the Range before the break is %.1f km", before.range_km);
+
+    /* The break: out through the persisted bytes and back into a fresh
+     * estimator, which is all a power cycle is. */
+    wf_est_persist_t saved, back;
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    wf_est_save(&e, &saved);
+    CHECK(wf_est_persist_encode(&saved, blob, sizeof(blob)), "encode failed");
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &back), "decode failed");
+
+    wf_est_t after;
+    wf_est_init(&after, &back);
+    wf_est_out_t o;
+    wf_est_get(&after, &o);
+    CHECK(o.range_valid, "no Range at all on the far side of the break");
+    CHECK(!o.anchored, "a restored estimator claimed to be Anchored");
+    CHECK_D(o.range_km, before.range_km, 0.5,
+            "the Range across the break");
+
+    /* A jump the instant after the break would be the persisted window not
+     * being believed, and a jump a kilometre later would be it not being
+     * displaced smoothly. Both are watched.
+     *
+     * There is one rise the break genuinely does cost, and it is bounded here
+     * rather than waved at. A restored estimator has no previous timestamp to
+     * integrate from, so the first power-block frame after it only starts the
+     * clock and its interval's energy is never booked - which is the correct
+     * answer, because the Monitor was off across it. That one missing sample
+     * makes the first bucket after the break slightly cheaper than the road it
+     * covers, so the window dips and Range rises by the same fraction, until
+     * the bucket ages out a kilometre later. tests/host/replay.c budgets the
+     * same lost step in watt-hours; this is that step expressed in kilometres
+     * of Range. */
+    double lost_wh   = CONS_VOLTS * amps_for(cost, kmh) *
+                       ((double)SAMPLE_MS / 3600000.0);
+    double window_wh = cost * (WF_EST_CONS_WINDOW_M / 1000.0);
+    double budget_km = before.range_km * lost_wh / window_wh;
+
+    range_watch_t w;
+    memset(&w, 0, sizeof(w));
+    double prev = o.range_km;
+    double worst = 0.0;
+    for (int i = 0; i < 10; i++) {
+        t = ride_watched(&after, &w, t, 100.0, kmh, amps_for(cost, kmh), 0.0);
+        wf_est_get(&after, &o);
+        double step = o.range_km - prev;
+        if (step < 0.0) {
+            step = -step;
+        }
+        if (step > 0.2 && step > worst) {
+            worst = step;
+        }
+        prev = o.range_km;
+    }
+    CHECK(worst == 0.0,
+          "Range stepped by %.3f km over the kilometre after the break, "
+          "beyond the 0.1 km that kilometre should cost it", worst);
+    CHECK_U(w.handovers, 0,
+            "changes of Consumption source after the break: the window was "
+            "restored, so there is nothing to hand over from");
+    CHECK(w.up_max <= budget_km,
+          "Range rose by %.6f km after the break, beyond the %.6f km the one "
+          "integration step the break costs accounts for", w.up_max, budget_km);
+    CHECK(w.km_ups <= 1 && w.km_up_max <= 1.0,
+          "the displayed Range ticked up %ld times, by up to %.0f km, over the "
+          "kilometre after the break", w.km_ups, w.km_up_max);
+    CHECK_D(prev, before.range_km - 1.0, 0.5,
+            "the Range a kilometre past the break, which should be a kilometre "
+            "less than the Range before it");
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(void)
@@ -1632,6 +2210,13 @@ int main(void)
     test_consumption_follows_the_recent_kilometre();
     test_the_all_time_average_improves_across_rides();
     test_consumption_survives_a_power_cycle();
+
+    test_range_declines_the_divisions_it_cannot_make();
+    test_range_counts_down_to_the_limp_point();
+    test_range_drops_on_the_motorway();
+    test_range_is_there_in_the_first_kilometre();
+    test_range_does_not_jitter_up_on_a_noisy_current();
+    test_range_survives_a_power_cycle();
 
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();

@@ -38,8 +38,8 @@ That generates the decoders from the Field Table, builds the decoding in
 files the firmware compiles - with plain gcc, replays every recorded Capture in
 `tests/fixtures/` through them and asserts on what comes out: every Controller
 frame's checksum, the BMS register decode against the values that ride is known
-to have produced, the Remaining Energy and distance curves the estimator draws
-from it, and a
+to have produced, the Remaining Energy, distance and Range curves the estimator
+draws from it, and a
 handful of invariants any Capture has to satisfy. Each Capture is replayed
 twice and the two curves have to match bit for bit, which is what makes the
 estimator's determinism a test rather than an intention. Each is then replayed

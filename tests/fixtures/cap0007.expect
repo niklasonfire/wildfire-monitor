@@ -159,3 +159,20 @@ est_odo_samples       31
 est_cons_source       0
 est_alltime_m         16.71
 est_alltime_wh        1.73
+
+# Range, and the same honest zero for the same reason: Range is Remaining
+# Energy divided by Consumption, this ride produces no Consumption, so it
+# produces no Range and the estimator declines the division rather than
+# dividing 2727 Wh by nearly nothing. The source is Consumption's own -
+#
+#   0  no figure   1  from the all-time average   2  from the rolling window
+#
+# - so this number cannot move off 0 while est_cons_source is 0, and if it ever
+# does, one of the two guards has gone. That is the whole of what a 16.7 m ride
+# can say about Range. Everything behavioural about it - the fall of a
+# kilometre per kilometre ridden, the drop on the motorway, the figure being
+# there in the first kilometre off the persisted average, the power cycle -
+# is driven with synthesised riding in tests/host/unit.c, because a fixture
+# that never produces the figure cannot assert anything about it without
+# pretending to.
+est_range_source      0

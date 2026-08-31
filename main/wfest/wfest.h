@@ -2,8 +2,10 @@
  * wfest - what the decoded fields mean for the rider, as pure C99.
  *
  * This is the estimation seam. A stream of decoded fields plus persisted state
- * goes in; Remaining Energy, the Coulomb Count and the State of Charge come
- * out. Nothing else. No I/O, no wall clock, no BLE, no display, no globals, no
+ * goes in; the Coulomb Count, the State of Charge, Remaining Energy, Distance,
+ * Consumption and Range come out - Range being the one the rider rides by, and
+ * the reason the other five are here at all. Nothing else. No I/O, no wall
+ * clock, no BLE, no display, no globals, no
  * esp_*, no FreeRTOS, no logging, no malloc - the same rules main/wfdecode
  * lives by, and for the same reason: the figures the rider sees on the
  * handlebars have to be provably the figures a recorded Capture reproduces off
@@ -163,6 +165,97 @@
  * is the honest answer for a lifetime average and does mean an afternoon
  * parked with the ignition on and the Monitor running biases it upward.
  *
+ * ---------------------------------------------------------------------------
+ * Range, which is the one number the rider actually rides by
+ * ---------------------------------------------------------------------------
+ *
+ *   Range           kilometres still rideable before the Limp Point, at the
+ *                   way the bike is being ridden now
+ *
+ * It is Remaining Energy divided by Consumption and nothing else. Both are
+ * above; neither is recomputed for it, and there is no filter of its own -
+ * which is the whole design, so it is worth saying why each half of that is
+ * deliberate.
+ *
+ * The crawl is already excluded and must not be excluded twice. Remaining
+ * Energy counts down to the Limp Point rather than to zero State of Charge -
+ * wf_est_energy_above_limp_wh() is zero at and below it - so a Range built on
+ * it reaches zero exactly when the Controller cuts to walking pace, which is
+ * what "reaching zero means the ride is over" requires. The kilometre of
+ * crawling that follows sits below the Limp Point and is therefore already
+ * outside the numerator. Subtracting a kilometre here as well would count it
+ * twice and would make the figure pessimistic by a kilometre at every point of
+ * every ride.
+ *
+ * There is no smoothing on the quotient because the smoothing belongs in the
+ * denominator, where it already is. Consumption moves once per closed bucket -
+ * once per WF_EST_CONS_BUCKET_M of road - and one bucket can move it by at most
+ * a twentieth of the difference between the road entering the window and the
+ * road leaving it. So Range inherits a figure that cannot lurch on a single
+ * noisy frame, and adding a second filter on top would only make it slower to
+ * react without making it any steadier.
+ *
+ * That leaves monotonicity, and the two acceptance criteria pull against each
+ * other hard enough to be worth settling here rather than in a test:
+ *
+ *   Range falls monotonically over a recorded ride, absent regeneration.
+ *   Range reacts to a sustained change of riding style within the window.
+ *
+ * Strict global monotonicity is incompatible with the second one. A rider who
+ * slows down is genuinely spending less per kilometre and can genuinely go
+ * further, and a Range that refused to say so would be a ratchet rather than an
+ * estimate. So what is implemented, and what tests/host/unit.c asserts, is:
+ *
+ *   under steady riding, Range is monotone non-increasing - strictly, on the
+ *   double, sampled at every frame - and falls by one kilometre per kilometre
+ *   ridden, which is the identity that says the numerator and the denominator
+ *   are describing the same riding;
+ *
+ *   under a sustained change, it moves, and the motorway shows up inside one
+ *   window;
+ *
+ *   under instrument noise it does neither. Half an LSB of line current -
+ *   the whole of the quantisation error - dithered onto every sample moves the
+ *   window by a fiftieth of a percent, which is less than half of what a
+ *   bucket of road takes off the Range in the same instant. The riding outruns
+ *   the instrument at every bucket boundary.
+ *
+ * That last one is a bound and not a zero, and the difference is worth being
+ * straight about. Rendering a continuous figure as a whole number puts a
+ * rounding boundary every kilometre, and a hundredth of a percent of wobble
+ * near one of them is a displayed kilometre ticking back up: about three times
+ * in ten kilometres, by one, never twice running. Removing that would take a
+ * filter on Range itself, and no filter can tell it apart from the rise a
+ * rider earns by easing off - which is the second criterion above, and is the
+ * figure moving for exactly the right reason. The wobble is also some two
+ * thousand times smaller than the 19 % this figure is uncertain by for as long
+ * as WF_CTRL_CURRENT_LSB_PER_A is unsettled. So there is no filter, and
+ * tests/host/unit.c asserts the bound instead of pretending to a zero.
+ *
+ * There is one discontinuity that is none of those three, and it is expected
+ * rather than tolerated: the handover, when the ring fills and the rolling
+ * window takes over from the persisted all-time average. Those are two
+ * different figures - how the rider is riding now, against how they have
+ * ridden ever - so Range moves by whatever they differ by, in whichever
+ * direction the ride differs from the history. It is not jitter and it is not
+ * a step in one figure; it is the answer to a different question, arriving
+ * once, a kilometre into the ride, and the screen marks it by dropping the
+ * star. Monotonicity is asserted on either side of it and not across it.
+ *
+ * A floor on how small that handover can be does not exist even in principle,
+ * but a floor on how small it is under steady riding does: the two integrals
+ * behind the window are cut on different frame types, so the first window is
+ * up to one frame interval - one part in five hundred - out against the road
+ * it covers. On a Range of 90 km that is under two hundred metres.
+ *
+ * The two divisions are guarded, and the guard is a floor on the divisor rather
+ * than a cap on the quotient: WF_EST_RANGE_MIN_CONS_WH_PER_KM. Consumption can
+ * legitimately come out at zero or below - a windowful of descent, or more
+ * regeneration than draw - and a quotient of a real energy by nearly nothing is
+ * not a large Range, it is a meaningless one. Below the floor there is no Range
+ * at all and the screen shows a dash, which is the same answer Consumption
+ * itself gives below its own floor.
+ *
  * WARNING, and it is the big one: every watt-hour below is scaled by
  * WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 % - upstream says 4 LSB
  * per amp, regression against the BMS says 4.77. That uncertainty propagates
@@ -307,6 +400,30 @@
 #define WF_EST_CONS_BUCKET_M          (WF_EST_CONS_WINDOW_M / \
                                        WF_EST_CONS_BUCKETS)
 #define WF_EST_CONS_MIN_DIST_M        100.0
+
+/* ------------------------------------------------------- Range's one guard
+ *
+ * The smallest Consumption that may be divided into. It is a floor on the
+ * divisor and not a cap on the answer, because a capped answer still claims to
+ * be an estimate and this is the case where there is no estimate to make.
+ *
+ * Two reasons for the value, and they agree, which is why it is this one.
+ *
+ * Nothing this bike does costs less. The cheapest riding any Capture we hold
+ * has shown is tens of watt-hours per kilometre, and a fifth of the cheapest of
+ * those is not a riding style - it is a kilometre of descent, or a window in
+ * which regeneration outweighed draw, and neither predicts the next hundred
+ * kilometres. Consumption at or below zero lands here too: the comparison is
+ * written the way round that rejects a negative and a NaN as well.
+ *
+ * And it bounds the figure structurally. A full Pack holds about 4585 Wh above
+ * the Limp Point on the constants above, so the largest Range that can ever
+ * come out of this division is about 917 km - three digits, which is what the
+ * hero row on the live screen has room for. The screen cannot be overflowed by
+ * a number the estimator is willing to produce. If the Pack model or this floor
+ * ever moves, check that pair again; main/ui.c's layout comment says so too.
+ */
+#define WF_EST_RANGE_MIN_CONS_WH_PER_KM  5.0
 
 /* ----------------------------------------------------------- sign convention
  *
@@ -520,6 +637,24 @@ typedef struct {
     double   window_m;
     double   alltime_m;
     double   alltime_wh;
+
+    /* Range, in kilometres: Remaining Energy divided by Consumption, and the
+     * primary figure on the live screen. Zero means the Limp Point, because
+     * the numerator counts down to the Limp Point - the crawl below it is
+     * already outside this figure and is not subtracted again.
+     *
+     * `range_valid` is false when there is no Remaining Energy to divide, no
+     * Consumption to divide by, or a Consumption below
+     * WF_EST_RANGE_MIN_CONS_WH_PER_KM, and then `range_km` is left at exactly
+     * zero - which is the proof that the division did not happen rather than
+     * that it happened and produced something small.
+     *
+     * Which of the two Consumptions it was built on is `consumption_windowed`
+     * and is not repeated here: a Range from the persisted all-time average is
+     * exactly as provisional as the average it came from, and the screen marks
+     * both with the same star. */
+    bool     range_valid;
+    double   range_km;
 
     uint32_t power_samples;
     uint32_t anchor_samples;

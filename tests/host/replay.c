@@ -143,6 +143,23 @@ typedef struct {
     long     dist_points;
     double   dist_m_last, dist_odo_last;
     double   dist_step_back_max;   /* largest backwards move, must stay 0 */
+    /* Range. Sampled wherever there is one, which on cap0007 is nowhere: that
+     * ride covers 16.7 m, produces no Consumption and therefore no Range, and
+     * cap0007.expect pins exactly that. The behavioural assertions are in
+     * tests/host/unit.c on synthesised riding, for the same reason
+     * Consumption's are. What is tracked here is what a Capture can honestly
+     * say: how far the figure moved and which way.
+     *
+     * `est_range_step_up_max` is the one to watch when a longer ride lands.
+     * On a ride with no regeneration and no change of Consumption source it
+     * is the monotonicity criterion as a number, and it belongs in that ride's
+     * .expect file - which is where a per-ride fact goes. It is deliberately
+     * not an invariant here: a Range that rises when the rider slows down is
+     * the figure working, and an invariant would forbid it on every Capture. */
+    long     range_points;
+    double   range_km_first, range_km_last;
+    double   range_km_prev;
+    double   range_step_up_max;    /* largest upward move over the ride */
     /* Records walked, and whether a power cycle was simulated part way through
      * this run. See power_cycle() and the criterion it exists for. */
     long     records;
@@ -201,6 +218,19 @@ static void est_sample(run_t *r)
     if (o.distance_valid) {
         dist_point(r, o.distance_m);
         r->dist_odo_last = o.odo_distance_m;
+    }
+    if (o.range_valid) {
+        if (r->range_points == 0) {
+            r->range_km_first = o.range_km;
+            r->range_km_prev  = o.range_km;
+        }
+        double up = o.range_km - r->range_km_prev;
+        if (up > r->range_step_up_max) {
+            r->range_step_up_max = up;
+        }
+        r->range_km_prev = o.range_km;
+        r->range_km_last = o.range_km;
+        r->range_points++;
     }
     if (!o.valid) {
         return;
@@ -605,6 +635,22 @@ static void collect(const run_t *r, metrics_t *ms)
         if (o.consumption_valid) {
             put(ms, "est_cons_wh_per_km", o.consumption_wh_per_km);
         }
+
+        /* Range, on the same terms and for the same reason: "this ride
+         * produced no Range" is the fact worth pinning on a fixture that never
+         * produces one, and the source is Consumption's own - Range is only
+         * ever as windowed as the figure it was divided by.
+         *
+         *   0  no figure   1  from the all-time average   2  from the window
+         */
+        put(ms, "est_range_source",
+            o.range_valid ? (o.consumption_windowed ? 2.0 : 1.0) : 0.0);
+        if (r->range_points > 0) {
+            put(ms, "est_range_points", (double)r->range_points);
+            put(ms, "est_range_km_first", r->range_km_first);
+            put(ms, "est_range_km_last", r->range_km_last);
+            put(ms, "est_range_step_up_max", r->range_step_up_max);
+        }
     }
 }
 
@@ -781,6 +827,56 @@ static void check_invariants(const char *fixture, const run_t *r)
         fail(fixture, "no Consumption figure, and yet %.3f Wh/km came out of "
                       "the division that was not supposed to happen",
              o.consumption_wh_per_km);
+    }
+
+    /* ---- Range ---- */
+
+    /* The same shape of invariant as Consumption's, and it has to hold on any
+     * Capture: the division either happened under its guards or did not happen
+     * at all, and there is no third state in which a figure exists that no
+     * guard let through.
+     *
+     * The identity is the strongest part. Range times Consumption has to be
+     * Remaining Energy, which is what says the estimator did this division and
+     * left main/ui.c nothing to do but a "%.0f" - the criterion "Range is
+     * computed in the pure estimator; the display only formats it", as
+     * arithmetic rather than as a promise. */
+    if (o.range_valid) {
+        if (!o.valid) {
+            fail(fixture, "a Range with no Remaining Energy behind it");
+        }
+        if (!o.consumption_valid) {
+            fail(fixture, "a Range with no Consumption behind it");
+        }
+        if (o.consumption_wh_per_km < WF_EST_RANGE_MIN_CONS_WH_PER_KM) {
+            fail(fixture, "a Range of %.1f km from a Consumption of %.3f "
+                          "Wh/km, below the %.1f Wh/km floor", o.range_km,
+                 o.consumption_wh_per_km, WF_EST_RANGE_MIN_CONS_WH_PER_KM);
+        }
+        double implied = o.range_km * o.consumption_wh_per_km;
+        double slip = implied - o.remaining_wh;
+        if (slip < 0.0) {
+            slip = -slip;
+        }
+        if (slip > 1e-6 * (1.0 + o.remaining_wh)) {
+            fail(fixture, "%.3f km at %.3f Wh/km is %.3f Wh, not the %.3f Wh "
+                          "of Remaining Energy it was divided from - something "
+                          "other than the division moved the figure",
+                 o.range_km, o.consumption_wh_per_km, implied, o.remaining_wh);
+        }
+        /* The Pack cannot hold more than a full charge above the Limp Point,
+         * and the Consumption floor is what bounds the quotient from there -
+         * which is also what keeps the figure inside the three columns
+         * main/ui.c's hero row has for it. */
+        double most_km = wf_est_energy_above_limp_wh(100.0) /
+                         WF_EST_RANGE_MIN_CONS_WH_PER_KM;
+        if (o.range_km < 0.0 || o.range_km > most_km) {
+            fail(fixture, "a Range of %.1f km, outside the 0-%.0f km this Pack "
+                          "and this floor can produce", o.range_km, most_km);
+        }
+    } else if (o.range_km != 0.0) {
+        fail(fixture, "no Range, and yet %.3f km came out of the division that "
+                      "was not supposed to happen", o.range_km);
     }
 
     /* The all-time totals are the same two integrals the ride already
@@ -1066,6 +1162,16 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                                           : "all-time average",
                    o.alltime_wh, o.alltime_m);
         }
+        if (!o.range_valid) {
+            printf("  range: none - there is no Consumption above the %.1f "
+                   "Wh/km floor to divide %.0f Wh by\n",
+                   WF_EST_RANGE_MIN_CONS_WH_PER_KM, o.remaining_wh);
+        } else {
+            printf("  range: %.1f -> %.1f km to a provisional %.1f V Limp "
+                   "Point over %ld points, rose at most %.3f km\n",
+                   r->range_km_first, r->range_km_last, WF_EST_LIMP_POINT_V,
+                   r->range_points, r->range_step_up_max);
+        }
     }
 }
 
@@ -1261,6 +1367,37 @@ int main(int argc, char **argv)
                 broken.consumption_windowed != whole.consumption_windowed) {
                 fail(paths[i], "a power cycle changed where the Consumption "
                                "figure comes from");
+            }
+
+            /* Range across the break. Both halves of the quotient are
+             * persisted, so the figure has to come back the same one - and on
+             * a fixture that produces no Range on either side, which cap0007
+             * is, "no Range before and no Range after" is the whole of what
+             * can honestly be asserted here. The figure's continuity across a
+             * break on a ride long enough to have one is asserted in
+             * tests/host/unit.c, against a persisted history deliberately
+             * unlike the riding.
+             *
+             * The budget, when there is a figure, is the energy budget above
+             * converted into kilometres by the Consumption it would be divided
+             * by: the same one lost integration step, said in the units of
+             * this screen. */
+            if (broken.range_valid != whole.range_valid) {
+                fail(paths[i], "a power cycle changed whether there is a Range "
+                               "at all");
+            } else if (whole.range_valid) {
+                double d_km = broken.range_km - whole.range_km;
+                if (d_km < 0.0) {
+                    d_km = -d_km;
+                }
+                double budget_km = budget_wh / whole.consumption_wh_per_km;
+                if (d_km > budget_km) {
+                    fail(paths[i], "a power cycle mid-ride moved Range by "
+                                   "%.3f km, more than the %.3f km one lost "
+                                   "integration step accounts for: %.3f km "
+                                   "unbroken, %.3f km across the break",
+                         d_km, budget_km, whole.range_km, broken.range_km);
+                }
             }
             check_invariants(paths[i], &cyc);
         }
