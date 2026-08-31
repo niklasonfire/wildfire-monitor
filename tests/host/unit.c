@@ -1216,6 +1216,140 @@ static uint32_t ride(wf_est_t *e, uint32_t t0_ms, double metres, double kmh,
     return t;
 }
 
+/* A NONSENSE FLOAT IN THE BLOB MUST NOT SURVIVE THE RESTORE, which is what
+ * sane_f() is for and what the three most load-bearing figures were skipping.
+ *
+ * The threat is not a corrupted record - the CRC catches those. It is a record
+ * whose checksum is perfectly good and whose bytes are not a number: a flash
+ * cell that flipped before the CRC was taken, a struct written by a build with
+ * a different layout, an arithmetic slip upstream that saved an infinity. The
+ * estimator has no way to tell those apart from a real figure, so it checks
+ * the value rather than the record.
+ *
+ * A NaN that got in would not merely be wrong once. Remaining Energy is
+ * corrected by `x += (target - x) * k`, which is NaN for every k, so no BMS
+ * answer can ever pull it back; Range is a quotient of it and goes with it;
+ * and wf_est_save() writes it out again under a fresh valid CRC. It is the one
+ * class of error in this module that a power cycle makes worse rather than
+ * better.
+ *
+ * Built as bit patterns rather than as NAN and INFINITY so that the test says
+ * what a corrupted record actually looks like, and so that nothing here needs
+ * math.h. */
+static float float_from_bits(uint32_t bits)
+{
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static bool is_a_number(double v)
+{
+    return v > -1e30 && v < 1e30;
+}
+
+/* One poisoned blob, all the way through the round trip a power cycle is. */
+static void check_nonsense_is_refused(const char *what,
+                                      const wf_est_persist_t *poisoned)
+{
+    uint8_t blob[WF_EST_PERSIST_BYTES];
+    wf_est_persist_t back;
+    CHECK(wf_est_persist_encode(poisoned, blob, sizeof(blob)),
+          "%s: encode failed", what);
+    CHECK(wf_est_persist_decode(blob, sizeof(blob), &back),
+          "%s: the blob did not survive its own CRC, so this case is not "
+          "testing the restore", what);
+
+    wf_est_t e;
+    wf_est_init(&e, &back);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(is_a_number(o.coulomb_ah) && is_a_number(o.remaining_wh) &&
+          is_a_number(o.distance_m) && is_a_number(o.range_km) &&
+          is_a_number(o.soc_pct) && is_a_number(o.usable_frac),
+          "%s: restored, and the estimator now shows coulomb %f Ah, "
+          "remaining %f Wh, distance %f m, range %f km", what, o.coulomb_ah,
+          o.remaining_wh, o.distance_m, o.range_km);
+
+    /* And it does not come back on the next save. A figure the estimator
+     * refused to restore must not be written out again under a fresh CRC, or
+     * the record repairs itself into the same state at every power cycle. */
+    wf_est_persist_t again;
+    wf_est_save(&e, &again);
+    CHECK(is_a_number((double)again.coulomb_ah) &&
+          is_a_number((double)again.remaining_wh) &&
+          is_a_number((double)again.distance_m),
+          "%s: the estimator saved the nonsense straight back out", what);
+
+    /* Riding on top of it does not resurrect it either: a ride that starts
+     * from a refused restore is a ride that starts cold. */
+    feed_soc(&e, 0, 80.0);
+    for (uint32_t t = SAMPLE_MS; t <= 60000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 40.0, amps_for(25.0, 40.0));
+    }
+    wf_est_get(&e, &o);
+    CHECK(is_a_number(o.remaining_wh) && is_a_number(o.distance_m) &&
+          (!o.range_valid || is_a_number(o.range_km)),
+          "%s: a minute of riding on the refused restore produced remaining "
+          "%f Wh, distance %f m, range %f km", what, o.remaining_wh,
+          o.distance_m, o.range_km);
+}
+
+static void test_a_nonsense_restore_is_refused(void)
+{
+    const uint32_t quiet_nan = 0x7fc00000u;
+    const uint32_t pos_inf   = 0x7f800000u;
+
+    wf_est_persist_t good;
+    memset(&good, 0, sizeof(good));
+    good.version           = WF_EST_PERSIST_VERSION;
+    good.valid             = true;
+    good.coulomb_ah        = 15.0f;
+    good.remaining_wh      = 750.0f;
+    good.rated_capacity_ah = (float)WF_EST_RATED_CAPACITY_AH;
+    good.distance_valid    = true;
+    good.distance_m        = 8000.0f;
+    good.alltime_m         = 50000.0f;
+    good.alltime_wh        = 4000.0f;
+
+    /* The control: the same blob with nothing wrong with it restores, so a
+     * pass below cannot be the restore having failed for some other reason. */
+    wf_est_t e;
+    wf_est_init(&e, &good);
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.valid && o.distance_valid,
+          "the un-poisoned control blob did not restore, so the cases below "
+          "assert nothing");
+    CHECK_D(o.remaining_wh, 750.0, 1e-6, "the control's Remaining Energy");
+
+    wf_est_persist_t p;
+
+    p = good;
+    p.remaining_wh = float_from_bits(quiet_nan);
+    check_nonsense_is_refused("a NaN Remaining Energy", &p);
+
+    p = good;
+    p.remaining_wh = float_from_bits(pos_inf);
+    check_nonsense_is_refused("an infinite Remaining Energy", &p);
+
+    p = good;
+    p.coulomb_ah = float_from_bits(quiet_nan);
+    check_nonsense_is_refused("a NaN Coulomb Count", &p);
+
+    p = good;
+    p.coulomb_ah = 1e31f;
+    check_nonsense_is_refused("a Coulomb Count of 1e31 Ah", &p);
+
+    p = good;
+    p.distance_m = float_from_bits(pos_inf);
+    check_nonsense_is_refused("an infinite Distance", &p);
+
+    p = good;
+    p.distance_m = 1e31f;
+    check_nonsense_is_refused("a Distance of 1e31 m", &p);
+}
+
 /* The all-time average as the two totals it is the ratio of, which is what the
  * screen would show once the window has run out and is what the tests below
  * compare the windowed figure against. */
@@ -4169,6 +4303,7 @@ int main(void)
     test_the_same_input_gives_the_same_state();
     test_persisted_state_round_trips();
     test_a_restored_count_is_not_an_anchor();
+    test_a_nonsense_restore_is_refused();
     test_distance_survives_a_power_cycle();
 
     test_a_standing_bike_produces_no_consumption();

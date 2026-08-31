@@ -247,7 +247,8 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
      * not depend on the Pack model, and the Rated Capacity guard below has
      * nothing to say about it. The comparison is written the way round that
      * rejects a NaN as well as a negative. */
-    if (restored->distance_valid && restored->distance_m >= 0.0f) {
+    if (restored->distance_valid && restored->distance_m >= 0.0f &&
+        sane_f(restored->distance_m)) {
         e->distance_m        = (double)restored->distance_m;
         e->distance_restored = true;
     }
@@ -309,6 +310,18 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
      * guessing at, start cold - the first BMS answer acquires within a second
      * either way. */
     if ((double)restored->rated_capacity_ah != WF_EST_RATED_CAPACITY_AH) {
+        return;
+    }
+    /* And the same check every other restored float gets, on the two figures
+     * that need it most. Both or neither: the count and the energy are one
+     * statement about the Pack, and half of it is not one.
+     *
+     * A NaN here would not be wrong once. The Anchor corrects Remaining Energy
+     * by `x += (target - x) * k`, which is NaN for every k, so no BMS answer
+     * could ever pull it back; Range is a quotient of it and would follow it;
+     * and wf_est_save() would write it out again under a fresh valid CRC. It
+     * is the one error in this module that a power cycle makes worse. */
+    if (!sane_f(restored->coulomb_ah) || !sane_f(restored->remaining_wh)) {
         return;
     }
     e->coulomb_ah   = (double)restored->coulomb_ah;
