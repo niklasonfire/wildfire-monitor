@@ -3396,6 +3396,651 @@ static void test_extrapolation_is_flagged_and_not_hidden(void)
           "a million km/h was not flagged as extrapolation");
 }
 
+/* ======================================================== the advice, issue #20
+ *
+ * "How much further would I get at 45?" - the one thing on this screen that
+ * answers a question the rider did not already have the numbers for.
+ *
+ * Every test here is in two halves and the split is the whole of how this
+ * cascade has handled a fixture that cannot exercise the physics.
+ *
+ * The dormancy half runs against the committed constants. WF_FIT_FITTED is 0,
+ * so the advice can never appear on this build, and that is asserted rather
+ * than assumed - a feature that is meant to be silent and is silent for the
+ * wrong reason would look identical from the outside.
+ *
+ * The behaviour half runs against a curve synthesised here, because there is
+ * no fitted one to run against and there will not be until the calibration
+ * ride happens. That is the same reason every Range test above is driven by
+ * synthesised riding: cap0007 covers 16.7 m and produces no Range either. What
+ * is deliberately NOT done is putting invented coefficients into wf_fit.h to
+ * make the feature demonstrable on the archive - that is the one failure mode
+ * ADR-0005 exists to prevent.
+ */
+
+/* A curve the archive does not have, and numbers of the right order for a
+ * light electric motorbike: 18 Wh/km of rolling and driveline, and a drag term
+ * that has doubled that by 90 km/h. Supported over 20-90 km/h, which is about
+ * what a calibration ride with steady-speed holds in it would cover.
+ *
+ * The arithmetic the tests below lean on, worked out here so the expectations
+ * are checkable by hand:
+ *
+ *   25 km/h  20.81      35 km/h  23.51      45 km/h  27.11      55 km/h  31.61
+ *   30 km/h  22.05      40 km/h  25.20      50 km/h  29.25      60 km/h  34.20
+ */
+static void synth_curve(wf_est_curve_t *c)
+{
+    memset(c, 0, sizeof(*c));
+    c->fitted                 = true;
+    c->a_wh_per_km            = 18.0;
+    c->c_wh_per_km_per_kmh2   = 0.0045;
+    c->speed_min_kmh          = 20.0;
+    c->speed_max_kmh          = 90.0;
+}
+
+static double curve_wh_per_km(const wf_est_curve_t *c, double kmh)
+{
+    return wf_est_fit_eval(c->a_wh_per_km, c->b_wh_per_km_per_kmh,
+                           c->c_wh_per_km_per_kmh2, kmh);
+}
+
+/* A draw that costs what the curve says this speed costs. The synthesised bike
+ * and the synthesised fit then describe one machine, so the measured
+ * Consumption the Range is built on and the fitted curve the counterfactual is
+ * built on cannot silently disagree - which is the state a real Monitor with a
+ * real fit would be in on a flat road. */
+static double amps_on_curve(const wf_est_curve_t *c, double kmh)
+{
+    return amps_for(curve_wh_per_km(c, kmh), kmh);
+}
+
+/* A Range figure with no advice on it has to be a Range figure and nothing
+ * else: the three advice fields are left at exactly zero, which is the proof
+ * that no counterfactual was evaluated rather than that one was and came out
+ * small. It is also the acceptance criterion "the default screen still shows
+ * exactly one Range figure", as arithmetic - main/ui.c draws the row only when
+ * `advice_valid`, so a zeroed triple is an absent row. */
+static void check_no_second_number(const wf_est_out_t *o, const char *when)
+{
+    if (o->advice_valid) {
+        return;
+    }
+    CHECK(o->advice_speed_kmh == 0.0 && o->advice_range_km == 0.0 &&
+          o->advice_gain_km == 0.0,
+          "%s: no advice, and yet %.1f km/h buying %.1f km came out of the "
+          "counterfactual that was not supposed to happen", when,
+          o->advice_speed_kmh, o->advice_range_km);
+}
+
+/* THE DORMANCY, and it is a real assertion and not a placeholder.
+ *
+ * The archive holds one 47-second parking-lot ride, the fit refused over it,
+ * and so the counterfactual has no curve to evaluate. The rule that follows is
+ * absolute: no ride, however low its Pack and however fast its rider, may put
+ * this row on the screen on this build. */
+static void test_the_advice_is_silent_without_a_fit(void)
+{
+    wf_est_curve_t committed;
+    wf_est_curve_default(&committed);
+    CHECK(committed.fitted == (WF_FIT_FITTED != 0),
+          "wf_fit.h says FITTED=%d and the curve says %d", WF_FIT_FITTED,
+          (int)committed.fitted);
+
+    if (!committed.fitted) {
+        /* Every speed a rider could be doing, against a Pack as low as it can
+         * get, which is the most favourable case the advice will ever see. */
+        for (double kmh = 5.0; kmh <= 120.0; kmh += 5.0) {
+            wf_est_advice_t a;
+            CHECK(!wf_est_advice_pick(&committed, kmh, 40.0, 0.05, &a),
+                  "an unfitted archive advised something at %.0f km/h", kmh);
+            CHECK(a.speed_kmh == 0.0 && a.range_km == 0.0,
+                  "an unfitted archive produced %.1f km/h buying %.1f km",
+                  a.speed_kmh, a.range_km);
+            CHECK(!wf_est_advice_at(&committed, kmh, 40.0, kmh - 10.0, &a),
+                  "an unfitted archive costed a counterfactual at %.0f km/h",
+                  kmh - 10.0);
+        }
+    }
+
+    /* And end to end, on the estimator the Monitor actually runs: a Pack down
+     * to a fifth of its usable energy, a rider holding a speed the advice
+     * would love to talk about, and twenty minutes of it. */
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    feed_soc(&e, 0, 29.0);
+    wf_est_curve_t c;
+    synth_curve(&c);
+    for (uint32_t t = SAMPLE_MS; t <= 20u * 60u * 1000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 55.0, amps_on_curve(&c, 55.0));
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        if (o.advice_valid) {
+            CHECK(false, "the advice appeared at %u ms with no fit behind it",
+                  (unsigned)t);
+            break;
+        }
+        check_no_second_number(&o, "an unfitted ride");
+    }
+    wf_est_out_t o;
+    wf_est_get(&e, &o);
+    CHECK(o.range_valid, "the dormancy ride produced no Range at all, so it "
+                         "was not testing the advice's silence");
+    CHECK(o.usable_frac <= WF_EST_ADVICE_LOW_FRAC,
+          "the dormancy ride ended at %.3f of a usable Pack, above the %.2f "
+          "the advice needs - so it never asked the question",
+          o.usable_frac, WF_EST_ADVICE_LOW_FRAC);
+}
+
+/* The counterfactual itself, with no policy in it: Range times the ratio of
+ * the curve at the two speeds. The ratio is what makes this honest - the
+ * rider's own measured Consumption carries the hill they are on, and only the
+ * *shape* of the fit is borrowed. */
+static void test_the_counterfactual_is_a_ratio(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+
+    wf_est_advice_t a;
+    CHECK(wf_est_advice_at(&c, 55.0, 30.0, 45.0, &a),
+          "no counterfactual for 55 -> 45 km/h inside the fitted range");
+    double want = 30.0 * (curve_wh_per_km(&c, 55.0) / curve_wh_per_km(&c, 45.0));
+    CHECK_D(a.range_km, want, 1e-9, "the Range 45 km/h would buy");
+    CHECK_D(a.gain_km, want - 30.0, 1e-9, "the extra distance");
+    CHECK_D(a.gain_frac, (want - 30.0) / 30.0, 1e-12, "the gain as a fraction");
+    CHECK(a.range_km > 30.0, "slowing down bought less Range, not more");
+
+    /* Scale-free in the Range it is applied to, which is the property that
+     * makes the 19 % current scale cancel out of the *fraction* even though it
+     * does not cancel out of the kilometres. */
+    wf_est_advice_t half;
+    CHECK(wf_est_advice_at(&c, 55.0, 15.0, 45.0, &half), "no counterfactual");
+    CHECK_D(half.gain_frac, a.gain_frac, 1e-12,
+            "the gain fraction moved when only the Range it was applied to did");
+
+    /* Both ends have to be inside the fit. A rider above the fitted range gets
+     * nothing, because a counterfactual with an extrapolated numerator
+     * over-promises exactly as badly as one with an extrapolated denominator -
+     * and over-promising is the failure this feature cannot have. */
+    CHECK(!wf_est_advice_at(&c, 100.0, 30.0, 60.0, &a),
+          "a cruise of 100 km/h was costed against a fit that stops at 90");
+    CHECK(!wf_est_advice_at(&c, 30.0, 30.0, 15.0, &a),
+          "a suggestion of 15 km/h was costed against a fit that starts at 20");
+    CHECK(a.range_km == 0.0 && a.speed_kmh == 0.0,
+          "a refused counterfactual still filled something in");
+
+    /* And no Range to take a fraction of is no advice, whatever the curve. */
+    CHECK(!wf_est_advice_at(&c, 55.0, 0.0, 45.0, &a),
+          "a counterfactual on a Range of zero");
+}
+
+/* THE FIRST CONDITION. On a full Pack there is nothing to decide and the row
+ * stays off the screen; the threshold is a fifth of the usable Pack and it is
+ * pinned here to the millipoint, because a threshold nobody can see move is a
+ * threshold that will be moved by accident. */
+static void test_the_advice_is_hidden_on_a_full_pack(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+    wf_est_advice_t a;
+
+    CHECK(!wf_est_advice_pick(&c, 55.0, 30.0, 1.00, &a),
+          "the advice spoke to a rider on a full Pack");
+    CHECK(!wf_est_advice_pick(&c, 55.0, 30.0, 0.50, &a),
+          "the advice spoke to a rider on half a Pack");
+    CHECK(!wf_est_advice_pick(&c, 55.0, 30.0,
+                              WF_EST_ADVICE_LOW_FRAC + 0.001, &a),
+          "the advice spoke a thousandth above its own threshold");
+    CHECK(a.speed_kmh == 0.0, "a refused pick still suggested %.1f km/h",
+          a.speed_kmh);
+    CHECK(wf_est_advice_pick(&c, 55.0, 30.0, WF_EST_ADVICE_LOW_FRAC, &a),
+          "the advice stayed silent at exactly its own threshold");
+
+    /* A frac that is not a number is not a low Pack. The comparison is written
+     * the way round that says so, so an estimate that has gone wrong is silent
+     * rather than loud. */
+    double nan_frac = 0.0 / 0.0;
+    CHECK(!wf_est_advice_pick(&c, 55.0, 30.0, nan_frac, &a),
+          "a NaN Pack fraction was treated as a low Pack");
+}
+
+/* THE SECOND CONDITION, and the threshold the criterion asks to be stated:
+ * WF_EST_ADVICE_GAIN_FRAC of the Range they have, and WF_EST_ADVICE_GAIN_KM of
+ * road. A curve flat enough that backing off buys a few percent says nothing
+ * at all, which is the "hidden when it would not change the decision" half. */
+static void test_the_advice_is_hidden_when_slowing_buys_nothing(void)
+{
+    /* Almost all rolling resistance and almost no drag - a heavy bike at town
+     * speeds. Slowing from 55 to 35 buys under 3 %. */
+    wf_est_curve_t flat;
+    memset(&flat, 0, sizeof(flat));
+    flat.fitted               = true;
+    flat.a_wh_per_km          = 30.0;
+    flat.c_wh_per_km_per_kmh2 = 0.0005;
+    flat.speed_min_kmh        = 10.0;
+    flat.speed_max_kmh        = 120.0;
+
+    wf_est_advice_t a;
+    CHECK(!wf_est_advice_pick(&flat, 55.0, 30.0, 0.10, &a),
+          "the advice offered %.1f km/h for %.2f km, which is %.1f %% - under "
+          "the %.0f %% that changes a decision", a.speed_kmh, a.gain_km,
+          100.0 * a.gain_frac, 100.0 * WF_EST_ADVICE_GAIN_FRAC);
+
+    /* The kilometre floor, on its own, and it takes a Range short enough that
+     * no rung of the ladder can clear it: a rider with 1.5 km left is offered
+     * a third more by the biggest cut on offer, and a third of 1.5 km is half
+     * a kilometre. Both rows render "%.0f", so they would show the same number
+     * twice with an instruction between them, which reads as a fault.
+     *
+     * Note what the floor does NOT do, and the difference matters: on a longer
+     * Range it makes the ladder walk one rung further down rather than going
+     * silent, because a deeper cut buys more road. Silence is only the answer
+     * when the whole ladder is under the floor. */
+    wf_est_curve_t c;
+    synth_curve(&c);
+    CHECK(wf_est_advice_at(&c, 55.0, 1.5, 45.0, &a) &&
+          a.gain_frac >= WF_EST_ADVICE_GAIN_FRAC,
+          "the short-Range case is not clearing the fraction, so it is testing "
+          "the wrong floor");
+    CHECK(a.gain_km < WF_EST_ADVICE_GAIN_KM,
+          "%.2f km is not under the %.1f km floor this case is about",
+          a.gain_km, WF_EST_ADVICE_GAIN_KM);
+    CHECK(!wf_est_advice_pick(&c, 55.0, 1.5, 0.10, &a),
+          "the advice promised %.2f km, under the %.1f km either row can show",
+          a.gain_km, WF_EST_ADVICE_GAIN_KM);
+    /* The same rider with a longer Range is advised, and advised deeper than
+     * the fraction alone would have suggested - which is the floor moving the
+     * answer instead of removing it. */
+    CHECK(wf_est_advice_pick(&c, 55.0, 4.0, 0.10, &a),
+          "no advice at all for a Range the ladder can clear the floor on");
+    CHECK_D(a.speed_kmh, 40.0, 0.0,
+            "the rung the kilometre floor pushed the suggestion down to");
+}
+
+/* THE SUGGESTION HAS TO BE ONE THE RIDER COULD ACTUALLY HOLD, which is four
+ * separate refusals wearing one criterion. */
+static void test_the_suggested_speed_is_holdable(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+    wf_est_advice_t a;
+
+    /* The ordinary case: 55 km/h on a low Pack. 50 buys 8 % and is refused; 45
+     * buys 17 % and is the answer - the least sacrifice that changes the
+     * outcome, and a number a speedometer has a mark for. */
+    CHECK(wf_est_advice_pick(&c, 55.0, 30.0, 0.15, &a),
+          "no advice at 55 km/h on a Pack at 15 %%");
+    CHECK_D(a.speed_kmh, 45.0, 0.0, "the suggested speed");
+    CHECK(a.gain_frac >= WF_EST_ADVICE_GAIN_FRAC,
+          "the suggestion buys %.1f %%, under its own threshold",
+          100.0 * a.gain_frac);
+
+    /* Round numbers, whatever the cruise is. A rider drifting at 62.3 km/h is
+     * not told to hold 52.3. */
+    for (double cruise = 30.0; cruise <= 90.0; cruise += 0.7) {
+        if (!wf_est_advice_pick(&c, cruise, 40.0, 0.15, &a)) {
+            continue;
+        }
+        double rungs = a.speed_kmh / WF_EST_ADVICE_STEP_KMH;
+        CHECK_D(rungs, (double)(long)(rungs + 0.5), 1e-9,
+                "a suggestion that is not a multiple of the ladder step");
+        CHECK(a.speed_kmh >= WF_EST_ADVICE_MIN_SPEED_KMH,
+              "a suggestion of %.1f km/h, under the %.0f km/h floor",
+              a.speed_kmh, WF_EST_ADVICE_MIN_SPEED_KMH);
+        CHECK(a.speed_kmh <= cruise - WF_EST_ADVICE_STEP_KMH,
+              "a suggestion of %.1f km/h to a rider doing %.1f - not a step",
+              a.speed_kmh, cruise);
+        CHECK(a.speed_kmh >= cruise * (1.0 - WF_EST_ADVICE_MAX_DROP_FRAC),
+              "a suggestion of %.1f km/h to a rider doing %.1f is %.0f %% off",
+              a.speed_kmh, cruise, 100.0 * (1.0 - a.speed_kmh / cruise));
+        /* And inside the fit, always. This is `extrapolated` doing the job it
+         * was put in #19 for. */
+        wf_est_fit_t f;
+        wf_est_curve_at(&c, a.speed_kmh, &f);
+        CHECK(f.fitted && !f.extrapolated,
+              "a suggestion of %.1f km/h, outside the %.0f-%.0f km/h the fit "
+              "covers", a.speed_kmh, c.speed_min_kmh, c.speed_max_kmh);
+    }
+
+    /* Above the fitted range there is nothing honest to say, and the answer is
+     * silence rather than an extrapolated quadratic. */
+    CHECK(!wf_est_advice_pick(&c, 110.0, 30.0, 0.15, &a),
+          "a rider above the fitted range was advised %.1f km/h", a.speed_kmh);
+
+    /* Below the ladder's own floor, likewise: a rider already at 30 km/h has
+     * only 25 to give and 25 buys 11 %, so nothing is said. */
+    CHECK(!wf_est_advice_pick(&c, 30.0, 30.0, 0.15, &a),
+          "a rider at 30 km/h was advised %.1f km/h", a.speed_kmh);
+
+    /* The proportional cap, which is the one that answers "slow to 25 km/h on
+     * a motorway". A curve flat enough that a rider doing 100 has to come down
+     * to half of it before the gain is worth having - so the advice says
+     * nothing, and the thing it would otherwise have said is exactly what the
+     * cap exists to refuse. */
+    wf_est_curve_t heavy;
+    memset(&heavy, 0, sizeof(heavy));
+    heavy.fitted               = true;
+    heavy.a_wh_per_km          = 45.0;
+    heavy.c_wh_per_km_per_kmh2 = 0.001;
+    heavy.speed_min_kmh        = 10.0;
+    heavy.speed_max_kmh        = 120.0;
+
+    wf_est_advice_t would;
+    CHECK(wf_est_advice_at(&heavy, 100.0, 40.0, 50.0, &would) &&
+          would.gain_frac >= WF_EST_ADVICE_GAIN_FRAC,
+          "50 km/h does not clear the gain threshold here, so this case is "
+          "not testing the cap");
+    CHECK(50.0 < 100.0 * (1.0 - WF_EST_ADVICE_MAX_DROP_FRAC),
+          "50 km/h is not past the cap, so this case tests nothing");
+    CHECK(!wf_est_advice_pick(&heavy, 100.0, 40.0, 0.15, &a),
+          "a rider doing 100 km/h was told to hold %.1f km/h", a.speed_kmh);
+}
+
+/* THE RIDE, and the criterion "the advice appears at the intended point and
+ * not before". A Pack starting at 28 % of its usable energy, drained at a
+ * steady 55 km/h until it crosses the threshold.
+ *
+ * The two halves asserted are "not one frame before the Pack is low" and "not
+ * long after it" - the second matters as much as the first, because an advice
+ * that arrives ten minutes late arrives after the junction the rider needed it
+ * at. WF_EST_ADVICE_ARM_MS is ten seconds, which at 55 km/h is 153 m and about
+ * five watt-hours: a thousandth of the Pack, which is what the tolerance
+ * below is. */
+static void test_the_advice_arrives_when_the_pack_is_low(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    wf_est_set_curve(&e, &c);
+    feed_soc(&e, 0, 38.0);
+
+    bool   seen = false;
+    double frac_at_first = 0.0;
+    double range_at_first = 0.0, advice_at_first = 0.0;
+    uint32_t t_first = 0;
+
+    for (uint32_t t = SAMPLE_MS; t <= 30u * 60u * 1000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 55.0, amps_on_curve(&c, 55.0));
+
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        if (!seen) {
+            /* Not before. The condition is on the Pack, so a screen showing
+             * this while the Pack is above the threshold is showing it for a
+             * reason nobody wrote down. */
+            CHECK(!o.advice_valid || o.usable_frac <= WF_EST_ADVICE_LOW_FRAC,
+                  "the advice appeared at %.3f of a usable Pack, above the "
+                  "%.2f threshold", o.usable_frac, WF_EST_ADVICE_LOW_FRAC);
+        }
+        check_no_second_number(&o, "mid-ride");
+        if (o.advice_valid && !seen) {
+            seen            = true;
+            t_first         = t;
+            frac_at_first   = o.usable_frac;
+            range_at_first  = o.range_km;
+            advice_at_first = o.advice_range_km;
+        }
+        if (o.advice_valid) {
+            /* Everything the row says, every frame it says it. */
+            CHECK_D(o.advice_speed_kmh, 45.0, 0.0,
+                    "the speed the advice suggests at a steady 55 km/h");
+            CHECK(o.advice_range_km > o.range_km,
+                  "the advice offered %.1f km against a Range of %.1f km",
+                  o.advice_range_km, o.range_km);
+            CHECK(o.advice_gain_km >= WF_EST_ADVICE_GAIN_KM,
+                  "the advice offered %.2f km, under its own floor",
+                  o.advice_gain_km);
+        }
+    }
+
+    CHECK(seen, "a Pack drained past the threshold never produced the advice");
+    if (!seen) {
+        return;
+    }
+    CHECK(frac_at_first <= WF_EST_ADVICE_LOW_FRAC,
+          "the advice arrived at %.4f of a usable Pack", frac_at_first);
+    CHECK(frac_at_first >= WF_EST_ADVICE_LOW_FRAC - 0.005,
+          "the advice arrived %.4f of a Pack late - more than the ten seconds "
+          "of arming accounts for", WF_EST_ADVICE_LOW_FRAC - frac_at_first);
+    CHECK(t_first > WF_EST_ADVICE_ARM_MS,
+          "the advice appeared before it could have armed");
+    /* And what it said, checked against the curve by hand rather than against
+     * the code that produced it. */
+    double want = range_at_first *
+                  (curve_wh_per_km(&c, 55.0) / curve_wh_per_km(&c, 45.0));
+    CHECK_D(advice_at_first, want, 1e-6,
+            "the kilometres the advice offered are not the Range times the "
+            "curve's own ratio");
+}
+
+/* IT MUST NOT BLINK, which is a rider-facing correctness property: a warning
+ * that flickers is one that gets ignored, and this one only ever appears when
+ * the rider cannot afford to ignore it.
+ *
+ * The test drives the two mechanisms separately, and measures what they are
+ * suppressing rather than asserting a bare "it did not flicker".
+ *
+ *   Phase 1, eight-second oscillation between 34 and 42 km/h. The raw
+ *   condition - the pick applied to this instant's speed, with no averaging
+ *   and no hysteresis - toggles on every swing, because 34 km/h has nothing
+ *   worth saying and 42 has. The cruise average absorbs it whole.
+ *
+ *   Phase 2, sixty-second swings between 30 and 45. Now the average genuinely
+ *   follows and the advice genuinely comes and goes - which is right, the
+ *   rider really has changed what they are doing - and what is asserted is
+ *   that no episode is shorter than the dwell. The screen changes, and it
+ *   never blinks.
+ */
+static void test_the_advice_does_not_flicker(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    wf_est_set_curve(&e, &c);
+    feed_soc(&e, 0, 29.0);
+
+    bool     shown = false, raw_prev = false, started = false;
+    long     raw_flips = 0, flips = 0, phase1_flips = 0;
+    uint32_t episode_t0 = 0;
+    uint32_t shortest_shown = 0xffffffffu, shortest_hidden = 0xffffffffu;
+    const uint32_t phase1_end = 8u * 60u * 1000u;
+    const uint32_t ride_end   = 24u * 60u * 1000u;
+
+    for (uint32_t t = SAMPLE_MS; t <= ride_end; t += SAMPLE_MS) {
+        double kmh;
+        if (t <= phase1_end) {
+            kmh = ((t / 4000u) % 2u) ? 42.0 : 34.0;
+        } else {
+            kmh = ((t / 30000u) % 2u) ? 45.0 : 30.0;
+        }
+        feed_ride(&e, t, kmh, amps_on_curve(&c, kmh));
+
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        check_no_second_number(&o, "a rider whose speed is moving");
+        if (!o.range_valid) {
+            continue;
+        }
+
+        /* What a build with no averaging and no hysteresis in it would have
+         * put on the screen this frame. */
+        wf_est_advice_t a;
+        bool raw = wf_est_advice_pick(&c, kmh, o.range_km, o.usable_frac, &a);
+        if (started && raw != raw_prev) {
+            raw_flips++;
+        }
+        raw_prev = raw;
+
+        if (!started) {
+            started    = true;
+            shown      = o.advice_valid;
+            episode_t0 = t;
+            continue;
+        }
+        if (o.advice_valid == shown) {
+            continue;
+        }
+        uint32_t held = t - episode_t0;
+        if (shown) {
+            if (held < shortest_shown) {
+                shortest_shown = held;
+            }
+        } else if (held < shortest_hidden) {
+            shortest_hidden = held;
+        }
+        flips++;
+        if (t <= phase1_end) {
+            phase1_flips++;
+        }
+        shown      = o.advice_valid;
+        episode_t0 = t;
+    }
+
+    CHECK(raw_flips > 20,
+          "the raw condition only moved %ld times, so this ride is not "
+          "driving the thing the hysteresis exists for", raw_flips);
+    /* Phase 1: one transition is the advice arriving and staying. Anything
+     * more is the screen following the throttle. */
+    CHECK(phase1_flips <= 1,
+          "the advice changed %ld times while the rider's speed swung either "
+          "side of the threshold every eight seconds", phase1_flips);
+    CHECK(flips >= 2,
+          "the advice never came and went at all over the slow swings, so the "
+          "dwell below is not being tested");
+    CHECK(shortest_shown >= WF_EST_ADVICE_DWELL_MS,
+          "the advice was on the screen for %u ms, under the %u ms dwell",
+          (unsigned)shortest_shown, (unsigned)WF_EST_ADVICE_DWELL_MS);
+    CHECK(shortest_hidden >= WF_EST_ADVICE_ARM_MS,
+          "the advice came back after %u ms, under the %u ms it takes to arm",
+          (unsigned)shortest_hidden, (unsigned)WF_EST_ADVICE_ARM_MS);
+}
+
+/* The hysteresis band on the low-Pack condition, driven directly rather than
+ * inferred from a ride that never crosses back.
+ *
+ * The Pack recovers - a long descent, or simply a BMS that has warmed up and
+ * revised its State of Charge upward, which is what is synthesised here
+ * because the Anchor's pull raises Remaining Energy without touching the
+ * Consumption window and so isolates the one condition being tested. The
+ * advice has to hold through the whole of WF_EST_ADVICE_LOW_FRAC to
+ * _LOW_FRAC_KEEP, and let go past it. A rider sitting exactly on a fifth of a
+ * Pack must not be shown a row that comes and goes with the last decimal. */
+static void test_the_advice_holds_through_its_own_band(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    wf_est_set_curve(&e, &c);
+    feed_soc(&e, 0, 29.0);
+
+    uint32_t t = SAMPLE_MS;
+    bool     seen = false;
+    for (; t <= 10u * 60u * 1000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 55.0, amps_on_curve(&c, 55.0));
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        if (o.advice_valid) {
+            seen = true;
+            break;
+        }
+    }
+    CHECK(seen, "the advice never appeared, so there is no band to hold");
+    if (!seen) {
+        return;
+    }
+
+    /* The BMS now says half a Pack. The Anchor pulls Remaining Energy up
+     * through the band over the next couple of minutes. */
+    long in_band = 0;
+    bool gone = false;
+    for (uint32_t t0 = t; t <= t0 + 10u * 60u * 1000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 55.0, amps_on_curve(&c, 55.0));
+        if (t % POLL_MS < SAMPLE_MS) {
+            feed_soc(&e, t, 50.0);
+        }
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+
+        if (o.usable_frac > WF_EST_ADVICE_LOW_FRAC &&
+            o.usable_frac <= WF_EST_ADVICE_LOW_FRAC_KEEP) {
+            in_band++;
+            CHECK(o.advice_valid,
+                  "the advice let go at %.4f of a usable Pack, inside the "
+                  "%.2f-%.2f band it is supposed to hold through",
+                  o.usable_frac, WF_EST_ADVICE_LOW_FRAC,
+                  WF_EST_ADVICE_LOW_FRAC_KEEP);
+        }
+        if (o.usable_frac > WF_EST_ADVICE_LOW_FRAC_KEEP + 0.02 &&
+            !o.advice_valid) {
+            gone = true;
+            break;
+        }
+    }
+    CHECK(in_band > 50,
+          "only %ld samples fell inside the hysteresis band, so it was not "
+          "really tested", in_band);
+    CHECK(gone, "the advice stayed up past the far side of its own band");
+}
+
+/* The rider takes the advice. Two things then have to happen, and the second
+ * is the one worth a test: the suggestion retires, because it has stopped
+ * being a suggestion - and it does not retire so fast that the rider is left
+ * wondering whether they imagined it. */
+static void test_the_advice_retires_when_it_is_taken(void)
+{
+    wf_est_curve_t c;
+    synth_curve(&c);
+
+    wf_est_t e;
+    wf_est_init(&e, NULL);
+    wf_est_set_curve(&e, &c);
+    feed_soc(&e, 0, 29.0);
+
+    uint32_t t = SAMPLE_MS;
+    bool     seen = false;
+    double   took = 0.0;
+    for (; t <= 10u * 60u * 1000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, 55.0, amps_on_curve(&c, 55.0));
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        if (o.advice_valid) {
+            seen = true;
+            took = o.advice_speed_kmh;
+            break;
+        }
+    }
+    CHECK(seen, "the advice never appeared, so nothing can be taken");
+    if (!seen) {
+        return;
+    }
+    CHECK_D(took, 45.0, 0.0, "the speed the rider was asked to hold");
+
+    /* They ease off to the suggested speed. The cruise average follows over
+     * WF_EST_ADVICE_SPEED_TAU_S, the suggestion stops being a step below what
+     * they are doing, and the row goes - but not before the dwell. */
+    uint32_t t_taken = t;
+    bool     gone = false;
+    for (; t <= t_taken + 5u * 60u * 1000u; t += SAMPLE_MS) {
+        feed_ride(&e, t, took, amps_on_curve(&c, took));
+        wf_est_out_t o;
+        wf_est_get(&e, &o);
+        if (!o.advice_valid) {
+            gone = true;
+            break;
+        }
+    }
+    CHECK(gone, "the advice stayed up after the rider took it");
+    CHECK(t - t_taken >= WF_EST_ADVICE_DWELL_MS,
+          "the advice vanished %u ms after appearing, under the %u ms dwell",
+          (unsigned)(t - t_taken), (unsigned)WF_EST_ADVICE_DWELL_MS);
+}
+
 int main(void)
 {
     test_odo_metres();
@@ -3456,6 +4101,16 @@ int main(void)
     test_the_fit_polynomial_is_what_it_claims();
     test_the_monitor_produces_nothing_without_a_fit();
     test_extrapolation_is_flagged_and_not_hidden();
+
+    test_the_advice_is_silent_without_a_fit();
+    test_the_counterfactual_is_a_ratio();
+    test_the_advice_is_hidden_on_a_full_pack();
+    test_the_advice_is_hidden_when_slowing_buys_nothing();
+    test_the_suggested_speed_is_holdable();
+    test_the_advice_arrives_when_the_pack_is_low();
+    test_the_advice_does_not_flicker();
+    test_the_advice_holds_through_its_own_band();
+    test_the_advice_retires_when_it_is_taken();
 
     test_a_version_1_blob_is_migrated();
     test_a_version_2_blob_is_migrated();

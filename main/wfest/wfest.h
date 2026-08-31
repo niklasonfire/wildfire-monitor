@@ -418,6 +418,132 @@
  * about a second, the same as the load average behind Sag.
  *
  * ---------------------------------------------------------------------------
+ * The advice, which is the only thing here that chooses when to speak
+ * ---------------------------------------------------------------------------
+ *
+ *   Cruise          the speed the rider is holding, averaged, in km/h
+ *   the advice      one slower speed, and the Range it would buy
+ *
+ * Everything above this line answers "what is happening". This answers "what
+ * would happen if you eased off", and it exists because a rider low on charge
+ * deserves a choice rather than a verdict: a Range of 30 km when home is 34 km
+ * away is a sentence, and "45 km/h would make it 35" is a decision.
+ *
+ * THE COUNTERFACTUAL IS A RATIO, and that is the whole of why it is honest.
+ * The obvious construction - Remaining Energy divided by the fitted curve at
+ * the slower speed - is wrong, because it throws away everything the ride
+ * knows. The rider's measured Consumption carries the hill they are on, the
+ * wind, the load on the pillion seat and the tyre pressures; the fitted curve
+ * carries none of those and never will (wf_fit.h: gradient is the dominant
+ * unmodelled residual). So the curve is asked only for the *ratio* between two
+ * speeds, and that ratio is applied to the Range the rider already has:
+ *
+ *   Range(v) = Range now * Consumption_fit(cruise) / Consumption_fit(v)
+ *
+ * The fit's absolute level, its offset against this particular road and this
+ * particular day, and the whole of WF_CTRL_CURRENT_LSB_PER_A's 19 % divide out
+ * of that quotient. What survives is the shape of the curve, which is the one
+ * thing the archive can honestly say. It also means the advice cannot promise
+ * a Range the hero row does not already imply: it is the hero row's own number
+ * multiplied by a number greater than one.
+ *
+ * WHEN IT SPEAKS, and this is the ticket rather than the arithmetic. Two
+ * conditions, both required, both with a threshold that has a reason:
+ *
+ *   the Pack is low enough for it to matter. Remaining Energy as a fraction of
+ *   what a full Pack holds above the Limp Point - `usable_frac` - is at or
+ *   below WF_EST_ADVICE_LOW_FRAC. Not State of Charge, because this fraction
+ *   already counts down to the Limp Point and already carries Sag and the
+ *   weakest Cell: a Pack whose worst Cell has clamped the Range reaches "low"
+ *   sooner, which is exactly right, and issue #17's moving Limp Point reaches
+ *   the advice for free instead of having to be re-derived here.
+ *
+ *   backing off would change the outcome. The extra distance is at least
+ *   WF_EST_ADVICE_GAIN_FRAC of the Range they have and at least
+ *   WF_EST_ADVICE_GAIN_KM of road. Both, and they guard different things: the
+ *   fraction is about the decision, the kilometre is about the display.
+ *
+ * On a full Pack the first condition fails and nothing is drawn. When slowing
+ * down buys almost nothing the second fails and nothing is drawn. The default
+ * screen therefore holds exactly one Range figure, which is what main/ui.c's
+ * layout comment has said since the hero row was built.
+ *
+ * WHICH SPEED, and what makes a suggestion holdable. The ladder is round
+ * numbers - multiples of WF_EST_ADVICE_STEP_KMH, because a rider holds 50 and
+ * not 47.3 - walked downward from the cruise, and the FIRST one that clears
+ * the gain threshold is the one suggested. First and not best: the least
+ * sacrifice that changes the outcome is the advice a rider will actually take,
+ * and since the curve rises with speed the gain only grows further down, so
+ * "first" is well defined and "best" would always be "stop".
+ *
+ * Three floors cut the bottom of that ladder off, and a suggestion that falls
+ * through all of them is no suggestion at all:
+ *
+ *   the fit's own range. A speed outside WF_FIT_SPEED_MIN..MAX_KMH comes back
+ *   `extrapolated` from wf_est_consumption_at_speed(), and an extrapolated
+ *   quadratic promising a rider they will make it home is precisely the
+ *   over-promise this whole discipline exists to prevent. The cruise has to be
+ *   inside the range too - a counterfactual with an extrapolated numerator is
+ *   no better than one with an extrapolated denominator - so above the fitted
+ *   range the advice is silent, and the fix for that is the calibration ride
+ *   (issue #6) and not a weaker rule.
+ *   WF_EST_ADVICE_MIN_SPEED_KMH, below which this is not a road vehicle in
+ *   traffic any more.
+ *   WF_EST_ADVICE_MAX_DROP_FRAC of the cruise. This is the one that answers
+ *   "slow to 11 km/h on a motorway": an absolute floor cannot, because what is
+ *   holdable depends on what the rider is doing, and a proportional cap scales
+ *   with it. Asking for a fifth off is advice; asking for two thirds off is
+ *   telling someone to stop, and they will read it as noise and ignore the
+ *   next one too.
+ *
+ * IT MUST NOT BLINK, and that is a correctness property and not a nicety - a
+ * warning that flickers is one a rider learns to ignore, and this one only
+ * ever appears when they cannot afford to. Three mechanisms, at three
+ * different levels, and each does something the others cannot:
+ *
+ *   the input is smoothed one level down, exactly as Range's steadiness is
+ *   bought by Consumption's ring and Sag's is bought by the load average.
+ *   Cruise is an EMA over WF_EST_ADVICE_SPEED_TAU_S of road speed, so what the
+ *   advice reasons about is riding style and not throttle position. Range
+ *   itself is untouched: it still has no filter of its own.
+ *
+ *   hysteresis. Both judgement thresholds have a second, wider value used while
+ *   the advice is already up: WF_EST_ADVICE_LOW_FRAC_KEEP and _GAIN_FRAC_KEEP.
+ *   A rider hovering exactly at a boundary has a stable screen because the
+ *   boundary they are hovering at is not the one they crossed. The kilometre
+ *   floor is the exception and the constants block says why.
+ *
+ *   time. A flip needs its condition to have held for WF_EST_ADVICE_ARM_MS
+ *   without interruption, and once the advice is up it stays up for at least
+ *   WF_EST_ADVICE_DWELL_MS whatever happens. Ten seconds to appear, thirty
+ *   seconds minimum on the screen. The arming timer is accumulated from the
+ *   same clamped dt the integrators use, so it measures seconds of observed
+ *   riding rather than seconds of wall clock, and a Controller link that
+ *   dropped for a minute cannot arm or disarm anything.
+ *
+ * And the speed itself is latched for the duration of an episode. Recomputing
+ * it every frame would have a cruise drifting between 61 and 59 km/h swapping
+ * the suggestion between 55 and 50 with the advice never once going away -
+ * which is the same failure as blinking, wearing a different hat. What is
+ * recomputed at read time is the kilometres the latched speed buys, because
+ * those genuinely do fall as the Pack empties.
+ *
+ * WHAT IT IS SILENT ABOUT. It is a flat-road estimate, per wf_fit.h, and the
+ * screen has no room to say so - which is an argument for the advice being
+ * conservative rather than for it being chatty, and is why the thresholds are
+ * where they are rather than lower.
+ *
+ * AND TODAY IT NEVER SPEAKS AT ALL. WF_FIT_FITTED is 0: the archive holds one
+ * 47-second parking-lot ride, the fit refused over it, and
+ * wf_est_consumption_at_speed() therefore produces nothing at any speed. Every
+ * counterfactual above is unavailable, so the advice is silent on every ride
+ * this build can be given. That is the correct behaviour and not a limitation
+ * to be worked around; tests/host/unit.c asserts the silence as a property,
+ * and asserts the behaviour itself against coefficients it synthesises, the
+ * same way every Range test here is driven by synthesised riding because
+ * cap0007 cannot produce a Range either.
+ *
+ * ---------------------------------------------------------------------------
  * WARNING: the 19 %, and which way it goes in each figure
  * ---------------------------------------------------------------------------
  *
@@ -458,6 +584,23 @@
  *   and leaves. The Sag-corrected Limp Point, and the watt-hours Range gives
  *   up because of it, are as good as the voltage readings alone - the one part
  *   of this file that does not have to wait for Ride 1.
+ *
+ *   The advice is two figures with two different answers, and saying "19 %
+ *   uncertain" over both of them would be wrong twice. `advice_gain_km`'s
+ *   *fraction* - how much further, in percent - is a ratio of the fitted curve
+ *   at two speeds. Both coefficients were fitted from currents on the same
+ *   scale, so the scale multiplies numerator and denominator alike and leaves;
+ *   the percentage is as good as the fit's shape, which is where its real
+ *   uncertainty lives. `advice_range_km` and `advice_gain_km` themselves are
+ *   that unbiased fraction applied to a Range, so they inherit Range's 16 %
+ *   pessimism exactly and no more - once, through the same denominator, not
+ *   twice. And the decision to speak at all carries less than either:
+ *   `usable_frac` is Remaining Energy over a constant, and Remaining Energy is
+ *   Anchored to the BMS, so the low-Pack condition is largely independent of
+ *   the constant while the Anchor is alive; while the gain condition is tested
+ *   as a fraction, which is the half that cancels. A current scale settled at
+ *   4.77 would move the kilometres on this row and would not move when it
+ *   appears.
  */
 #ifndef WFEST_H
 #define WFEST_H
@@ -765,6 +908,124 @@
 #define WF_EST_CELL_OUTLIER_K        2.0
 #define WF_EST_CELL_SAMPLES_MAX      16u
 
+/* ------------------------------------------------- the advice's thresholds
+ *
+ * The prose is in the header comment above. These are the numbers it settles,
+ * and the two that matter most are the two the acceptance criteria name: when
+ * the Pack is low enough for the advice to matter, and what makes an extra
+ * distance meaningful.
+ *
+ * LOW_FRAC is the first. A fifth of the usable Pack - Remaining Energy over
+ * what a full one holds above the Limp Point, which is about 4585 Wh on
+ * today's constants, so roughly 917 Wh and, at anything like ordinary
+ * Consumption, twenty to thirty kilometres. That is the conventional reserve
+ * point on a road EV and it is where it is for a reason that survives being
+ * copied: above a fifth, "will I make it" is a question about the next charge
+ * stop, and below it, it is a question about this road. It is a fraction of
+ * the *usable* Pack and not a State of Charge, so it moves with Sag and with
+ * the weakest Cell rather than ignoring both.
+ *
+ * GAIN_FRAC is the second, and the honest justification for it is the Range
+ * figure's own uncertainty. Range is 16 % pessimistic for as long as
+ * WF_CTRL_CURRENT_LSB_PER_A is unsettled, and its denominator is a window over
+ * the last kilometre of road which may not resemble the next one. Advice that
+ * promises less than the figure it is modifying is uncertain by is not advice.
+ * Fifteen percent is that bias rounded down to a number a rider can hear: a
+ * seventh further, which changes a journey's answer even if the Range it is
+ * being added to is somewhat wrong.
+ *
+ * GAIN_KM is the second half of "meaningful", and it is about the panel rather
+ * than the decision. The hero row renders "%.0f" and so does the advice, so a
+ * gain under half a kilometre can render as no gain at all - two identical
+ * numbers on the screen with an instruction between them, which reads as a
+ * fault. One kilometre is the smallest promise both figures can actually show,
+ * and it is also one WF_EST_CONS_WINDOW_M, which is the resolution the whole
+ * Consumption model has.
+ *
+ * The two _KEEP values are those thresholds widened for the hysteresis and are
+ * used only while the advice is already on the screen. Each is far enough from
+ * its own edge that the noise left after the cruise average cannot span the
+ * band, and near enough that a rider who has genuinely changed what they are
+ * doing is not lectured for another minute.
+ *
+ * GAIN_KM deliberately has no widened twin, and it is the one threshold that
+ * must not have one. The other two are judgements about a rider's decision and
+ * a judgement can sensibly be stickier once made; this one is a fact about the
+ * panel. Half a kilometre of gain renders as no gain at all - the two rows
+ * would show the same "%.0f" with an instruction between them, which reads as
+ * a fault rather than as an offer - and a threshold that is a display fact has
+ * no honest wider value. Hysteresis it does not need: gain in kilometres is
+ * the gain fraction times a Range that falls as the Pack empties, so it
+ * crosses this floor once and downward, and the dwell below covers the
+ * crossing itself.
+ *
+ * STEP_KMH is the ladder, and it is round numbers because a speedometer is.
+ * It doubles as the smallest drop worth asking for: a suggestion less than one
+ * step below the cruise is inside the noise of holding a throttle.
+ *
+ * MIN_SPEED_KMH and MAX_DROP_FRAC are what "holdable" means, and they answer
+ * different halves of it. The absolute floor is the speed below which this is
+ * not a road vehicle in traffic - 25 km/h is where the law itself stops
+ * calling a thing a motorbike. The proportional cap is the one that stops
+ * "slow to 25" being said to someone doing 110: a fifth or a third off is
+ * backing off, and anything past MAX_DROP_FRAC is telling them to stop, which
+ * is not the choice this feature exists to offer.
+ *
+ * LADDER_MAX is a loop bound and nothing else - the floors above always cut
+ * the search off long before it, and it is here so that a NaN or an absurd
+ * decoded speed cannot spin.
+ *
+ * SPEED_TAU_S, ARM_MS and DWELL_MS are the anti-flicker constants; the header
+ * comment works through why all three exist. The tau is the Sag load
+ * average's, deliberately: it is the same question - what is this rider
+ * holding, as opposed to what is their wrist doing this second - and answering
+ * it twice with two different numbers would be two answers to one question.
+ */
+#define WF_EST_ADVICE_LOW_FRAC        0.20
+#define WF_EST_ADVICE_LOW_FRAC_KEEP   0.25
+#define WF_EST_ADVICE_GAIN_FRAC       0.15
+#define WF_EST_ADVICE_GAIN_FRAC_KEEP  0.10
+#define WF_EST_ADVICE_GAIN_KM         1.0
+#define WF_EST_ADVICE_STEP_KMH        5.0
+#define WF_EST_ADVICE_MIN_SPEED_KMH   25.0
+#define WF_EST_ADVICE_MAX_DROP_FRAC   0.40
+#define WF_EST_ADVICE_LADDER_MAX      64
+#define WF_EST_ADVICE_SPEED_TAU_S     WF_EST_SAG_TAU_S
+#define WF_EST_ADVICE_ARM_MS          10000u
+#define WF_EST_ADVICE_DWELL_MS        30000u
+
+/* The fitted curve, as a value rather than as a set of #defines.
+ *
+ * wf_est_curve_default() fills one from wf_fit.h and that is what every
+ * Monitor runs on: the constants are still constants, still fitted offline,
+ * still ADR-0005. What a value buys is a fitted curve the host tests can
+ * *have*, because the archive holds none - WF_FIT_FITTED is 0 and will be
+ * until the calibration ride happens - and a feature whose every branch is
+ * unreachable is a feature nobody has tested. Nothing in main/ ever builds one
+ * of these by hand.
+ *
+ * The functions that use it are at the foot of this file with the rest of the
+ * model; the type is here because wf_est_t holds one. */
+typedef struct {
+    bool   fitted;                 /* WF_FIT_FITTED: a fit, not a placeholder */
+    double a_wh_per_km;            /* the rolling and driveline term */
+    double b_wh_per_km_per_kmh;    /* the linear term, zero unless fitted */
+    double c_wh_per_km_per_kmh2;   /* the drag term */
+    double speed_min_kmh;          /* the range the fit is supported over */
+    double speed_max_kmh;
+} wf_est_curve_t;
+
+/* One counterfactual: what a chosen speed would buy, with no thresholds in it.
+ * `gain_km` is `range_km` minus the Range the rider has now and `gain_frac` is
+ * the same gain as a fraction of it - which is the half the current scale
+ * cancels out of. */
+typedef struct {
+    double speed_kmh;
+    double range_km;
+    double gain_km;
+    double gain_frac;
+} wf_est_advice_t;
+
 /* ----------------------------------------------------------- sign convention
  *
  * Positive current is discharge - the Controller's own convention, kept
@@ -961,6 +1222,33 @@ typedef struct {
     uint32_t cell_samples;      /* plausible Cell blocks folded in */
     uint32_t cell_rejected;     /* Cell blocks refused as not a 28-Cell Pack */
 
+    /* The advice, and it is the only thing in this struct that decides when to
+     * speak rather than what to say.
+     *
+     * `advice_curve` is seeded from wf_fit.h by wf_est_init() and is never
+     * written again on a Monitor - it is the offline fit, held as a value so
+     * that a host test can hold a different one. Nothing here fits anything.
+     *
+     * `cruise_kmh` is road speed averaged over WF_EST_ADVICE_SPEED_TAU_S, and
+     * it is the advice's whole view of what the rider is doing. Indexed by
+     * time and not by metres, like the load average behind Sag and for the
+     * same reason: it is a question about the last twenty seconds, not about
+     * the last fifty metres of road.
+     *
+     * The three timers are the anti-flicker, and none of them is a wall clock:
+     * `advice_hold_ms` is how long the condition that would flip the current
+     * state has held without interruption, `advice_state_ms` is how long the
+     * current state has lasted, and both accumulate the same clamped dt the
+     * integrators step on. Neither is persisted - a rider who switches the
+     * Monitor off and on has not thereby earned a warning. */
+    wf_est_curve_t advice_curve;
+    double   cruise_kmh;
+    bool     cruise_valid;
+    bool     advice_shown;
+    double   advice_speed_kmh;  /* latched for the length of an episode */
+    uint32_t advice_hold_ms;
+    uint32_t advice_state_ms;
+
     /* the clock, entirely as fed */
     uint32_t last_t_ms;         /* most recent t_ms of any feed */
     bool     last_t_valid;
@@ -1051,6 +1339,42 @@ typedef struct {
      * both with the same star. */
     bool     range_valid;
     double   range_km;
+
+    /* How full the Pack is in the only units that matter to a rider who is
+     * running out: Remaining Energy as a fraction of what a full Pack holds
+     * above the Limp Point. Not a State of Charge - this one already counts
+     * down to the Limp Point and already has Sag and the weakest Cell taken
+     * out of it, so a Pack that is being held back by its worst Cell reads low
+     * here and a State of Charge would not say so. It is the advice's
+     * low-Pack condition and is exposed so a harness can see the condition
+     * rather than infer it. */
+    double   usable_frac;
+
+    /* The advice: one slower speed and the Range it would buy.
+     *
+     * `advice_valid` is false almost all the time and that is the design - on
+     * a full Pack, when slowing down buys nothing, and on every ride this
+     * build can be given, because WF_FIT_FITTED is 0. When it is false the
+     * three figures are exactly zero, which is the same proof the rest of this
+     * struct offers: nothing was computed rather than something was and came
+     * out small. So the default screen holds exactly one Range figure.
+     *
+     * `advice_speed_kmh` is a multiple of WF_EST_ADVICE_STEP_KMH inside the
+     * fit's own supported range, held for the length of an episode.
+     * `advice_range_km` is `range_km` scaled by the ratio of the fitted curve
+     * at the two speeds, so it is always the greater of the two, and
+     * `advice_gain_km` is the difference the rider is being offered.
+     *
+     * `cruise_kmh` is what the suggestion was judged against - road speed
+     * averaged over WF_EST_ADVICE_SPEED_TAU_S - and is exposed for the same
+     * reason the window's metres are: so a test can tell "the rider was going
+     * too slowly for this to help" from "the advice is broken". */
+    bool     advice_valid;
+    double   advice_speed_kmh;
+    double   advice_range_km;
+    double   advice_gain_km;
+    bool     cruise_valid;
+    double   cruise_kmh;
 
     /* Internal Resistance and the Limp Point it moves.
      *
@@ -1294,5 +1618,52 @@ void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out);
  * with - and a branch that only ever runs one way is a branch nobody has
  * tested. tests/host/unit.c drives it against coefficients it chose. */
 double wf_est_fit_eval(double a, double b, double c, double speed_kmh);
+
+/* The same evaluation against a curve held as a value rather than as the
+ * #defines. wf_est_consumption_at_speed() above is exactly these two composed,
+ * so there is one evaluator and not two. */
+void wf_est_curve_default(wf_est_curve_t *out);
+void wf_est_curve_at(const wf_est_curve_t *curve, double speed_kmh,
+                     wf_est_fit_t *out);
+
+/* --------------------------------------------- the advice, as pure functions
+ *
+ * The prose is in the header comment. These two are the whole of the model and
+ * neither holds any state: the hysteresis and the timers are in wf_est_t,
+ * where they can be replayed, and the arithmetic is here, where it can be
+ * checked one call at a time.
+ *
+ * wf_est_advice_at() is the counterfactual with no policy in it at all: what
+ * one chosen speed would buy, as the Range now times the ratio of the fitted
+ * curve at the cruise to the fitted curve at that speed. False - leaving `out`
+ * zeroed - when there is no fit, when either speed is outside the range the
+ * fit is supported over, or when the slower speed is not actually cheaper.
+ * That is the only place `extrapolated` is consulted, and it is consulted for
+ * both speeds: a counterfactual with an extrapolated numerator over-promises
+ * exactly as badly as one with an extrapolated denominator.
+ *
+ * wf_est_advice_pick() adds the policy: the Pack has to be low, the ladder is
+ * walked downward from the cruise in WF_EST_ADVICE_STEP_KMH steps, the floors
+ * cut it off, and the first candidate that clears both gain thresholds is the
+ * answer. False when nothing qualifies, which is most of the time and is the
+ * point. The thresholds it applies are the appear-side ones; the wider _KEEP
+ * values belong to the state machine that decides when to stop, because
+ * "should this start" and "should this stop" are different questions and
+ * giving them one function with a flag would hide that.
+ */
+bool wf_est_advice_at(const wf_est_curve_t *curve, double cruise_kmh,
+                      double range_km, double speed_kmh, wf_est_advice_t *out);
+
+bool wf_est_advice_pick(const wf_est_curve_t *curve, double cruise_kmh,
+                        double range_km, double usable_frac,
+                        wf_est_advice_t *out);
+
+/* Replaces the curve an estimator reasons over. FOR THE HOST HARNESS ONLY:
+ * nothing in main/ calls this, the firmware runs on wf_est_init()'s seeding
+ * from wf_fit.h and on nothing else, and this is not a way for a Monitor to
+ * learn a curve - ADR-0005 is explicit that fitting happens offline. It exists
+ * because the committed constants are the unfitted placeholder, so without it
+ * every line of the advice would be dead code that no test could reach. */
+void wf_est_set_curve(wf_est_t *e, const wf_est_curve_t *curve);
 
 #endif /* WFEST_H */

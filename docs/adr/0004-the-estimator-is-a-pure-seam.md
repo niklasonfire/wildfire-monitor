@@ -39,6 +39,20 @@ still being watched. It stays replayable for the same reason the other two do -
 its step is one per record in the file - and it is applied at read time like
 Sag, so no accumulator is ever re-based because a Cell moved.
 
+Issue #20's advice - "you would get this much further at 45 km/h" - is in the
+seam on the same terms and is the only thing here that decides *when to speak*
+rather than what to say. That decision has state: an average of road speed, a
+latched suggestion, and two timers that keep it from blinking. All of it is
+inside, because a warning that appeared at a different point of a replayed ride
+than it appeared at on the bike would make the replay worth nothing for exactly
+the figure a rider acts on. The timers are indexed the way the load average is,
+by the clamped `dt` between two records, so they measure seconds of recorded
+riding rather than seconds of anything a clock knows about; the whole episode
+is a function of the bytes. What the advice does not do is touch Range - it
+multiplies the figure Range already is by a ratio of two fitted coefficients,
+which is why Range still has no filter after this and why the paragraph below
+is still true.
+
 Range is in the seam too, and it is the one figure there that holds no state of
 its own: it is Remaining Energy divided by Consumption, computed where both
 already are, guarded by a floor on the divisor. That is deliberate rather than

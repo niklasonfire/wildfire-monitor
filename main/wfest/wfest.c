@@ -232,6 +232,11 @@ void wf_est_init(wf_est_t *e, const wf_est_persist_t *restored)
     }
     memset(e, 0, sizeof(*e));
 
+    /* The one thing a Monitor is seeded with that did not come out of NVS: the
+     * offline fit, copied out of wf_fit.h. It is a copy of #defines and not a
+     * decision - ADR-0005 - and nothing on the bike ever writes it again. */
+    wf_est_curve_default(&e->advice_curve);
+
     if (restored == NULL ||
         restored->version < WF_EST_PERSIST_VERSION_MIN ||
         restored->version > WF_EST_PERSIST_VERSION) {
@@ -607,6 +612,123 @@ static void odo_fold(wf_est_t *e, const wf_ctrl_live_t *live)
     e->odo_distance_m += (double)wf_ctrl_odo_metres(d_counts);
 }
 
+/* --------------------------------------------------------------- the advice */
+
+/* Whether a suggestion is one the rider could hold, given what they are doing.
+ * Three floors, and the proportional one is the load-bearing one: what counts
+ * as backing off depends on the speed being backed off from. Every comparison
+ * is written the way round that rejects a NaN.
+ *
+ * The fit's own supported range is deliberately not here. It belongs to
+ * wf_est_advice_at(), which is where `extrapolated` comes back from, so that
+ * "the rider could hold this" and "the archive can speak about this" stay two
+ * separate refusals. */
+static bool advice_holdable(double cruise_kmh, double speed_kmh)
+{
+    return speed_kmh >= WF_EST_ADVICE_MIN_SPEED_KMH &&
+           speed_kmh <= cruise_kmh - WF_EST_ADVICE_STEP_KMH &&
+           speed_kmh >= cruise_kmh * (1.0 - WF_EST_ADVICE_MAX_DROP_FRAC);
+}
+
+/* The stop side of the hysteresis: does the advice already on the screen still
+ * earn its place? The latched speed is re-evaluated rather than re-picked, so
+ * a suggestion cannot quietly become a different suggestion - if the latched
+ * one has stopped being holdable or has stopped being worth taking, the
+ * episode ends and a new one may begin later at a new speed.
+ *
+ * The two judgement thresholds here are the widened _KEEP ones, which is the
+ * whole of the hysteresis: the boundary that ends an episode is not the
+ * boundary that started it. The kilometre floor is not widened; see below. */
+static bool advice_holds(const wf_est_curve_t *curve, double cruise_kmh,
+                         double range_km, double usable_frac, double speed_kmh,
+                         wf_est_advice_t *out)
+{
+    if (!(usable_frac <= WF_EST_ADVICE_LOW_FRAC_KEEP)) {
+        return false;
+    }
+    if (!advice_holdable(cruise_kmh, speed_kmh)) {
+        return false;
+    }
+    if (!wf_est_advice_at(curve, cruise_kmh, range_km, speed_kmh, out)) {
+        return false;
+    }
+    /* The fraction widens; the kilometre floor does not, because it is a fact
+     * about what the panel can render and not a judgement that can be stickier
+     * once it has been made. */
+    return out->gain_km >= WF_EST_ADVICE_GAIN_KM &&
+           out->gain_frac >= WF_EST_ADVICE_GAIN_FRAC_KEEP;
+}
+
+/* One motion frame's worth of "should the advice be up", and the only place
+ * the decision is made. It runs here, on the motion block, because that is
+ * where road speed arrives and where a dt worth timing with already exists.
+ *
+ * It reads the estimate through wf_est_get() rather than reaching into the
+ * accumulators, which costs a memset and a few dozen flops at ~5.2 Hz and buys
+ * the property worth having: the advice is judged against exactly the figures
+ * the rider is being shown, Sag, Cell clamp, window handover and all. There is
+ * no recursion - wf_est_get() computes and stores nothing.
+ *
+ * The flip is deliberately not `want != shown`. While the advice is hidden the
+ * question is "should this start", while it is up the question is "should this
+ * stop", and they are asked of different functions with different thresholds.
+ * What the timers see is one bit either way: the condition that would flip the
+ * current state either holds this instant or does not.
+ */
+static void advice_step(wf_est_t *e, uint32_t dt_ms)
+{
+    wf_est_out_t o;
+    wf_est_get(e, &o);
+
+    wf_est_advice_t a;
+    memset(&a, 0, sizeof(a));
+
+    bool flipping;
+    if (!o.range_valid || !e->cruise_valid) {
+        /* No Range to offer a fraction of, or no idea what the rider is doing.
+         * Hidden stays hidden; shown starts counting toward hidden. */
+        flipping = e->advice_shown;
+    } else if (e->advice_shown) {
+        flipping = !advice_holds(&e->advice_curve, e->cruise_kmh, o.range_km,
+                                 o.usable_frac, e->advice_speed_kmh, &a);
+    } else {
+        flipping = wf_est_advice_pick(&e->advice_curve, e->cruise_kmh,
+                                      o.range_km, o.usable_frac, &a);
+    }
+
+    /* Saturating, because these only ever have to outgrow two constants and a
+     * ride longer than a month of milliseconds must not wrap one of them back
+     * under a threshold. */
+    uint32_t hold = flipping ? e->advice_hold_ms + dt_ms : 0u;
+    uint32_t age  = e->advice_state_ms + dt_ms;
+    e->advice_hold_ms  = hold < e->advice_hold_ms ? 0xffffffffu : hold;
+    e->advice_state_ms = age < e->advice_state_ms ? 0xffffffffu : age;
+
+    if (!flipping) {
+        return;
+    }
+    if (!e->advice_shown) {
+        /* Ten seconds of continuous agreement before anything appears. */
+        if (e->advice_hold_ms >= WF_EST_ADVICE_ARM_MS) {
+            e->advice_shown     = true;
+            e->advice_speed_kmh = a.speed_kmh;
+            e->advice_hold_ms   = 0;
+            e->advice_state_ms  = 0;
+        }
+        return;
+    }
+    /* And thirty seconds on the screen before it may leave, whatever happens
+     * in between. A rider who glances down has to find the same screen they
+     * looked away from. */
+    if (e->advice_hold_ms >= WF_EST_ADVICE_ARM_MS &&
+        e->advice_state_ms >= WF_EST_ADVICE_DWELL_MS) {
+        e->advice_shown     = false;
+        e->advice_speed_kmh = 0.0;
+        e->advice_hold_ms   = 0;
+        e->advice_state_ms  = 0;
+    }
+}
+
 /* One motion frame: integrate road speed, then pull toward the Odometer. */
 static void distance_step(wf_est_t *e, uint32_t t_ms,
                           const wf_ctrl_live_t *live)
@@ -685,6 +807,35 @@ static void distance_step(wf_est_t *e, uint32_t t_ms,
     if (e->cons_part_m >= WF_EST_CONS_BUCKET_M) {
         cons_close_bucket(e);
     }
+
+    /* Cruise: the speed the rider is holding, as opposed to the speed they are
+     * doing this frame. Same first-order shape and the same tau as the load
+     * average behind Sag, and here for the same reason - a suggestion that
+     * changed every time a throttle moved would be a suggestion nobody could
+     * act on. Acquired outright on the first road speed, because there is
+     * nothing to preserve and a rider should not have to wait a minute for the
+     * average to climb off zero.
+     *
+     * A frame with no road speed in it - before the wheel geometry has arrived
+     * - moves neither this nor distance: an unknown speed is not a slow one. */
+    if (live->speed_valid) {
+        double kmh = (double)live->cur_speed_kmh;
+        if (!e->cruise_valid) {
+            e->cruise_kmh   = kmh;
+            e->cruise_valid = true;
+        } else {
+            double k = dt_s / WF_EST_ADVICE_SPEED_TAU_S;
+            if (k > 1.0) {
+                k = 1.0;
+            }
+            e->cruise_kmh += (kmh - e->cruise_kmh) * k;
+        }
+    }
+
+    /* And the one decision this module makes about what to put on the screen
+     * rather than what to compute. Last, so it sees this frame's metres, this
+     * frame's cruise and this frame's closed bucket. */
+    advice_step(e, dt_ms);
 }
 
 void wf_est_feed_ctrl(wf_est_t *e, uint32_t t_ms, uint8_t frame_type,
@@ -1002,6 +1153,38 @@ void wf_est_get(const wf_est_t *e, wf_est_out_t *out)
         out->range_km    = out->remaining_wh / out->consumption_wh_per_km;
     }
 
+    /* How full the Pack is, in the units the advice's first condition is
+     * written in: what is left over what a full one holds above the Limp
+     * Point. The denominator is a constant of the Pack model; the numerator is
+     * the clamped figure, so Sag and the weakest Cell are already in it. */
+    double full_wh = wf_est_energy_above_limp_wh(100.0);
+    if (full_wh > 0.0) {
+        out->usable_frac = out->remaining_wh / full_wh;
+    }
+
+    /* The advice. Whether it is on the screen at all was decided on the motion
+     * block, by advice_step(), because that decision needs a clock and this
+     * function has none; what is done here is the arithmetic that goes with a
+     * speed already chosen.
+     *
+     * Recomputed rather than stored, so the kilometres fall with the Pack
+     * while the speed stays put - and so that a counterfactual which has
+     * stopped being computable takes the row off the screen this frame rather
+     * than at the end of the dwell. The latch can only keep a suggestion up;
+     * it can never conjure one. */
+    out->cruise_valid = e->cruise_valid;
+    out->cruise_kmh   = e->cruise_kmh;
+    if (e->advice_shown && out->range_valid) {
+        wf_est_advice_t a;
+        if (wf_est_advice_at(&e->advice_curve, e->cruise_kmh, out->range_km,
+                             e->advice_speed_kmh, &a)) {
+            out->advice_valid     = true;
+            out->advice_speed_kmh = a.speed_kmh;
+            out->advice_range_km  = a.range_km;
+            out->advice_gain_km   = a.gain_km;
+        }
+    }
+
     if (e->anchor_seen && e->last_t_valid) {
         out->anchor_age_ms = e->last_t_ms - e->anchor_t_ms;
         out->anchor_fresh  = out->anchor_age_ms <= WF_EST_ANCHOR_STALE_MS;
@@ -1067,7 +1250,21 @@ double wf_est_fit_eval(double a, double b, double c, double speed_kmh)
     return a + speed_kmh * (b + speed_kmh * c);
 }
 
-void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out)
+void wf_est_curve_default(wf_est_curve_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->fitted              = WF_FIT_FITTED != 0;
+    out->a_wh_per_km         = WF_FIT_A_WH_PER_KM;
+    out->b_wh_per_km_per_kmh = WF_FIT_B_WH_PER_KM_PER_KMH;
+    out->c_wh_per_km_per_kmh2 = WF_FIT_C_WH_PER_KM_PER_KMH2;
+    out->speed_min_kmh       = WF_FIT_SPEED_MIN_KMH;
+    out->speed_max_kmh       = WF_FIT_SPEED_MAX_KMH;
+}
+
+void wf_est_curve_at(const wf_est_curve_t *curve, double speed_kmh,
+                     wf_est_fit_t *out)
 {
     if (out == NULL) {
         return;
@@ -1075,10 +1272,10 @@ void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out)
     out->fitted        = false;
     out->extrapolated  = false;
     out->wh_per_km     = 0.0;
-    out->speed_min_kmh = WF_FIT_SPEED_MIN_KMH;
-    out->speed_max_kmh = WF_FIT_SPEED_MAX_KMH;
+    out->speed_min_kmh = curve != NULL ? curve->speed_min_kmh : 0.0;
+    out->speed_max_kmh = curve != NULL ? curve->speed_max_kmh : 0.0;
 
-    if (!WF_FIT_FITTED) {
+    if (curve == NULL || !curve->fitted) {
         /* No fit at all. Nothing is produced at any speed, and the range
          * stays the pair of zeroes wf_fit.h holds - so a caller that checks
          * the range instead of the flag also finds no speed inside it. */
@@ -1089,11 +1286,134 @@ void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out)
     /* Written the way round that rejects a NaN as outside the range, since a
      * NaN compares false against both bounds and the honest answer to "is
      * this speed supported" for a speed that is not a number is no. */
-    if (!(speed_kmh >= WF_FIT_SPEED_MIN_KMH &&
-          speed_kmh <= WF_FIT_SPEED_MAX_KMH)) {
+    if (!(speed_kmh >= curve->speed_min_kmh &&
+          speed_kmh <= curve->speed_max_kmh)) {
         out->extrapolated = true;
     }
-    out->wh_per_km = wf_est_fit_eval(WF_FIT_A_WH_PER_KM,
-                                     WF_FIT_B_WH_PER_KM_PER_KMH,
-                                     WF_FIT_C_WH_PER_KM_PER_KMH2, speed_kmh);
+    out->wh_per_km = wf_est_fit_eval(curve->a_wh_per_km,
+                                     curve->b_wh_per_km_per_kmh,
+                                     curve->c_wh_per_km_per_kmh2, speed_kmh);
+}
+
+void wf_est_consumption_at_speed(double speed_kmh, wf_est_fit_t *out)
+{
+    /* The committed constants, and nothing else: the Monitor's own answer is
+     * these two composed, so a host test driving wf_est_curve_at() with
+     * coefficients of its own is exercising the very same evaluator. */
+    wf_est_curve_t curve;
+    wf_est_curve_default(&curve);
+    wf_est_curve_at(&curve, speed_kmh, out);
+}
+
+/* ---------------------------------------------------------------- the advice */
+
+bool wf_est_advice_at(const wf_est_curve_t *curve, double cruise_kmh,
+                      double range_km, double speed_kmh, wf_est_advice_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (curve == NULL || !curve->fitted) {
+        return false;
+    }
+    /* A fraction of no Range is no Range. Written the way round that rejects a
+     * NaN, and it also keeps the division below off a zero denominator. */
+    if (!(range_km > 0.0)) {
+        return false;
+    }
+
+    wf_est_fit_t now, slower;
+    wf_est_curve_at(curve, cruise_kmh, &now);
+    wf_est_curve_at(curve, speed_kmh, &slower);
+
+    /* Both ends, and this is the acceptance criterion about extrapolation as
+     * one comparison. The curve is a quadratic fitted over a span of speeds; a
+     * kilometre either side of that span it is a guess, and a guess is not
+     * something to tell a rider who is deciding whether they can get home. */
+    if (now.extrapolated || slower.extrapolated) {
+        return false;
+    }
+    if (!(now.wh_per_km > 0.0) || !(slower.wh_per_km > 0.0)) {
+        return false;
+    }
+    /* Nothing to offer if the slower speed is not actually cheaper - a flat
+     * curve, or a rider already below the bottom of the bathtub. */
+    if (!(slower.wh_per_km < now.wh_per_km)) {
+        return false;
+    }
+
+    out->speed_kmh = speed_kmh;
+    out->range_km  = range_km * (now.wh_per_km / slower.wh_per_km);
+    out->gain_km   = out->range_km - range_km;
+    out->gain_frac = out->gain_km / range_km;
+    return true;
+}
+
+bool wf_est_advice_pick(const wf_est_curve_t *curve, double cruise_kmh,
+                        double range_km, double usable_frac,
+                        wf_est_advice_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (curve == NULL || !curve->fitted) {
+        return false;
+    }
+
+    /* The first condition: the Pack has to be low enough for any of this to
+     * matter. Written the way round that rejects a NaN, so an estimate that
+     * has gone wrong is silent rather than loud. */
+    if (!(usable_frac <= WF_EST_ADVICE_LOW_FRAC)) {
+        return false;
+    }
+    /* A cruise that is not a plausible road speed is not something to reason
+     * from, and the bound is also what keeps the cast below defined. */
+    if (!(cruise_kmh > 0.0 && cruise_kmh < 1000.0)) {
+        return false;
+    }
+
+    /* The ladder: round numbers, walked down from the cruise. The first rung
+     * that clears both gain thresholds wins, because the least sacrifice that
+     * changes the outcome is the one a rider will take. */
+    double top = (double)(long)(cruise_kmh / WF_EST_ADVICE_STEP_KMH) *
+                 WF_EST_ADVICE_STEP_KMH;
+    for (int i = 0; i < WF_EST_ADVICE_LADDER_MAX; i++) {
+        double v = top - (double)i * WF_EST_ADVICE_STEP_KMH;
+
+        if (!advice_holdable(cruise_kmh, v)) {
+            /* Too close to the cruise to be worth asking for: keep walking
+             * down. Below one of the floors: nothing further down clears them
+             * either, so stop. */
+            if (v > cruise_kmh - WF_EST_ADVICE_STEP_KMH) {
+                continue;
+            }
+            break;
+        }
+        wf_est_advice_t a;
+        if (!wf_est_advice_at(curve, cruise_kmh, range_km, v, &a)) {
+            /* Off the bottom of the fit, or no gain to be had at all. Both are
+             * monotone in the same direction, so there is nothing below this
+             * worth trying. */
+            break;
+        }
+        /* The second condition, and it is two tests because "meaningful" is
+         * two things: enough of the Range they have to change the decision,
+         * and enough kilometres for the screen to be able to show it. */
+        if (a.gain_frac >= WF_EST_ADVICE_GAIN_FRAC &&
+            a.gain_km >= WF_EST_ADVICE_GAIN_KM) {
+            *out = a;
+            return true;
+        }
+    }
+    return false;
+}
+
+void wf_est_set_curve(wf_est_t *e, const wf_est_curve_t *curve)
+{
+    if (e == NULL || curve == NULL) {
+        return;
+    }
+    e->advice_curve = *curve;
 }

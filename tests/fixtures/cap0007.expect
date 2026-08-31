@@ -201,6 +201,25 @@ est_alltime_wh        1.73
 # pretending to.
 est_range_source      0
 
+# The advice - "you would get this much further at this speed" - and a third
+# honest zero, for a reason one level further back than the two above.
+#
+# The other zeros here are about this ride: 16.7 m is not a kilometre, so there
+# is no Consumption and so no Range. This one is about the archive. The advice
+# is a counterfactual off the fitted speed curve, scripts/fit_consumption.py
+# refused to fit one over an archive holding 47 s of crawling, and so
+# WF_FIT_FITTED is 0 and wf_est_consumption_at_speed() produces nothing at any
+# speed. No Capture this build can be given can put this row on the screen -
+# not a low Pack, not a motorway, not a rider who would benefit from it.
+#
+# That is the correct behaviour and it is asserted rather than assumed:
+# tests/host/replay.c fails any Capture that produces advice while FITTED is 0,
+# and tests/host/unit.c drives the behaviour itself against a curve it
+# synthesises. When the calibration ride (issue #6) lands and the header
+# carries a real fit, this number can move off 0 on a ride that earns it, and
+# the diff will say which ride.
+est_advice_shown      0
+
 # Internal Resistance, and the honest zero again. This ride's line current runs
 # -0.25..8.75 A over 47 s, so its largest load step is 9 A against the 21 A
 # WF_EST_IR_MIN_DI_A demands - and that threshold is not a preference, it is

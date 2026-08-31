@@ -262,6 +262,20 @@ typedef struct {
      * replayed with one Cell rewritten; see cell_synth_t below. */
     bool     cell_clamp_seen, cell_diverge_seen;
     double   cell_reserve_wh_max;
+    /* Issue #20's advice. Every Capture this build can be given produces a
+     * false here, because WF_FIT_FITTED is 0 and the counterfactual has no
+     * curve to evaluate - and "no ride in the archive puts this on the screen"
+     * is exactly the fact worth pinning while that is true. The behaviour
+     * itself is driven with a synthesised curve and synthesised riding in
+     * tests/host/unit.c, for the same reason Range's is: a fixture that cannot
+     * produce the figure cannot assert anything about it without pretending
+     * to. */
+    bool     advice_seen;
+    /* Set if any record ever left a counterfactual figure behind without the
+     * advice being up. check_invariants() only sees the last record, and "the
+     * three fields are exactly zero when there is nothing to say" is a
+     * property of every one of them. */
+    bool     advice_leak;
     long     range_points;
     double   range_km_first, range_km_last;
     double   range_km_prev;
@@ -446,6 +460,12 @@ static void est_sample(run_t *r)
     }
     if (o.cell_reserve_wh > r->cell_reserve_wh_max) {
         r->cell_reserve_wh_max = o.cell_reserve_wh;
+    }
+    if (o.advice_valid) {
+        r->advice_seen = true;
+    } else if (o.advice_speed_kmh != 0.0 || o.advice_range_km != 0.0 ||
+               o.advice_gain_km != 0.0) {
+        r->advice_leak = true;
     }
     if (o.distance_valid) {
         dist_point(r, o.distance_m);
@@ -1077,6 +1097,12 @@ static void collect(const run_t *r, metrics_t *ms)
          */
         put(ms, "est_range_source",
             o.range_valid ? (o.consumption_windowed ? 2.0 : 1.0) : 0.0);
+        /* The advice, and the honest zero once more. It needs a fitted speed
+         * curve and there is none, so no Capture in this archive can put it on
+         * the screen - which is the fact this pins. If a future header carries
+         * a real fit and a real ride crosses the thresholds, this moves off 0
+         * and the diff says which ride and when. */
+        put(ms, "est_advice_shown", r->advice_seen ? 1.0 : 0.0);
         if (r->range_points > 0) {
             put(ms, "est_range_points", (double)r->range_points);
             put(ms, "est_range_km_first", r->range_km_first);
@@ -1450,6 +1476,61 @@ static void check_invariants(const char *fixture, const run_t *r)
                       "was not supposed to happen", o.range_km);
     }
 
+    /* ---- the advice ---- */
+
+    /* The same shape again, and it has to hold on any Capture. The strongest
+     * clause is the first: with no fit there is no curve to evaluate, so there
+     * is no honest counterfactual at any speed, and a build that produced one
+     * anyway would be showing a rider a number the archive never earned. That
+     * is the failure this whole discipline exists to prevent, so it is an
+     * invariant and not a per-ride expectation. */
+    if (o.advice_valid) {
+        if (!WF_FIT_FITTED) {
+            fail(fixture, "the advice offered %.0f km/h with no fitted speed "
+                          "curve behind it - wf_fit.h says FITTED=0",
+                 o.advice_speed_kmh);
+        }
+        if (!o.range_valid) {
+            fail(fixture, "advice with no Range to be a fraction of");
+        }
+        if (o.advice_range_km <= o.range_km) {
+            fail(fixture, "the advice offered %.1f km against a Range of %.1f "
+                          "km - slowing down is supposed to buy road, not lose "
+                          "it", o.advice_range_km, o.range_km);
+        }
+        /* The suggestion is holdable and supported, checked against the
+         * constants rather than against the code that chose it. */
+        wf_est_fit_t f;
+        wf_est_consumption_at_speed(o.advice_speed_kmh, &f);
+        if (!f.fitted || f.extrapolated) {
+            fail(fixture, "the advice suggested %.1f km/h, outside the "
+                          "%.1f-%.1f km/h the fit covers", o.advice_speed_kmh,
+                 f.speed_min_kmh, f.speed_max_kmh);
+        }
+        if (o.advice_speed_kmh < WF_EST_ADVICE_MIN_SPEED_KMH ||
+            o.advice_speed_kmh > o.cruise_kmh - WF_EST_ADVICE_STEP_KMH ||
+            o.advice_speed_kmh <
+                o.cruise_kmh * (1.0 - WF_EST_ADVICE_MAX_DROP_FRAC)) {
+            fail(fixture, "the advice suggested %.1f km/h to a rider holding "
+                          "%.1f km/h, which is not a speed they could hold",
+                 o.advice_speed_kmh, o.cruise_kmh);
+        }
+        if (o.usable_frac > WF_EST_ADVICE_LOW_FRAC_KEEP) {
+            fail(fixture, "the advice was up at %.3f of a usable Pack, above "
+                          "even the %.2f it is allowed to stay up to",
+                 o.usable_frac, WF_EST_ADVICE_LOW_FRAC_KEEP);
+        }
+    } else if (o.advice_speed_kmh != 0.0 || o.advice_range_km != 0.0 ||
+               o.advice_gain_km != 0.0) {
+        fail(fixture, "no advice, and yet %.1f km/h buying %.1f km came out of "
+                      "the counterfactual that was not supposed to happen",
+             o.advice_speed_kmh, o.advice_range_km);
+    }
+    if (r->advice_leak) {
+        fail(fixture, "a record left a counterfactual figure behind with no "
+                      "advice on the screen to explain it");
+    }
+
     /* The all-time totals are the same two integrals the ride already
      * publishes, so on an unbroken replay they have to agree with them exactly
      * - anything else means Consumption is dividing something other than the
@@ -1779,6 +1860,20 @@ static void report(const wflog_hdr_t *h, const run_t *r)
                    "Point over %ld points, rose at most %.3f km\n",
                    r->range_km_first, r->range_km_last, WF_EST_LIMP_POINT_V,
                    r->range_points, r->range_step_up_max);
+        }
+        if (r->advice_seen) {
+            printf("  advice: ease to %.0f km/h for ~%.0f km, %.1f km more "
+                   "than riding on at %.0f\n", o.advice_speed_kmh,
+                   o.advice_range_km, o.advice_gain_km, o.cruise_kmh);
+        } else if (!WF_FIT_FITTED) {
+            printf("  advice: none - there is no fitted speed curve, so there "
+                   "is no honest answer to \"how much further at 45\" at any "
+                   "point of any ride\n");
+        } else {
+            printf("  advice: none - the Pack never fell to %.0f %% of its "
+                   "usable energy with a slower speed worth %.0f %% on the "
+                   "board\n", 100.0 * WF_EST_ADVICE_LOW_FRAC,
+                   100.0 * WF_EST_ADVICE_GAIN_FRAC);
         }
     }
 }

@@ -118,9 +118,25 @@ static const char *TAG = "ui";
  *
  * One number, and no second one. No band, no best case beside a worst case:
  * two range figures on a 135 px panel at speed is not more information, it is
- * a decision handed back to a rider wearing a helmet. The "you would get
- * further at a lower speed" figure is issue #20 and is conditional on the
- * rider asking for it.
+ * a decision handed back to a rider wearing a helmet.
+ *
+ * The one exception is issue #20's advice, and the exception is what makes the
+ * rule work rather than breaking it. It is a tenth row, at scale 1, in the
+ * clear band the layout set aside below y=204, and it is drawn only when the
+ * estimator says so - which is when the Pack is low enough for the question to
+ * be real AND easing off would change the answer by enough to matter. On a
+ * full Pack and on every ride this build can be given (WF_FIT_FITTED is 0) the
+ * row is not there at all, so the default screen still holds exactly one Range
+ * figure. When it is there, the second figure is the whole point: "ease to 45
+ * and you get 35 km instead of 30" is a choice, where "30 km" alone is a
+ * verdict. The row is only ever a row when it is the most useful thing on the
+ * panel.
+ *
+ * It went below the Odometer rather than beside the hero row for the reason
+ * the hero row exists: the eye goes to the biggest number first, and putting a
+ * second range figure next to it would make the rider compare two numbers
+ * before reading either. Down here it reads as a footnote, which is what it
+ * is. F_V8 and the band the hint separator sits in are still untouched.
  *
  * Remaining Energy did not leave the screen, it went down to scale 1 beside
  * the Odometer. It is the hero's numerator and it is worth being able to check
@@ -150,8 +166,11 @@ static const char *TAG = "ui";
  * keeps its demotion to scale 1, which is also what makes room for a distance
  * in metres that runs to seven digits.
  *
- * That leaves F_V7 and F_V8 unused and a clear band below y=204. Both are
- * deliberate: the next screen wants room, not a tenth row.
+ * That left F_V7 and F_V8 unused and a clear band below y=204, on the grounds
+ * that the next screen wanted room rather than this one wanting a tenth row.
+ * Issue #20 spent F_V7 and the top of that band on the advice - a tenth row
+ * that is absent from the default screen, which is what the rule was
+ * protecting - and left F_V8 and the two pixels either side of it alone.
  *
  * The character cell is 6*scale wide, so the budget is 7 columns at scale 3,
  * 11 at scale 2 and 22 at scale 1. "~91KM*" is 6 of the 7 and cannot need more
@@ -162,7 +181,11 @@ static const char *TAG = "ui";
  * nothing is lost by that. "~128 WH/KM*" is exactly 11.
  * "ODO 6553500 M ~4585WH" is 21 of the 22, at the Odometer's largest possible
  * reading and a full Pack - and it is one field and not two, so a shrinking
- * Odometer cannot leave debris beside a figure drawn at a fixed left edge. */
+ * Odometer cannot leave debris beside a figure drawn at a fixed left edge.
+ * "EASE TO 100: ~917KM" is 19 of the 22 at the widest either figure can be:
+ * the Range is bounded at three digits by WF_EST_RANGE_MIN_CONS_WH_PER_KM as
+ * above, and the speed cannot exceed the top of the fitted range, which no
+ * fit of this bike will put in four digits. */
 #define ROW_LIVE_SPEED  70          /* scale 3 */
 #define ROW_LIVE_HERO   96          /* scale 3: the figure the rider rides by */
 #define ROW_LIVE_CONS   122         /* scale 2 from here down... */
@@ -170,6 +193,9 @@ static const char *TAG = "ui";
 #define ROW_LIVE_AMPS   158
 #define ROW_LIVE_TEMP   176
 #define ROW_LIVE_ODO    196         /* ...except this one, scale 1 */
+/* Scale 1, so 206..213 - clear of the Odometer row above (196..203) and of the
+ * hint separator at y=216. Drawn only when there is advice; see draw_live(). */
+#define ROW_LIVE_ADVICE 206
 
 #define MSG_TITLE_Y    16
 #define MSG_SEP_Y      44
@@ -886,6 +912,32 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
         snprintf(wh_txt, sizeof(wh_txt), "-- WH");
     }
     FIELD(F_V6, 2, ROW_LIVE_ODO, 1, COL_DIM, "%s %s", odo_txt, wh_txt);
+
+    /* The advice, and it is the only conditional row on this screen.
+     *
+     *   EASE TO 45: ~35KM
+     *
+     * A speed and the Range it would buy, both concrete, because "ride gently"
+     * is not something a rider can act on at a junction. The estimator decided
+     * every part of that - whether to say it, which speed, and how many
+     * kilometres - and this does a "%.0f" of each, the same way the hero row
+     * does. No arithmetic here; ADR-0004.
+     *
+     * The hint colour, not red and not amber. This is an opportunity and not a
+     * fault: the Pack being low is already visible on the hero row, and what
+     * this adds is a way out. Amber is the weakest Cell's and red is a Pack
+     * with something wrong with it, and neither is what this means.
+     *
+     * When there is no advice the row is drawn as an empty string rather than
+     * skipped, because field_at() pads to the right edge and that is what wipes
+     * the last advice off the panel. A skipped row would leave it there. */
+    if (est->advice_valid) {
+        FIELD(F_V7, 2, ROW_LIVE_ADVICE, 1, COL_HINT, "EASE TO %.0f: ~%.0fKM",
+              est->advice_speed_kmh, est->advice_range_km);
+    } else {
+        FIELD(F_V7, 2, ROW_LIVE_ADVICE, 1, COL_DIM, "%s", "");
+    }
+
     /* The hint band is the legend for the marks above it, and which legend is
      * worth showing depends on what the hero row is saying.
      *
