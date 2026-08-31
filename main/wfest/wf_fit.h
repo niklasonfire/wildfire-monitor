@@ -15,10 +15,24 @@
  * This is Consumption - watt-hours per kilometre - and not power,
  * which is force times speed and would go as v^3.
  *
+ * WHAT THE FORM LEAVES OUT, and it is the big one. GRADIENT IS NOT
+ * MODELLED AND IS THE DOMINANT RESIDUAL. Speed is not the largest
+ * input to what a kilometre costs - the road is - and without route
+ * knowledge that input is simply missing. Any R^2 below is a
+ * statement about the spans that were fitted, never a claim about
+ * the next ride. Anything that shows a rider a number derived from
+ * these constants is showing them a flat-road estimate, and should
+ * say so rather than implying a precision the model does not have.
+ *
+ * Spans where the Pack was recharged rather than drawn from are kept
+ * in the fit, not dropped. Dropping the downhills while the uphills
+ * stay would bias every coefficient upward, and a biased fit that
+ * looks clean is worse than an honest one with a stated residual.
+ *
  * NOTHING FITS ON THE MONITOR. The fit happens offline, over the
  * archive; the Monitor evaluates a polynomial in two constants. See
  * wf_est_consumption_at_speed() in wfest.h, which is the only thing
- * that reads these.
+ * that reads these, and ADR-0005 for why it is built this way.
  *
  * THERE IS NO FIT. The coefficients below are placeholders and are
  * marked UNFITTED, in the same spirit as WF_EST_LIMP_POINT_V's
