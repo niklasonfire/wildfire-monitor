@@ -2063,15 +2063,32 @@ void cap_status(cap_status_t *out)
     /* One short critical section, so the UI can poll this at 5 Hz and never
      * sees half of a link's counters from before an update and half from
      * after. Nothing here allocates, blocks or calls into NimBLE. */
+    uint32_t last_rx[CAP_LINK_COUNT];
+
     portENTER_CRITICAL(&s_mux);
     memcpy(out, &s_pub, sizeof(*out));
+    for (int i = 0; i < CAP_LINK_COUNT; i++) {
+        out->link[i].ever_rx = s_link[i].ever_rx;
+        last_rx[i] = s_link[i].last_rx_ms;
+    }
     int64_t t0 = s_t0_us;
     bool rec = s_rec_on;
     portEXIT_CRITICAL(&s_mux);
 
+    /* Silence, in uptime rather than capture time: this is what the screen
+     * asks before it puts a decoded number up as a fact about now, and it has
+     * to answer while the bike is being ridden with no capture running, where
+     * capture time is frozen at zero. The subtraction is u32 modular, same as
+     * the stale watchdog's, so it survives the 49-day wrap. */
+    uint32_t now = now_ms();
+    for (int i = 0; i < CAP_LINK_COUNT; i++) {
+        out->link[i].quiet_ms =
+            out->link[i].ever_rx ? (uint32_t)(now - last_rx[i]) : 0;
+    }
+
     if (rec && t0 > 0) {
-        int64_t now = esp_timer_get_time();
-        out->elapsed_ms = (now > t0) ? (uint32_t)((now - t0) / 1000) : 0;
+        int64_t tnow = esp_timer_get_time();
+        out->elapsed_ms = (tnow > t0) ? (uint32_t)((tnow - t0) / 1000) : 0;
     }
 }
 

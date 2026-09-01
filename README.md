@@ -195,6 +195,35 @@ Output is written as tagged single-line records (`DEV`, `SVC`, `CHR`, `DSC`,
 The board blinks the red LED twice at boot as a visible sign that the freshly
 flashed image is running.
 
+## What the panel shows while recording
+
+Measurements, not counters. The band under the red `REC` banner holds the line
+current at the largest type the panel fits, then Pack voltage, road speed, the
+BMS's own State of Charge and engine temperature; the elapsed time sits in the
+banner beside the word, and the frame counts, drops, file name and free space
+are a three-line footer at the bottom.
+
+The reason is that a climbing frame count says the radio is up and says nothing
+about whether the bytes underneath decode - a Controller sending a layout the
+Field Table does not describe would run that counter at exactly the same rate.
+A current that moves with the throttle and a speed that matches the road say
+the decode is alive, which is the question worth answering while a ride is
+still recoverable.
+
+Every one of those is a Field Table entry formatted and nothing else. Nothing
+on this screen is divided by anything - no Range, no Consumption, no Remaining
+Energy - because those rest on an assumed Limp Point and on a Consumption curve
+this build has no fit for. They are the right thing to ride by and the wrong
+thing to judge a Capture by, and they are one short press of the power button
+away on the live screen.
+
+A value is drawn only while the link carrying it is still delivering: the
+decoder latches every field it has ever seen, so a Controller that goes off the
+air would otherwise leave its last current on the panel looking exactly like
+the current flowing now. Two seconds of silence - seventy missing frames at the
+Controller's 35.5 Hz - and the row becomes a dash. The same gate applies to the
+live screen.
+
 ## The button menu
 
 A is the capture workflow - scan, start, stop - and short B is a Marker while

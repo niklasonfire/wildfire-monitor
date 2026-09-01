@@ -14,7 +14,14 @@
  * strapped to the handlebar at arm's length. So the one fact that matters in
  * a given state gets the largest scale that fits the width, and the rest is
  * demoted: in CAP_SCANNING that is the two link lines, in CAP_RECORDING the
- * elapsed time. Everything else is reference material and lives at scale 2.
+ * line current. Everything else is reference material and lives at scale 2.
+ *
+ * The third thing, which arrived with the measurements on the recording
+ * screen: a decoded value may only be drawn as a live reading while the link
+ * that carries it is still delivering. Everything wfdecode keeps latches its
+ * validity flag on the first frame and never clears it, so the screen asks
+ * cap_status() how long the link has been quiet and shows dashes rather than
+ * a remembered number. See MCU_FRESH_MS and mcu_live().
  */
 #include "ui.h"
 
@@ -74,15 +81,64 @@ static const char *TAG = "ui";
 #define ROW_IDLE_FREE  112
 #define ROW_IDLE_CAPS  138
 
+/* Recording screen. Rebuilt around what the Pack is doing rather than around
+ * what the file is doing, and the reasoning is worth keeping because it moved
+ * every row on the screen.
+ *
+ * It used to be six counters and a clock: total frames, per-link frames,
+ * drops, the file name, free space. Every one of those answers "is the Monitor
+ * working", and none of them answers "is the bike working" - which is the
+ * question a rider on a moving bike actually has. Worse, they answer the first
+ * question badly: a frame counter climbing at 35.5 Hz proves the radio is up,
+ * and proves nothing whatever about whether the bytes underneath decode. A
+ * Controller that has started sending a layout this Field Table does not
+ * describe would run that counter exactly as fast.
+ *
+ * So the counters are demoted to a three-row footer at scale 1, and the band
+ * they vacated holds measurements: line current at scale 3 as the one figure
+ * this screen is built around, then Pack voltage, road speed, the BMS's own
+ * State of Charge and engine temperature. A current that moves with the
+ * throttle is a far stronger statement that the capture is worth having than
+ * any frame count, because it is the decode itself being checked and not the
+ * link under it.
+ *
+ * Measurements and not estimates, which is the difference between this screen
+ * and the live screen the PWR button toggles to. Nothing here is divided by
+ * anything: no Range, no Consumption, no Remaining Energy. Those rest on
+ * WF_EST_LIMP_POINT_V, which is assumed rather than measured, and on a
+ * Consumption curve this build has no fit for - they are the right thing to
+ * ride by and the wrong thing to judge a Capture by. Every figure on this
+ * screen is one field of the Field Table, formatted; the confidence column
+ * says what each is worth, and the two that carry a ride's worth of trust -
+ * `cur_rpm` behind the speed and `odometer_raw` - are `proven` against
+ * cap0002's GPS track.
+ *
+ * And every one of them is gated on the Controller having spoken inside
+ * MCU_FRESH_MS. See mcu_live(): the decoder latches, so without that gate this
+ * screen would show the last current before a dropout as though it were the
+ * current now, which is the one failure a screen like this must not have.
+ *
+ * The budget, at 6*scale columns: "+123.4A" is 7 of the 7 scale 3 gives, and
+ * bounds the row at the 999.9 A no Controller on this bike will report -
+ * cap0002 peaked at 68.8 A. "SOC 100%" is 8 of the 11 at scale 2 and
+ * "TEMP -40 C" is 10. In the scale 1 footer, "MCU 9999999 BMS 99999" is 21 of
+ * the 22 at both counters clamped and "cap0008.wfl 999MB" is 17. The elapsed
+ * time keeps six fixed columns inside the banner, which is what fmt_dur() caps
+ * it at. */
 #define ROW_REC_BANNER CONTENT_Y
 #define REC_BANNER_H   26
-#define ROW_REC_TIME   68           /* scale 4 "MM:SS", 120 px of 135 */
-#define ROW_REC_FRAMES 106
-#define ROW_REC_MCU    124
-#define ROW_REC_BMS    142
-#define ROW_REC_DROP   160
-#define ROW_REC_FILE   180
-#define ROW_REC_FREE   198
+/* Scale 2 centred in the 26 px banner, right of "REC" at scale 3: the word
+ * ends at x=56 and six columns at scale 2 start at x=61. */
+#define ROW_REC_TIME   41
+#define COL_REC_TIME_X 61
+#define ROW_REC_AMPS   68           /* scale 3: what the screen is built on */
+#define ROW_REC_VOLTS  96           /* scale 2 from here down... */
+#define ROW_REC_SPEED  114
+#define ROW_REC_SOC    132
+#define ROW_REC_TEMP   150
+#define ROW_REC_LINKS  172          /* ...except the footer, scale 1 */
+#define ROW_REC_DROP   186
+#define ROW_REC_FILE   200
 
 #define ROW_STOP_NOTE  100
 
@@ -218,6 +274,26 @@ static const char *TAG = "ui";
 /* Free space and the capture count come from the filesystem, which the writer
  * task also holds a lock on, so they are sampled rarely rather than per tick. */
 #define SPACE_PERIOD_TICKS 25       /* 5 s */
+
+/* How long the Controller may go quiet before what it last said stops being a
+ * fact about now.
+ *
+ * Every validity flag in wf_ctrl_live_t latches: it goes true the first time a
+ * frame of the type carrying the field arrives and never goes false again, so
+ * the decoder on its own cannot tell a reading taken this instant from one
+ * taken before the link dropped twenty seconds ago. Left ungated, a screen of
+ * measurements would keep the last current before the dropout standing there
+ * at full brightness - the single worst thing it could do, because a stale
+ * number that looks live is worse than no number.
+ *
+ * Two seconds, because the Controller pushes at 35.5 Hz: this is seventy
+ * consecutive missing frames, which is far past any burst of interference a
+ * moving bike produces and well short of the capture task's own CAP_STALE_MS,
+ * where the link is torn down and rebuilt. So the screen says "gone" for a
+ * few seconds before the radio does something about it, which is the right
+ * order - the rider learns the Controller stopped talking, then watches it
+ * come back. */
+#define MCU_FRESH_MS   2000
 
 #define MSG_TEXT_MAX   32
 #define FIELD_TEXT_MAX 24
@@ -584,6 +660,20 @@ static void refresh_space(bool force)
     s_cap_count = n < 0 ? 0 : (n > 99 ? 99 : n);
 }
 
+/* True when the Controller's stream is arriving now rather than having
+ * arrived at some point since power-on. Every figure decoded off the MCU link
+ * is gated on this before it is drawn as a live reading; see MCU_FRESH_MS.
+ *
+ * `ever_rx` and not `frames`: the counter is reset when a capture starts and
+ * only moves while one is running, and this has to give the same answer to
+ * the live screen, which is up whenever the bike is being ridden. */
+static bool mcu_live(const cap_status_t *st)
+{
+    const cap_link_status_t *l = &st->link[CAP_LINK_MCU];
+
+    return l->ever_rx && l->quiet_ms <= MCU_FRESH_MS;
+}
+
 static void draw_idle(bool full)
 {
     refresh_space(full);
@@ -630,45 +720,129 @@ static void draw_connecting(const cap_status_t *st)
     draw_hint("A: ABORT");
 }
 
-static void draw_recording(const cap_status_t *st, bool full)
+static void draw_recording(const cap_status_t *st, const wf_ctrl_live_t *lv,
+                           const wf_est_out_t *est, bool full)
 {
     char dur[12];
+    bool live = mcu_live(st);
 
     if (full) {
         /* Banner rather than a word: red across the full width is readable
          * from the corner of the eye, which is all the attention a rider has
          * to spare. It is static, so it is painted once per entry. */
         disp_fill_rect(0, ROW_REC_BANNER, DISP_W, REC_BANNER_H, DISP_RED);
-        disp_text(centre_x(3, "REC"), ROW_REC_BANNER + 1, 3, DISP_WHITE,
-                  DISP_RED, "REC");
+        disp_text(2, ROW_REC_BANNER + 1, 3, DISP_WHITE, DISP_RED, "REC");
     }
     refresh_space(full);
     fmt_dur(dur, sizeof(dur), st->elapsed_ms);
 
-    /* "MM:SS" is five characters, which is scale 4 (120 px of 135); past 100
-     * minutes it grows a digit and drops to scale 3. field_at() wipes the
-     * band when the scale changes, so the switch leaves nothing behind. */
-    int sc = fit_scale(dur, 4);
-    field_at(&s_field[F_V0], centre_x(sc, dur), ROW_REC_TIME, sc, COL_VALUE,
-             COL_BG, false, "%s", dur);
+    /* Into the banner beside "REC", which is what freed the whole band below
+     * for measurements. Right aligned into the six fixed columns fmt_dur()
+     * caps itself at, at a fixed left edge and with pad off: the extra digit
+     * past the hour and a half has to land inside the field, because a moved
+     * left edge would make field_at() wipe the band - and the band is the
+     * banner, with "REC" sitting in it. */
+    field_at(&s_field[F_V8], COL_REC_TIME_X, ROW_REC_TIME, 2, DISP_WHITE,
+             DISP_RED, false, "%6s", dur);
 
-    FIELD(F_V1, 2, ROW_REC_FRAMES, 2, COL_VALUE, "F %" PRIu32,
-          clamp_u32(st->frames, 999999999));
-    FIELD(F_V2, 2, ROW_REC_MCU, 2, DISP_CYAN, "MCU %" PRIu32,
-          clamp_u32(st->link[CAP_LINK_MCU].frames, 9999999));
-    FIELD(F_V3, 2, ROW_REC_BMS, 2, DISP_CYAN, "BMS %" PRIu32,
-          clamp_u32(st->link[CAP_LINK_BMS].frames, 9999999));
-    /* Dropped frames are the one number that turns a capture into a bad
-     * capture, so it goes red the instant it is not zero. */
-    FIELD(F_V4, 2, ROW_REC_DROP, 2, st->dropped ? DISP_RED : COL_DIM,
-          "DROP %" PRIu32, clamp_u32(st->dropped, 999999));
-    FIELD(F_V5, 2, ROW_REC_FILE, 2, COL_DIM, "%s", st->file);
-    if (s_space_ok) {
-        FIELD(F_V6, 2, ROW_REC_FREE, 2, COL_DIM, "FREE %u MB", s_free_mb);
+    /* The line current, and the reason this screen exists. Positive while the
+     * Pack is being drawn from, which is the Controller's own sign convention
+     * and the one main/wfest integrates in.
+     *
+     * One decimal, because the raw count is a quarter of an amp wide (see
+     * WF_CTRL_CURRENT_LSB_PER_A, which cap0002 measured on two independent
+     * routes that agree) and a second decimal would claim a precision the
+     * field does not have. No space before the "A": that is what keeps a
+     * three-digit reading inside the seven columns scale 3 gives, so a hard
+     * launch cannot make the row change scale and jump.
+     *
+     * A dash when the Controller is not talking - not the last reading dimmed.
+     * A current is a statement about this instant or it is nothing, and the
+     * row of dashes is the same thing the live screen shows for a decode that
+     * is not working. */
+    if (live && lv->power_valid) {
+        FIELD(F_V0, 2, ROW_REC_AMPS, 3, COL_VALUE, "%+.1fA",
+              (double)lv->line_current_a);
     } else {
-        FIELD(F_V6, 2, ROW_REC_FREE, 2, DISP_RED, "NO FLASH");
+        FIELD(F_V0, 2, ROW_REC_AMPS, 3, COL_DIM, "%s", "-- A");
     }
-    draw_hint("A: STOP");
+
+    /* Pack voltage from the same block and the same frame, so the two are one
+     * measurement of one instant: the Sag on this row is the Sag the current
+     * on the row above is causing. */
+    if (live && lv->power_valid) {
+        FIELD(F_V1, 2, ROW_REC_VOLTS, 2, COL_VALUE, "%.1f V", (double)lv->pack_v);
+    } else {
+        FIELD(F_V1, 2, ROW_REC_VOLTS, 2, COL_DIM, "%s", "-- V");
+    }
+
+    /* Road speed. The `proven` row: it is `cur_rpm` and the wheel geometry
+     * through wf_ctrl_speed_kmh(), and cap0002's GPS track settled both the
+     * rpm and the gearing correction that turns it into km/h. Which makes it
+     * the one figure on this screen a rider can check against the world by
+     * looking at it - if the panel says 40 and the bike feels like 40, the
+     * decode is alive. */
+    if (live && lv->speed_valid) {
+        FIELD(F_V2, 2, ROW_REC_SPEED, 2, COL_VALUE, "%.0f KM/H",
+              (double)lv->cur_speed_kmh);
+    } else {
+        FIELD(F_V2, 2, ROW_REC_SPEED, 2, COL_DIM, "%s", "-- KM/H");
+    }
+
+    /* The BMS's own State of Charge, straight through: `anchor_soc_pct` is
+     * the last answer the BMS gave and the estimator does no arithmetic on it
+     * before exposing it. The BMS is the authority on State of Charge
+     * (ADR-0003), so this is the Anchor itself rather than the Coulomb Count
+     * riding on it - which is the whole point on a screen of measurements.
+     *
+     * Gated on `anchored` and not on `valid`: `valid` is also true when the
+     * figure rests on state restored from NVS that no BMS answer has
+     * confirmed this power-on, and a remembered State of Charge is not a
+     * measurement. Dim past WF_EST_ANCHOR_STALE_MS, because the BMS is polled
+     * at 1 Hz and a poll that has gone unanswered for five seconds is a link
+     * in trouble rather than the ordinary gap between answers. */
+    if (!est->anchored) {
+        FIELD(F_V3, 2, ROW_REC_SOC, 2, COL_DIM, "%s", "SOC --");
+    } else {
+        FIELD(F_V3, 2, ROW_REC_SOC, 2,
+              est->anchor_fresh ? COL_VALUE : COL_DIM,
+              "SOC %.0f%%", est->anchor_soc_pct);
+    }
+
+    /* Engine temperature, because it is the one number on here that can end a
+     * ride. Its own frame type, so it has its own validity flag. */
+    if (live && lv->b5_valid) {
+        FIELD(F_V4, 2, ROW_REC_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
+    } else {
+        FIELD(F_V4, 2, ROW_REC_TEMP, 2, COL_DIM, "%s", "TEMP --");
+    }
+
+    /* The footer: what the file is doing, at scale 1, which is where counters
+     * belong on a screen a rider reads at speed. Still here, and still worth
+     * having - the rows above say the decode is alive, and these say the ride
+     * is reaching flash - but read at a standstill rather than at 40 km/h.
+     *
+     * The per-link counts and not the total: the total is their sum, and which
+     * of the two links has stopped is the thing the sum cannot say. */
+    FIELD(F_V5, 2, ROW_REC_LINKS, 1, COL_DIM, "MCU %" PRIu32 " BMS %" PRIu32,
+          clamp_u32(st->link[CAP_LINK_MCU].frames, 9999999),
+          clamp_u32(st->link[CAP_LINK_BMS].frames, 99999));
+    /* Dropped frames are the one number that turns a capture into a bad
+     * capture, so it goes red the instant it is not zero - and it keeps a row
+     * to itself, because a field that shares a row cannot pad out to the right
+     * edge and so cannot wipe what a shrinking value leaves behind. */
+    FIELD(F_V6, 2, ROW_REC_DROP, 1, st->dropped ? DISP_RED : COL_DIM,
+          "DROP %" PRIu32, clamp_u32(st->dropped, 999999));
+    /* One field and not two, so the padding that wipes a shrinking value has
+     * a whole row to do it in - and "cap0008.wfl 999MB" is 17 of the 22
+     * columns scale 1 gives, where the same pair with the words spelled out
+     * would be 24 and would not fit the panel or field_at()'s buffer. */
+    if (s_space_ok) {
+        FIELD(F_V7, 2, ROW_REC_FILE, 1, COL_DIM, "%s %uMB", st->file, s_free_mb);
+    } else {
+        FIELD(F_V7, 2, ROW_REC_FILE, 1, DISP_RED, "%s NO FLASH", st->file);
+    }
+    draw_hint("A: STOP  B: MARK");
 }
 
 static void draw_stopping(void)
@@ -717,7 +891,10 @@ static void draw_error(const cap_status_t *st)
  * screen is not one of the cap_state_t cases in draw_state() and can be up at
  * the same time as any of them. It shares F_TITLE/F_V0..F_V6 with those
  * screens rather than getting its own slots, same reuse as every state below;
- * F_V7 and F_V8 are the headroom the layout comment above set aside. */
+ * F_V7 is the headroom the layout comment above set aside, spent on the
+ * advice row. F_V8 is this screen's last free slot; the recording screen now
+ * spends its own on the elapsed time in the banner, which costs this one
+ * nothing - a state change and the PWR toggle both invalidate every slot. */
 static const char *gear_name(uint8_t gear)
 {
     switch (gear) {
@@ -728,15 +905,25 @@ static const char *gear_name(uint8_t gear)
     }
 }
 
-static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
+static void draw_live(const cap_status_t *st, const wf_ctrl_live_t *lv,
+                      const wf_est_out_t *est)
 {
-    if (lv->motion_valid) {
+    /* Same gate the recording screen uses, and for the same reason: every
+     * flag in wf_ctrl_live_t latches, so without it a Controller that has
+     * gone off the air leaves its last gear, speed, volts, amps and
+     * temperature on the panel indefinitely. The estimator's own figures
+     * below are not gated on it - they carry their own staleness in
+     * `anchored`, `anchor_fresh` and `consumption_windowed`, and Range is
+     * meant to survive a dropout rather than blink out with it. */
+    bool live = mcu_live(st);
+
+    if (live && lv->motion_valid) {
         draw_title(gear_name(lv->gear), DISP_GREEN);
     } else {
         draw_title("--", COL_DIM);
     }
 
-    if (lv->speed_valid) {
+    if (live && lv->speed_valid) {
         FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_VALUE, "%.0f KM/H", lv->cur_speed_kmh);
     } else {
         FIELD(F_V0, 2, ROW_LIVE_SPEED, 3, COL_DIM, "%s", "-- KM/H");
@@ -872,14 +1059,14 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * this number does not have. The sign is the Controller's own, positive
      * while the Pack is being drawn from - which is the convention the
      * estimator integrates in too. */
-    if (lv->power_valid) {
+    if (live && lv->power_valid) {
         FIELD(F_V3, 2, ROW_LIVE_VOLTS, 2, COL_VALUE, "%.1f V", lv->pack_v);
         FIELD(F_V4, 2, ROW_LIVE_AMPS, 2, COL_VALUE, "%+.1f A", lv->line_current_a);
     } else {
         FIELD(F_V3, 2, ROW_LIVE_VOLTS, 2, COL_DIM, "%s", "-- V");
         FIELD(F_V4, 2, ROW_LIVE_AMPS, 2, COL_DIM, "%s", "-- A");
     }
-    if (lv->b5_valid) {
+    if (live && lv->b5_valid) {
         FIELD(F_V5, 2, ROW_LIVE_TEMP, 2, COL_VALUE, "TEMP %d C", lv->engine_temp);
     } else {
         FIELD(F_V5, 2, ROW_LIVE_TEMP, 2, COL_DIM, "%s", "TEMP --");
@@ -903,6 +1090,10 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * arithmetic. */
     char odo_txt[16], wh_txt[12];
 
+    /* Not gated on `live`, alone among the Controller's rows on this screen.
+     * The Odometer is the bike's lifetime total: it does not go stale the way
+     * a current does, and the last count the Controller sent is still the
+     * right answer minutes after it stopped sending. */
     if (lv->odo_valid) {
         snprintf(odo_txt, sizeof(odo_txt), "ODO %" PRIu32 " M",
                  wf_ctrl_odo_metres(lv->odometer_raw));
@@ -992,14 +1183,15 @@ static void draw_message(const ui_msg_t *m)
 
 /* ---- redraw task -------------------------------------------------------- */
 
-static void draw_state(const cap_status_t *st, bool full)
+static void draw_state(const cap_status_t *st, const wf_ctrl_live_t *lv,
+                       const wf_est_out_t *est, bool full)
 {
     switch (st->state) {
     case CAP_IDLE:       draw_idle(full);            break;
     case CAP_SCANNING:   draw_scanning(st);          break;
     case CAP_ARMED:      draw_armed(st);             break;
     case CAP_CONNECTING: draw_connecting(st);        break;
-    case CAP_RECORDING:  draw_recording(st, full);   break;
+    case CAP_RECORDING:  draw_recording(st, lv, est, full); break;
     case CAP_STOPPING:   draw_stopping();            break;
     case CAP_DONE:       draw_done(st);              break;
     case CAP_ERROR:      draw_error(st);             break;
@@ -1085,14 +1277,17 @@ static void ui_task(void *arg)
             }
             s_last_state = (int)st.state;
             draw_bar();
+            /* Fetched for both screens now, not just the live one: the
+             * recording screen is measurements too, and both take the same
+             * two short critical sections. */
+            wf_ctrl_live_t lv;
+            wf_est_out_t   est;
+            cap_live_get(&lv);
+            cap_est_get(&est);
             if (live) {
-                wf_ctrl_live_t lv;
-                wf_est_out_t   est;
-                cap_live_get(&lv);
-                cap_est_get(&est);
-                draw_live(&lv, &est);
+                draw_live(&st, &lv, &est);
             } else {
-                draw_state(&st, full);
+                draw_state(&st, &lv, &est, full);
             }
         }
         /* Reaching here means the panel is up and holds a frame this task put

@@ -45,6 +45,18 @@ typedef struct {
     uint32_t bytes;
     uint32_t reconnects;
     uint32_t last_frame_ms; /* capture time of the most recent frame */
+    /* How long this link has been silent, in milliseconds of uptime, and
+     * whether it has ever spoken at all. Both are tracked whether or not a
+     * capture is running, because what they exist for is telling a live
+     * reading from a remembered one: every field wfdecode keeps latches its
+     * validity flag the first time the frame type carrying it arrives and
+     * never clears it, so a Controller that has gone off the air leaves the
+     * last current it reported standing on the screen looking exactly like
+     * the current flowing now. `quiet_ms` is what says otherwise. It is zero
+     * while `ever_rx` is false, which is the "nothing has arrived" case and
+     * not a fresh one. */
+    bool     ever_rx;
+    uint32_t quiet_ms;
 } cap_link_status_t;
 
 typedef struct {
