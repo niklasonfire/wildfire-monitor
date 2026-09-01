@@ -62,10 +62,16 @@ power_w_max           536
 cell_delta_redundant_mismatch 0
 power_redundant_mismatch      0
 
-# Controller. The ride never left walking pace, so the decoded speed has to
-# stay in the 4-7 km/h the notes record; 5.64 km/h is the peak of this one.
-# The wheel geometry from type 0xaf is what that speed is computed from, so it
-# is pinned too - a slip there would move every speed in the ride.
+# Controller. The peak is 7.31 km/h, and it moved from 5.64 when cap0002's GPS
+# track measured WF_CTRL_GEARING_CORRECTION - this Controller is configured for
+# a 4.000:1 reduction and the bike has 3.079:1, so every speed it reports is
+# 30 % low. The wheel geometry from type 0xaf is what the speed is computed
+# from, so it is pinned too - a slip there would move every speed in the ride.
+#
+# Worth recording that this sits slightly outside the 4-7 km/h the ride notes
+# for cap0007 claim, where the uncorrected 5.64 sat comfortably inside. The
+# notes are a rider's estimate of a parking-lot crawl; the correction is 21 km
+# of GPS agreeing with itself on three routes. The estimate is what gives.
 #
 # Both of these moved in #13 and the movement is the fix, not a regression:
 # the motion block is eight frame types and the Field Table declared one, so
@@ -74,7 +80,7 @@ power_redundant_mismatch      0
 # itself: 237 fresh road speeds over 47 s rather than 30. Not the block's full
 # 244, because speed needs the wheel geometry from type 0xaf too and the first
 # seven motion frames of the ride arrived before it did.
-speed_kmh_max     5.64
+speed_kmh_max     7.31
 speed_samples     237
 rpm_max           253
 wheel_radius      12
@@ -92,11 +98,12 @@ power_frames      244
 ctrl_pack_v_min   105.0
 ctrl_pack_v_max   105.5
 
-# Raw -1..35 over this ride, at WF_CTRL_CURRENT_LSB_PER_A = 4. Both numbers
-# move if that constant is corrected against Ride 1, which is the point of it
-# being a constant; they are here so that a change to it is deliberate.
-ctrl_current_a_min -0.25
-ctrl_current_a_max 8.75
+# Raw -1..35 over this ride, at WF_CTRL_CURRENT_LSB_PER_A = 4.25. Both numbers
+# moved from -0.25/8.75 when cap0002 measured that constant - by Coulomb count
+# against a 9.30 Ah draw, and again by a lag-corrected regression against the
+# BMS's own amps. They are here so that a further change to it is deliberate.
+ctrl_current_a_min -0.24
+ctrl_current_a_max 8.24
 
 # The strongest correctness signal in the whole fixture: the Controller and
 # the BMS measure this Pack with separate instruments and never disagree by
@@ -104,11 +111,13 @@ ctrl_current_a_max 8.75
 # side could not land inside that.
 pack_v_device_gap_max 0.30
 
-# The estimation seam, main/wfest. Every figure here is provisional twice
-# over: it is scaled by WF_CTRL_CURRENT_LSB_PER_A, which is uncertain by 19 %
-# until Ride 1 settles it, and it counts down to a Limp Point of 84.0 V that
-# is assumed rather than measured. They are pinned so that a change to either
-# is deliberate and shows up as a diff, not so that they are believed.
+# The estimation seam, main/wfest. One of the two things that made every figure
+# here provisional is gone: WF_CTRL_CURRENT_LSB_PER_A is measured as of cap0002
+# rather than uncertain by 19 %, and the 19 % turned out never to have existed -
+# it was the BMS's poll lag in the regression that produced the rival candidate.
+# What remains provisional is the Limp Point of 84.0 V, which is still assumed
+# rather than measured, and issue #8 is the ride that measures it. These are
+# pinned so that a change is deliberate and shows up as a diff.
 #
 # 34 BMS answers, 244 power-block frames: the same counts the decode above
 # asserts, which is the plumbing check - the estimator saw everything the
@@ -119,20 +128,20 @@ est_points          1694
 est_power_samples   244
 est_anchor_samples  34
 
-# The ride: 47 s of crawling took 1.73 Wh out of the Pack, so Remaining
-# Energy fell 1.6 Wh from where the 66.7 % Anchor put it. The maximum is the
+# The ride: 47 s of crawling took 1.63 Wh out of the Pack, so Remaining
+# Energy fell 1.5 Wh from where the 66.7 % Anchor put it. The maximum is the
 # first point, before anything was drawn; the minimum is not the last, because
-# the line current dips to -0.25 A near the end and that little of the energy
+# the line current dips to -0.24 A near the end and that little of the energy
 # comes back - which is the sign convention showing up in a real ride.
 est_wh_first        2729.04
-est_wh_last         2727.42
-est_wh_min          2727.38
+est_wh_last         2727.52
+est_wh_min          2727.48
 est_wh_max          2729.04
-est_used_wh         1.73
+est_used_wh         1.63
 est_used_ah         0.02
 
 # The Anchor holding. The BMS never moved off 66.7 %, the Coulomb Count
-# integrated 0.016 Ah out of the Pack, and the gap between them never reached
+# integrated 0.015 Ah out of the Pack, and the gap between them never reached
 # a thirtieth of a percent. This ride cannot show the Anchor pulling a real
 # drift back - its State of Charge does not move and its current barely does -
 # so that is driven with synthesised streams in tests/host/unit.c instead.
@@ -145,11 +154,14 @@ est_soc_gap_max     0.03
 # This ride is the plumbing check and nothing more, because its Odometer never
 # moves: `odometer_raw` reads a constant 14 for all 47 s, so the Anchor's own
 # account of this journey is 0 m and the truth is somewhere in the first
-# hundred metres. Integrating the road speed alone gives 21.9 m; the pull
-# toward a stationary Anchor takes it to 16.7 m, which is the fusion visibly
-# doing its job on a figure the Odometer cannot yet contradict. Neither number
-# is checkable against the ground - nothing here settles
-# WF_CTRL_ODO_METRES_PER_COUNT, and Ride 1 is what does.
+# hundred metres. Integrating the road speed alone gives 28.4 m; the pull
+# toward a stationary Anchor takes it to 21.7 m, which is the fusion visibly
+# doing its job on a figure the Odometer cannot yet contradict.
+#
+# Both numbers moved by WF_CTRL_GEARING_CORRECTION when cap0002 landed. Neither
+# is checkable against the ground on this ride, but the constant underneath them
+# now is: cap0002's GPS track measures WF_CTRL_ODO_METRES_PER_COUNT at 129.80 m
+# against upstream's 100.
 #
 # What is worth asserting is the rate and the count. 243 distance steps is one
 # per motion frame after the first, which is the criterion "updated at the rate
@@ -159,14 +171,14 @@ est_soc_gap_max     0.03
 # tests/host/unit.c, and the wrap again by replaying this very file with its
 # Odometer rewritten - see the odo_synth block in tests/host/replay.c.
 est_dist_points       1687
-est_distance_m        16.71
+est_distance_m        21.67
 est_odo_distance_m    0.00
 est_distance_samples  243
 est_odo_samples       31
 
 # Consumption, and the fact worth pinning here is that this ride produces no
-# Consumption figure at all. 16.7 m is a sixth of one Odometer count and a
-# sixtieth of the WF_EST_CONS_WINDOW_M window, and the bike is stationary for
+# Consumption figure at all. 21.7 m is a sixth of one Odometer count and a
+# forty-sixth of the WF_EST_CONS_WINDOW_M window, and the bike is stationary for
 # the first eight seconds of it - so neither denominator clears its guard and
 # est_cons_source stays 0. That is the stationary-bike criterion showing up on
 # a real ride rather than a synthesised one: if a future change ever divides
@@ -181,8 +193,8 @@ est_odo_samples       31
 # tests/host/replay.c asserts as an invariant; they are repeated here so that
 # a change to either shows up as a diff in this file too.
 est_cons_source       0
-est_alltime_m         16.71
-est_alltime_wh        1.73
+est_alltime_m         21.67
+est_alltime_wh        1.63
 
 # Range, and the same honest zero for the same reason: Range is Remaining
 # Energy divided by Consumption, this ride produces no Consumption, so it
@@ -221,7 +233,7 @@ est_range_source      0
 est_advice_shown      0
 
 # Internal Resistance, and the honest zero again. This ride's line current runs
-# -0.25..8.75 A over 47 s, so its largest load step is 9 A against the 21 A
+# -0.24..8.24 A over 47 s, so its largest load step is 8 A against the 21 A
 # WF_EST_IR_MIN_DI_A demands - and that threshold is not a preference, it is
 # what the 0.1 V voltage quantisation costs on a Pack of tens of milliohms. So
 # no pair of samples in this Capture is a load step: nothing is measured,

@@ -70,7 +70,8 @@ container and keeping it matched to the desktop - a second toolchain to
 disagree with the first. `scripts/release.sh` builds and calls
 `gh release create`, and refuses to publish from a dirty tree or from a
 commit the tag does not sit on. Without those two guards the local build
-ships whatever was in the editor.
+ships whatever was in the editor. (There is CI now; the amendment at the
+end of this document says what changed and what did not.)
 
 ## Consequences
 
@@ -134,3 +135,36 @@ because `otadata` still points at the running app, so a broken transfer
 shows an error and returns to the menu. It does not retry by itself: the
 rider is standing next to the Monitor during an update, and an automatic
 retry would only hide a hotspot that is too weak to finish.
+
+## Amendment: there is CI, and it does not publish
+
+The "no CI" half of the argument above no longer holds, and it is worth
+saying exactly which half.
+
+`.github/workflows/build.yml` builds the firmware on every push to `main`,
+on every pull request, and on demand. It runs on a **self-hosted runner** -
+a build machine outside GitHub, so the builds cost nothing and there is no
+minute budget to ration them against.
+
+**The objection it answered is gone rather than overruled.** The worry was a
+second toolchain: a container pinned in CI, drifting away from the one on
+the desktop, so that "it builds" stopped meaning "it builds the thing you
+would build". The workflow runs `idf.py build` inside `espressif/idf:v6.1` -
+the same image `./idf.sh` runs it in, named in the same place. The runner is
+docker-in-docker and carries no toolchain of its own, so there is nothing on
+it that can drift. Two callers, one image; when the image moves, both move.
+
+**The trust boundary has not moved.** CI builds and keeps the artifacts. It
+does not tag, it does not write a manifest, and it does not call
+`gh release create`. Publishing is still `scripts/release.sh` run from the
+development machine, still refusing a dirty tree and a tag that is not on
+`HEAD`, and still the only thing that produces the four fields update mode
+reads. So what a rider's Monitor installs is what this ADR always said it
+was: an image built from a tree you can name, by a machine you can inspect.
+
+What CI buys is the thing local-only building never gave: a pull request
+that will not compile says so before it is merged, rather than at the
+moment somebody wants to cut a release from it. It also does not run the
+host suite - `make test` is still the developer's to run, and
+`scripts/release.sh` still does not run it either. That is a gap worth
+closing and it is not closed here.

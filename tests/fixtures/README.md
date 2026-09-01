@@ -9,14 +9,19 @@ produce.
 
 The seventh Capture, taken on 2026-08-30 (`unix_start=1788080992`,
 `note=wildfire idf v6.1`). A 47 s parking-lot ride: ignition on, both links up
-the whole time, rolling at 4-7 km/h with no marked manoeuvres. Peak decoded
-speed is 5.64 km/h, the Pack sat at 105.1-105.5 V and the State of Charge did
-not move off 66.7 %.
+the whole time, rolling at what the ride notes call 4-7 km/h with no marked
+manoeuvres. Peak decoded speed is 7.31 km/h - just outside those notes, which
+are a rider's estimate rather than an instrument; see the `.expect` file. The
+Pack sat at 105.1-105.5 V and the State of Charge did not move off 66.7 %.
 
 It is also the ride that caught the `motion` block being declared at one frame
-type instead of eight (#13). That peak read 5.48 km/h until then, not because
+type instead of eight (#13). That peak read 7.11 km/h until then, not because
 the decoding of rpm was wrong but because seven frames in eight were being
 skipped and the fastest moment of the ride fell in one of them.
+
+Every speed here is 30 % higher than it was before cap0002: that ride's GPS
+track measured `WF_CTRL_GEARING_CORRECTION`, and this Controller is configured
+for a reduction the bike does not have. The peak read 5.64 km/h until then.
 
 This is the ride the BMS register map in `docs/field-table.md` was
 decoded from, which is why it is the fixture: everything CONFIRMED there is
@@ -49,7 +54,7 @@ the fit by being dropped in here and by nothing else. `make test` fails if
 `wf_fit.h` has drifted from what the archive now produces.
 
 Today every span of every Capture here is excluded - the one ride we hold
-crawls 16.7 m at under 6 km/h - and the fit refuses. That is the honest answer
+crawls 21.7 m at under 8 km/h - and the fit refuses. That is the honest answer
 until the calibration ride (#6) lands, and the generated header says so in
 those words.
 
@@ -74,7 +79,7 @@ Pack fails rather than passing.
 Every Capture is also replayed twice more with its Odometer frames rewritten
 to a synthesised count ramp, started either side of the u16 wrap, and the two
 distance curves have to come out bit-identical. No ride we hold crosses the
-wrap - it happens once every 6553 km - so this is how a real ride's timing and
+wrap - it happens once every 8520 km - so this is how a real ride's timing and
 speeds get to exercise it. Nothing is written back: the rewrite happens in a
 scratch buffer on the way into the parser, and the `.wfl` on disk stays the
 bytes the devices sent (ADR-0001).

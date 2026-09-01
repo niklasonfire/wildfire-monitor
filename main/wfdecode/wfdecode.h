@@ -85,7 +85,13 @@ bool wf_ctrl_type_in(const uint8_t *types, size_t count, uint8_t type);
  * circumference and the rpm->km/h factor folded into one constant, kept
  * exactly as it reads there rather than re-derived, since a rounding
  * "improvement" here would stop matching the dashboard this bike was designed
- * to be read by. */
+ * to be read by.
+ *
+ * Which turns out to be the wrong dashboard to match. cap0002's GPS track says
+ * this bike's Controller is configured for a 4.000:1 reduction and the bike has
+ * 3.079:1, so the dashboard - and this, before the correction - reads 30 % low.
+ * WF_CTRL_GEARING_CORRECTION carries the measured factor and the evidence; the
+ * upstream conversion above is left intact underneath it. */
 float wf_ctrl_speed_kmh(uint16_t rpm, uint8_t wheel_radius, uint8_t wheel_width,
                         uint8_t wheel_ratio, uint16_t rate_ratio);
 
@@ -97,8 +103,9 @@ float wf_ctrl_speed_kmh(uint16_t rpm, uint8_t wheel_radius, uint8_t wheel_width,
  * before it happens in metres.
  *
  * The scale is WF_CTRL_ODO_METRES_PER_COUNT, generated from the Field Table.
- * It is an unverified upstream claim - Ride 1 measures it - so it is one named
- * number in one place and these three functions are all that read it. */
+ * cap0002 measured it against a GPS track - 129.80 m per count, not upstream's
+ * 100 - so it is one named number in one place and these three functions are
+ * all that read it. */
 
 /* Metres covered in total, as of this reading. Wraps with the count. */
 uint32_t wf_ctrl_odo_metres(uint16_t counts);
@@ -111,8 +118,9 @@ uint32_t wf_ctrl_odo_metres(uint16_t counts);
 uint16_t wf_ctrl_odo_delta_counts(uint16_t from, uint16_t to);
 
 /* The same difference, in metres. At u16 the count wraps every 65536 counts,
- * ~6553 km at 100 m each; taking this difference naively in a wider type is
- * what would put one 6553 km phantom trip into the archive. */
+ * ~8520 km at WF_CTRL_ODO_METRES_PER_COUNT each; taking this difference
+ * naively in a wider type is what would put one 8520 km phantom trip into the
+ * archive. */
 uint32_t wf_ctrl_odo_delta_metres(uint16_t from, uint16_t to);
 
 /* ------------------------------------------------------- BMS responses */

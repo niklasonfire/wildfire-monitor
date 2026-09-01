@@ -49,7 +49,7 @@
  *   issue #6, and that ride has not happened.
  *
  * THE ARCHIVE THIS WAS RUN OVER.
- *   cap0007: 2668 records, 47.1 s, 16.7 m, 1.731 Wh, peak 5.6 km/h, 2 spans
+ *   cap0007: 2668 records, 47.1 s, 21.7 m, 1.629 Wh, peak 7.3 km/h, 2 spans
  *
  * 2 spans closed, 0 accepted.
  *   1 excluded - incomplete: the Capture ended inside it

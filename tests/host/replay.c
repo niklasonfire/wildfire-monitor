@@ -504,7 +504,7 @@ static void est_sample(run_t *r)
 
 /* `odometer_raw` reads a constant 14 through the whole of cap0007, so no
  * Capture we hold crosses the Odometer's u16 wrap and no Capture we are likely
- * to take soon will either - it happens once every 6553 km. The acceptance
+ * to take soon will either - it happens once every 8520 km. The acceptance
  * criterion is still that a wrap produces no discontinuity, so the wrap is
  * synthesised into a real ride: every Odometer frame's count is rewritten to a
  * ramp and the frame re-checksummed, so it goes through the same parser, the

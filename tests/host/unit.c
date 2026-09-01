@@ -9,7 +9,7 @@
  *
  *   - the Odometer wrap. `odometer_raw` reads a constant 14 through the whole
  *     of cap0007, so that fixture cannot distinguish wrap-safe differencing
- *     from the naive kind that puts a 6553 km phantom trip in the archive.
+ *     from the naive kind that puts an 8520 km phantom trip in the archive.
  *     Pretending it does would be worse than not testing it, so the wrap is
  *     driven here with synthesised counts instead.
  *
@@ -869,7 +869,8 @@ static void test_the_odometer_corrects_drift_without_a_step(void)
             worst_error = err;
         }
         if (t % ODO_MS < SAMPLE_MS) {
-            /* The Odometer, counting real metres at a hundred to the count. */
+            /* The Odometer, counting real metres at
+             * WF_CTRL_ODO_METRES_PER_COUNT to the count. */
             feed_odo(&e, t, (uint16_t)(1000u + (unsigned)(true_m /
                         WF_CTRL_ODO_METRES_PER_COUNT)));
         }
@@ -889,7 +890,12 @@ static void test_the_odometer_corrects_drift_without_a_step(void)
           "distance was %.0f m from the truth at its worst, more than the "
           "Odometer's own %d m quantisation", worst_error,
           WF_CTRL_ODO_METRES_PER_COUNT);
-    CHECK_D(o.odo_distance_m, 6000.0, 1e-9, "the Odometer's own account");
+    /* 6000 m of ground truth, floored to whole counts - which is not 6000 m
+     * unless the count divides it, so the expectation is written in counts. */
+    CHECK_D(o.odo_distance_m,
+            (double)((6000u / WF_CTRL_ODO_METRES_PER_COUNT) *
+                     WF_CTRL_ODO_METRES_PER_COUNT),
+            1e-9, "the Odometer's own account");
 
     /* Never backwards, at all, ever. */
     CHECK_D(worst_back, 0.0, 0.0, "the largest backwards move in distance");
@@ -959,13 +965,13 @@ static void test_an_odometer_that_jumps_is_not_believed(void)
     wf_est_t e;
     wf_est_init(&e, NULL);
     feed_odo(&e, 0, 1000);
-    feed_odo(&e, ODO_MS, 1005);             /* 500 m, believed */
+    feed_odo(&e, ODO_MS, 1005);             /* five counts, believed */
     feed_odo(&e, 2 * ODO_MS, 5);            /* a leap backwards */
-    feed_odo(&e, 3 * ODO_MS, 10);           /* 500 m from the new base */
+    feed_odo(&e, 3 * ODO_MS, 10);           /* five more from the new base */
 
     wf_est_out_t o;
     wf_est_get(&e, &o);
-    CHECK_D(o.odo_distance_m, 1000.0, 1e-9,
+    CHECK_D(o.odo_distance_m, 10.0 * WF_CTRL_ODO_METRES_PER_COUNT, 1e-9,
             "the Odometer account after a reading that went backwards");
 }
 
@@ -981,27 +987,32 @@ static void test_a_controller_link_drop_loses_no_distance(void)
     feed_odo(&e, 0, 1000);
 
     uint32_t t = SAMPLE_MS;
-    /* A minute at 36 km/h: 600 m, six counts. */
+    /* A minute at 36 km/h: 600 m. At 10 m/s the metres covered by time t are
+     * t/100, and the count is that many WF_CTRL_ODO_METRES_PER_COUNT. */
     for (; t <= 60000u; t += SAMPLE_MS) {
         feed_speed(&e, t, 36.0);
         if (t % ODO_MS < SAMPLE_MS) {
-            feed_odo(&e, t, (uint16_t)(1000u + (t / 10000u)));
+            feed_odo(&e, t, (uint16_t)(1000u +
+                        (t / 100u) / WF_CTRL_ODO_METRES_PER_COUNT));
         }
     }
 
     /* The link goes. The bike rides on for two minutes at the same speed -
-     * another 1200 m, twelve counts - and the Monitor hears none of it. */
+     * another 1200 m - and the Monitor hears none of it. */
     uint32_t back_ms = t + 120000u;
 
     /* The link returns, and the first Odometer reading carries the whole gap:
-     * 60 s + 120 s at 10 m/s is 1800 m, count 1000 + 18. */
+     * 60 s + 120 s at 10 m/s is 1800 m. */
     feed_speed(&e, back_ms, 36.0);
-    feed_odo(&e, back_ms, 1018);
+    feed_odo(&e, back_ms,
+             (uint16_t)(1000u + 1800u / WF_CTRL_ODO_METRES_PER_COUNT));
 
     wf_est_out_t o;
     wf_est_get(&e, &o);
-    CHECK_D(o.odo_distance_m, 1800.0, 1e-9,
-            "the Odometer account across the drop");
+    CHECK_D(o.odo_distance_m,
+            (double)((1800u / WF_CTRL_ODO_METRES_PER_COUNT) *
+                     WF_CTRL_ODO_METRES_PER_COUNT),
+            1e-9, "the Odometer account across the drop");
     /* Nothing duplicated: the one frame that spanned the gap booked at most
      * WF_EST_DT_MAX_MS of speed, not two minutes of it. */
     CHECK(o.distance_m < 700.0,
@@ -1015,8 +1026,9 @@ static void test_a_controller_link_drop_loses_no_distance(void)
     for (t = back_ms + SAMPLE_MS; t <= end_ms; t += SAMPLE_MS) {
         feed_speed(&e, t, 36.0);
         if (t % ODO_MS < SAMPLE_MS) {
-            feed_odo(&e, t, (uint16_t)(1000u + 18u +
-                        ((t - back_ms) / 10000u)));
+            feed_odo(&e, t, (uint16_t)(1000u +
+                        (1800u + (t - back_ms) / 100u) /
+                        WF_CTRL_ODO_METRES_PER_COUNT));
         }
     }
     wf_est_get(&e, &o);
@@ -2829,7 +2841,10 @@ static void test_sag_moves_the_limp_point_with_load(void)
     wf_est_get(&e, &o);
     double rest_wh   = o.remaining_wh;
     double rest_limp = o.limp_point_v;
-    CHECK_D(o.load_a, IR_REST_A, 0.01, "the load average at rest");
+    /* Against the quantised hotel load, not the nominal one: the stream is
+     * rounded to WF_CTRL_CURRENT_LSB_PER_A on the way in, and since that
+     * constant was measured rather than chosen it does not divide 5 A. */
+    CHECK_D(o.load_a, pack_amps(IR_REST_A), 0.01, "the load average at rest");
     CHECK_D(o.sag_v, IR_TRUE_OHM * IR_REST_A, 0.01, "Sag at the hotel load");
     CHECK_D(o.limp_point_v, WF_EST_LIMP_POINT_V + IR_TRUE_OHM * IR_REST_A, 0.01,
             "the Limp Point at rest");

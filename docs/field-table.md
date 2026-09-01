@@ -5,6 +5,10 @@
 
 None of this is our own reverse-engineering from nothing. The field offsets are transcribed from two external projects and then checked against our own Captures wherever we have a Capture that can check them. The Confidence column says which of those two things happened for each entry, and it is the most important column in the table.
 
+**cap0002 changes that in one direction.** It is a 38.6 minute, 21.24 km road ride taken on 2026-09-01 with a GPS track recorded alongside it, and a GPS track is the first instrument outside this project that any entry here has been held against. Two entries are `proven` because of it, one constant that had never been checked turns out to have been in the wrong frame of reference by 30 %, one that had two candidates 19 % apart turns out to have had only ever one, three fields come off trust, and three fields are in this table that were not transcribed from anywhere - `torque_current_raw`, `soc_gauge` and the BMS's `charge_state`.
+
+The Monitor's clock ran 12 s slow against the GPS, found by cross-correlating rpm against Doppler speed (r = 0.9972, and 0.9960 and 0.9938 a second either side). Anything comparing that Capture to that track has to shift by it.
+
 **Frame envelope, confirmed by a second source.** A Controller frame is `aa <type> <12-byte payload> <crc_lo> <crc_hi>`, sixteen bytes, as in `docs/capture.md`. jackhumbert's version of the same envelope reads byte 1 as a 6-bit ID (0..54) packed with a 2-bit flags field; the flags we always see are `0b10`, which is exactly why our type byte runs `0x80..0xb6` rather than `0x00..0x36`. His `fardriver.hpp` builds its CRC table from the same two seed bytes we use as the initial value (`0x3c`, `0x7f` -> little-endian `0x7f3c`). Two independent implementations agreeing on an unusual initial value means this is the documented vendor protocol and not something bespoke to our unit.
 
 **The two key spaces are different.** A Controller field is addressed by frame type plus a 0-based byte offset into the 12-byte payload, so payload byte 0 is frame byte 2, and multi-byte values are little-endian. A BMS field is addressed by a 0-based register index into the big-endian u16 registers of the `0xd2` read-holding-registers response, so register 0 is response bytes 3-4. The table carries both, and the generator emits a decoder for each.
@@ -23,19 +27,21 @@ None of this is our own reverse-engineering from nothing. The field offsets are 
 | --- | --- | --- |
 | `trusted` | taken on trust from elsewhere | SOUND, and UNCERTAIN |
 | `consistent` | consistent with our own Captures | CONFIRMED |
-| `proven` | proven against an independent measurement | nothing yet |
+| `proven` | proven against an independent measurement | cur_rpm and odometer_raw, against cap0002's GPS track |
 
 **`trusted`** - Somebody else's code says the byte means this and we have never checked it against a Capture of our own. The old document split this into SOUND (read from blackTeaDisp, which runs against this exact bike) and UNCERTAIN (blackTeaDisp's own author flags it as a guess); both collapse to here, because in neither case have we measured anything. Where the old label was UNCERTAIN the field's note says so.
 
 **`consistent`** - Decoding a recorded Capture with this entry produces numbers that hold together - values in a physically possible range, agreeing with other registers that describe the same thing, changing when the ride changed. That is a real check and `make test` re-runs it on every fixture, but it is still our own decoder marking its own homework.
 
-**`proven`** - A meter, a scale, a second instrument: something outside this project agreeing with the number. No entry in this table has that yet, and the empty column is the point of having it - it says plainly that every number the Monitor shows is still only as good as an upstream project plus a plausibility check.
+**`proven`** - A meter, a scale, a second instrument: something outside this project agreeing with the number. **Two entries reached it with cap0002**, whose ride was recorded alongside a GPS track: `cur_rpm` and `odometer_raw`, and with them the two constants that turn either into metres. That is the whole of the column, and it stays a short list on purpose - everything else the Monitor shows is still only as good as an upstream project plus a plausibility check, and the point of this level is to say which is which at a glance.
+
+What a GPS track can and cannot prove is worth being exact about, now that it is load-bearing. It measures distance and speed against the ground, so it settles anything that converts to either - which is why it reaches rpm, the Odometer, and the scales between them and metres. It says nothing whatever about volts, amps, charge or temperature, so nothing in those parts of the table can arrive here by the same route. Those need a meter.
 
 ## Controller
 
 The Controller talks unprompted and cycles through all 55 frame types in order, so the link's ~35.5 Hz is shared out evenly: cap0007 carries 1674 frames in 47.1 s, and every one of the 55 types appears 30 or 31 times, which is ~0.65 Hz each. A field therefore updates as often as the block of types carrying it is wide - once per cycle at ~0.65 Hz if it lives at one type, eight times per cycle at ~5.2 Hz if it lives in a block.
 
-**There are exactly three blocks of eight**, and they are neighbours: `0x80+k, 0x87+k, 0x8e+k, 0x95+k, 0x9c+k, 0xa3+k, 0xaa+k, 0xb0+k` for k = 0, 1 and 2, which is the `motion` block, the `power` block and a third that is not decoded at all. That was established by grouping every one of cap0007's 1674 frames by type and comparing the twelve payload bytes: the members of a block carry the same layout and move together, and k = 3 and beyond do not - `0x83`, `0x8a`, `0x91`, `0x98`, `0x9f`, `0xa6`, `0xad` and `0xb3` have eight different payloads and nothing in common. The four single-type groups below were checked the same way and each is genuinely alone: no other type in the Capture ever carries the payload `0xaf`, `0xb5`, `0xb3` or `0x94` carries.
+**There are exactly three blocks of eight**, and they are neighbours: `0x80+k, 0x87+k, 0x8e+k, 0x95+k, 0x9c+k, 0xa3+k, 0xaa+k, 0xb0+k` for k = 0, 1 and 2, which is the `motion` block, the `power` block and a third that is almost entirely undecoded. That was established by grouping every one of cap0007's 1674 frames by type and comparing the twelve payload bytes: the members of a block carry the same layout and move together, and k = 3 and beyond do not - `0x83`, `0x8a`, `0x91`, `0x98`, `0x9f`, `0xa6`, `0xad` and `0xb3` have eight different payloads and nothing in common. The four single-type groups below were checked the same way and each is genuinely alone: no other type in the Capture ever carries the payload `0xaf`, `0xb5`, `0xb3` or `0x94` carries.
 
 Each group carries its own "seen at least once" flag, which is what lets a screen show `--` for engine temperature while gear and rpm are already live.
 
@@ -46,9 +52,11 @@ Each group carries its own "seen at least once" flag, which is what lets a scree
 What the missing seven cost is measurable rather than theoretical. Gear went to sport for 400 ms at t = 4.7 s in cap0007, and it appears in `0x87` and `0x8e` and in no other frame of the ride - the single-type decode did not see that gear change at all. Worst-case staleness on rpm falls from 1.66 s to 0.32 s.
 
 Road speed is computed from this group's rpm, so speed updates at 5.2 Hz too - which is what #13's integrated distance rests on: integrating a speed that could be a second and a half old would put that error into every kilometre and into the Consumption and Range figures under it. |
-| `0x81`, `0x88`, `0x8f`, `0x96`, `0x9d`, `0xa4`, `0xab`, `0xb1` | power | Pack voltage and line current, and the reason the Field Table has to be able to say "one field, several frame types": these eight types all carry the same twelve-byte layout, and in cap0007 all eight read the same voltage to a tenth of a volt across the whole ride. The types step by 7 except for the last, `0xab` -> `0xb1`, which steps by 6 - the block does not divide the 55-type cycle evenly, so the eight are listed rather than generated from a stride. Eight types out of 55 is eight samples per cycle: 244 frames in 47.1 s of cap0007, **5.2 Hz**. That is 8x anything else the Controller sends and ~5x the BMS's ~1 Hz poll, which is what ADR-0003's split of authority rests on - but it is not the 35 Hz that ADR was originally written with, and #17's internal-resistance estimate from load steps has to be designed for 5 Hz. |
+| `0x81`, `0x88`, `0x8f`, `0x96`, `0x9d`, `0xa4`, `0xab`, `0xb1` | power | Pack voltage and line current, and the reason the Field Table has to be able to say "one field, several frame types": these eight types all carry the same twelve-byte layout, and in cap0007 all eight read the same voltage to a tenth of a volt across the whole ride. The types step by 7 except for the last, `0xab` -> `0xb1`, which steps by 6 - the block does not divide the 55-type cycle evenly, so the eight are listed rather than generated from a stride. Eight types out of 55 is eight samples per cycle: 244 frames in 47.1 s of cap0007, **5.2 Hz**. That is 8x anything else the Controller sends and ~5x the BMS's ~1 Hz poll, which is what ADR-0003's split of authority rests on - but it is not the 35 Hz that ADR was originally written with, and #17's internal-resistance estimate from load steps has to be designed for 5 Hz.
+
+Also the torque current, as of cap0002, at bytes 8-9 - the block's long-unexplained pair turning out to be the one signal that explains the other two. |
 | `0xaf` | wheel | Wheel geometry and the gearing constant. Static configuration rather than telemetry, but it only arrives on the link, so nothing can compute speed until one of these has been seen. |
-| `0xb5` | temp | Motor temperature. |
+| `0xb5` | temp | Motor temperature, and the Controller's own charge gauge - which cap0002 found here, three bytes along from a field that had been in the table since the beginning. |
 | `0xb3` | ctrl_temp | Controller temperature, and the least trustworthy group in the table - see the note on the field itself. |
 | `0x94` | odo | The Odometer, which Anchors distance: coarse and it wraps, but it does not drift. |
 
@@ -60,29 +68,55 @@ Numbers the decoding needs that are not a field: each is declared once here, gen
 
 The frame is 16 bytes and this is 12 of them. Neither is negotiable - the Controller sends what it sends - which is why widening this is not a way to reach anything; a field the twelve bytes do not contain is in another frame type.
 
-**`WF_CTRL_CURRENT_LSB_PER_A`** = 4 - How many raw counts of `line_current_a` make one amp, and the single most consequential unmeasured number in this project - ADR-0003 makes it the gain on every watt-hour ever counted, so its error propagates undiminished into range. **Two candidates, 19 % apart, and this table has picked neither.** Upstream sources say 4 LSB per amp; a regression of our own Controller current against the BMS's says 4.77. cap0007 cannot decide between them: its peak of 35 raw is 8.75 A at 4 and 7.34 A at 4.77, and the BMS read -5.1 A at that moment, but the BMS's poll lag is not removed from that comparison, so it separates nothing. The value here is 4 because it is the upstream number and because an integer divisor is exact in both a C float and a Python double, which keeps the two generated decoders agreeing digit for digit - not because it is more likely to be right. Ride 1, the calibration ride, closes this by fitting integrated current against the BMS's own State of Charge delta over a whole ride; it is tracked as issue #12. Correct it here and every decoder, the document and the live screen follow.
+**`WF_CTRL_CURRENT_LSB_PER_A`** = 4.25 - How many raw counts of `line_current_a` make one amp, and until cap0002 the single most consequential unmeasured number in this project - ADR-0003 makes it the gain on every watt-hour ever counted, so its error propagates undiminished into range. **Measured, on two independent routes that agree.**
 
-**`WF_CTRL_ODO_METRES_PER_COUNT`** = 100 - Metres per count of `odometer_raw`. This is blackTeaDisp's "roughly one count per 100 m" and nobody has checked it: no ride of known length has been put against it, which is why `odometer_raw` sits at trusted. Ride 1 measures it by reading the Odometer at two landmarks a known distance apart; correct it here and the live screen and everything built on `wf_ctrl_odo_metres()` follow. It is deliberately not the field's own scale: the Field Table keeps `odometer_raw` as the raw count the Controller sent, because at u16 the count wraps and a wrap has to be differenced in counts before it is turned into a distance.
+cap0002 is a 38.6 minute road ride with a GPS track beside it, and it takes 9.30 Ah out of the Pack: the BMS's `remaining_ah` falls 32.9 -> 23.6 Ah while its State of Charge falls 65.9 % -> 47.3 %. Integrating the Controller's raw line current over the same window gives 39.39 raw-count-hours, so the divisor is **4.236**. Separately, regressing the Controller's raw current against the BMS's own amps - after sweeping out the BMS's poll lag, which peaks at 1.1 s - gives **4.18 to 4.28**, tightening as the current rises. Two different measurements of two different things, landing on one number.
+
+**The old 4.77 was the lag.** Run without the shift, that same regression reads 4.98 and correlates at only 0.759; with it, 0.967. What this table recorded as a second candidate 19 % away from upstream's 4 was an artefact of comparing a 1 Hz poll against a 5 Hz signal, and there was never a real 19 % divide to settle.
+
+**The value here is 4.25 rather than 4.236, and the 0.3 % is deliberate.** `divisor_for()` cannot turn a measured divisor into a round fraction, so both generated decoders divide by the constant itself - C in a float, Python in a double - and at 4.236 they disagree in the second decimal for 624 of the 65536 possible raw values. 4.25 is exactly representable in binary and disagrees for none of them, checked across the whole int16 range, so the cross-language test still proves what it claims to. 4.25 sits inside both measurements' bands, and the gap between it and 4.236 is a fortieth of the quantisation step this field already carries. `line_current_a` therefore declares its own `decimals` rather than taking them from the scale, which is the other half of keeping the two decoders digit-identical.
+
+Energy is the check that the number is right rather than merely self-consistent: at 4.25 the Controller accounts for 907 Wh over cap0002, and the BMS, integrating its own volts and amps, accounts for 911 Wh. Two instruments, two scales, 0.4 % apart. Issue #12 is what this closes.
+
+**`WF_CTRL_ODO_METRES_PER_COUNT`** = 130 - Metres per count of `odometer_raw`, **measured against a GPS track in cap0002** and no longer blackTeaDisp's unchecked "roughly one count per 100 m".
+
+The measurement is direct. Over that ride the Odometer stepped 163 times, and the recorded distance between the first step and the last is 21158 m: **129.80 m per count**. The median per-count spacing is 130.37 m, and the scatter around it is the 6 s GPS sample grid rather than the Controller.
+
+100 was less wrong than in the wrong frame of reference, and keeping that straight matters because it is the same fault as the speed. Dividing the Controller's own counts by the motor revolutions between them says the Controller reckons **0.37198 m per motor revolution**, which against a nominal 120/70-12 rolling circumference is a **3.9930 : 1** reduction - `rate_ratio` 4000/1000 to within 0.2 %. So the Controller does count 100 m of its own distance per count, exactly as upstream says; its own distance is short by `WF_CTRL_GEARING_CORRECTION`, because the bike's real reduction is 3.079 : 1. 100 x 1.2969 is 129.69 m, which is what the GPS says directly.
+
+The value stays an integer because `wf_ctrl_odo_metres()` is uint32 arithmetic and a wrap has to be differenced in counts; 130 against a measured 129.80 is 0.15 %, far inside the GPS's own error over 21 km. It is deliberately not the field's own scale: the Field Table keeps `odometer_raw` as the raw count the Controller sent.
+
+**`WF_CTRL_GEARING_CORRECTION`** = 1.2969 - What the Controller's own reckoning of speed and distance has to be multiplied by to become the road's. **The Controller is configured for a 4.000 : 1 reduction and the bike has 3.079 : 1**, so everything it derives from motor rpm - the speed on its own dash, its Odometer, and both of ours - is short by 30 %.
+
+Three independent measurements against cap0002's GPS track agree on **0.4824 m per motor revolution**: GPS distance over integrated rpm across the whole 2307 s overlap gives 0.48242; regressing instantaneous rpm on Doppler speed above 25 km/h gives 0.48268; the Odometer route in `WF_CTRL_ODO_METRES_PER_COUNT` gives 129.80 m per count, which is 0.48242 m per revolution again. `wf_ctrl_speed_kmh()` as upstream wrote it produces 0.37198, and 0.48242 / 0.37198 is the number here.
+
+The single check worth remembering: the ride's fastest moment is 2972 rpm at t = 1905 s, which is 86.0 km/h at the corrected scale, against a GPS peak of 85.7-86.4 km/h over the same twenty seconds. Uncorrected the decoders say 66.2 km/h, and the Odometer calls a 21.24 km ride 16.40 km.
+
+**This is a correction to one bike's configuration, not to the protocol.** `rate_ratio` reads 4000 because that is what this Controller has been told, and the four geometry bytes are right - 120/70-12 is the tyre actually on it. If the Controller is ever set to match the bike, this number goes to 1 and nothing else in the table moves, which is why it is a factor applied to the formula rather than a rewritten formula.
+
+Correct it here and `wf_ctrl_speed_kmh()`, the Odometer's metres, the live screen, and every Consumption and Range figure underneath them follow.
 
 ### Fields
 
 | Frame type | Payload byte | Width | Endian | Signed | Mask/shift | Bias/scale | Unit | Field | Confidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `motion` | 0 | 1 byte | - | no | `& 0x0c` `>> 2` | - | - | `gear` | consistent |
-| `motion` | 0 | 1 byte | - | no | `& 0x10` `>> 4` | - | - | `sliding_backwards` | trusted |
-| `motion` | 0 | 1 byte | - | no | `& 0x20` `>> 5` | - | - | `motion` | trusted |
+| `motion` | 0 | 1 byte | - | no | `& 0x10` `>> 4` | - | - | `sliding_backwards` | consistent |
+| `motion` | 0 | 1 byte | - | no | `& 0x20` `>> 5` | - | - | `motion` | consistent |
 | `motion` | 3 | 1 byte | - | no | `& 0x80` `>> 7` | - | - | `brake_switch` | trusted |
-| `motion` | 6-7 | 2 bytes | little | no | - | - | rpm | `cur_rpm` | consistent |
+| `motion` | 6-7 | 2 bytes | little | no | - | - | rpm | `cur_rpm` | proven |
 | `power` | 0-1 | 2 bytes | little | no | - | x 0.1 | V | `pack_v` | consistent |
 | `power` | 4-5 | 2 bytes | little | yes | - | / `WF_CTRL_CURRENT_LSB_PER_A` | A | `line_current_a` | consistent |
+| `power` | 8-9 | 2 bytes | little | yes | - | - | - | `torque_current_raw` | consistent |
 | `0xaf` | 4 | 1 byte | - | no | - | - | - | `wheel_ratio` | consistent |
 | `0xaf` | 5 | 1 byte | - | no | - | - | inch | `wheel_radius` | consistent |
 | `0xaf` | 6 | 1 byte | - | no | - | - | km/h | `avg_speed_kmh` | trusted |
 | `0xaf` | 7 | 1 byte | - | no | - | - | mm | `wheel_width` | consistent |
 | `0xaf` | 8-9 | 2 bytes | little | no | - | - | - | `rate_ratio` | trusted |
-| `0xb5` | 0-1 | 2 bytes | little | yes | - | - | C | `engine_temp` | trusted |
-| `0xb3` | 10 | 1 byte | - | yes | - | - | C | `controller_temp` | trusted |
-| `0x94` | 8-9 | 2 bytes | little | no | - | - | - | `odometer_raw` | trusted |
+| `0xb5` | 0-1 | 2 bytes | little | yes | - | - | C | `engine_temp` | consistent |
+| `0xb5` | 3 | 1 byte | - | no | - | - | - | `soc_gauge` | consistent |
+| `0xb3` | 10 | 1 byte | - | yes | - | - | C | `controller_temp` | consistent |
+| `0x94` | 8-9 | 2 bytes | little | no | - | - | - | `odometer_raw` | proven |
 
 Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before the bias where the Signed column says so. A `-` in the Bias/scale column means the raw number is the value; a `/ NAME` there means the scale is one over the constant of that name above, which is how a factor nobody has measured yet stays a single number in a single place.
 
@@ -90,33 +124,89 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **`gear`** (consistent with our own Captures) - 0/1/2 = eco/standard/sport. The useful cross-check in the whole Controller table: cap0006 caught payload byte 0 taking the values 1, 5 and 9 across a deliberate eco-standard-sport-standard cycle, and `(1 & 0x0c) >> 2 = 0`, `(5 & 0x0c) >> 2 = 1`, `(9 & 0x0c) >> 2 = 2` - bit for bit, in the order the rider pressed them. Byte 1's accompanying 24/25/26 is not explained by this bitfield and remains open.
 
-**`sliding_backwards`** (taken on trust from elsewhere) - blackTeaDisp's name for it. Never seen set in any Capture we hold, all of which are forwards.
+cap0002 rode 2319 s entirely in eco, and byte 1 read a constant 24 throughout - consistent with the 24/25/26 pairing cap0006 showed, and still no explanation of it.
 
-**`motion`** (taken on trust from elsewhere) - Set while the wheel is turning, per blackTeaDisp. Not cross-checked against rpm in a Capture yet, which would be an easy way to promote it.
+**`sliding_backwards`** (consistent with our own Captures) - blackTeaDisp's name for it, and **cap0002 is the first Capture in which it is ever set**. 21 episodes over 2319 s, 24.8 s in total, and every one of them at a GPS speed of 0.0-2.2 km/h. The flag comes up only while the bike is stopped or creeping and never once above walking pace, which is where a backwards roll happens and nowhere else. That is what takes it off trust.
 
-**`brake_switch`** (taken on trust from elsewhere) - The brake lever switch, per blackTeaDisp - and cap0007 argues against it. The bit reads 1 for the whole 47 s of that ride, including while the bike is moving at 5 km/h, which is not what a brake lever does. So either the polarity is inverted, or this bit is not the brake at all. Kept in the table at trusted rather than dropped, because it is what upstream reads, but it should not go on a screen until a Capture with a marked brake pull says which.
+It is not proof of the direction. `cur_rpm` is unsigned, and a 6 s GPS fix cannot resolve a metre of backwards roll, so what cap0002 establishes is that the bit means something about being stationary and that the name is not contradicted. A Capture with a marked deliberate roll-back would settle it.
 
-**`cur_rpm`** (consistent with our own Captures) - Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent - then, in #13, caused it a second time, because the entry was here but declared at one frame type out of the eight that carry it. cap0007 peaks at 253 rpm across the whole block, which through the speed formula is 5.6 km/h, against ride notes of a 4-7 km/h parking-lot crawl; reading `0xb0` alone the peak was 246, because the fastest moment of the ride landed on one of the other seven. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone.
+**`motion`** (consistent with our own Captures) - Set while the wheel is turning, per blackTeaDisp, and cap0002 is the cross-check the old note here asked for. Payload byte 0 takes exactly three values across that ride: `0x01` in 1234 frames, mean rpm 0; `0x21` in 10512 frames, mean rpm 1296; and `0x31` in 149 frames, which is `0x21` with `sliding_backwards` added. The bit is clear in every frame whose motor is stopped and set in every frame whose motor turns, over 38.6 minutes of real riding.
+
+**`brake_switch`** (taken on trust from elsewhere) - The brake lever switch, per blackTeaDisp - and two Captures now argue against it, in opposite directions. The bit reads 1 for the whole 47 s of cap0007, including while the bike is moving at 5 km/h. It reads **0 for the whole 2319 s of cap0002**, including every one of that ride's stops from motorway speed. Constant in both, at opposite values, so an inverted polarity does not explain it either: whatever this bit is, it is not tracking a brake lever.
+
+Kept in the table at trusted rather than dropped, because it is what upstream reads, but it must not go on a screen. What would settle it is a Capture with a marked brake pull; what cap0002 adds is that the answer is not simply the other polarity.
+
+**`cur_rpm`** (proven against an independent measurement) - Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent - then, in #13, caused it a second time, because the entry was here but declared at one frame type out of the eight that carry it. cap0007 peaks at 253 rpm across the whole block, which through the speed formula is 5.6 km/h, against ride notes of a 4-7 km/h parking-lot crawl; reading `0xb0` alone the peak was 246, because the fastest moment of the ride landed on one of the other seven. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone.
+
+**cap0002 promotes this to proven, and it is the first entry in the table to get there.** A GPS track recorded alongside that ride is an instrument outside this project, and over 2307 s of overlap this stream integrates to the recorded distance and regresses onto the recorded Doppler speed at one and the same constant - 0.48242 and 0.48268 m per motor revolution by the two routes, agreeing to 0.05 % - with the ride's 2972 rpm peak landing on the GPS's own 85.7-86.4 km/h.
+
+What that proves precisely is that this number is proportional to road speed at a measured constant. It does not independently establish that the count is literally motor revolutions per minute rather than a fixed multiple of them, and nothing built on it needs that. The constant is `WF_CTRL_GEARING_CORRECTION`, which is where the 30 % this Controller's own configuration is out gets written down.
 
 **`pack_v`** (consistent with our own Captures) - Pack voltage as the Controller measures it - the same quantity the BMS reports in register 40, from a second instrument on the same Pack, which is what makes this the best-corroborated entry in the whole table. Across cap0007 all eight types of the power block read 105.0-105.5 V, and the BMS's own `pack_v` reads 105.1-105.5 V over the same 47 s. Compared response by response, the two devices are never further apart than 0.30 V and average 0.09 V; `make test` asserts that gap stays under 2 V for any Capture that carries both, so a slipped offset on either side shows up as a device disagreement rather than as a plausible number. Consistent rather than proven all the same: two devices agreeing is not a meter, and no meter has been on this Pack.
 
-**`line_current_a`** (consistent with our own Captures) - Line current, signed, positive while the Pack is being drawn from. Across cap0007 the raw value runs -1..35, which is -0.25..8.75 A at the constant as it stands, and it tracks the ride: flat zero while parked, rising through 19, 27, 35 as the bike pulls away and falling back as it coasts. **The sign is inverted relative to the BMS.** At the moment the Controller peaks at +35 the BMS reads -5.1 A, and the BMS's own note calls positive discharge - so exactly one of the two is the wrong way round and this table does not yet know which. The Controller's polarity is the one shown on the live screen, because reading positive under load is what a rider expects; #12 settles which convention is right at the same time as it settles the scale. **The scale is genuinely open** - see `WF_CTRL_CURRENT_LSB_PER_A`, which is where both candidates and the 19 % between them are written down. Consistent means the shape of this signal matches the ride, not that its gain is known.
+cap0002 extends that check over a 12 V swing rather than cap0007's half-volt one: the Controller reads 104.8 V down to 92.6 V and the BMS 104.7 down to 93.7 over the same ride, tracking each other across 1546 responses at a mean gap of 0.61 V.
+
+**It also shows the 2 V assertion is a parked-Capture threshold.** The worst instantaneous gap over cap0002 is 5.00 V, under 68 A of draw - two instruments at different points of the same circuit, sampled 1 s apart, seeing different amounts of Sag. That is physics rather than a slipped offset, and a ride added to `tests/fixtures/` will fail the assertion as it stands. The threshold wants to be a function of current before that happens.
+
+**`line_current_a`** (consistent with our own Captures) - Line current, signed, positive while the Pack is being drawn from. Across cap0007 the raw value runs -1..35 and tracks the ride: flat zero while parked, rising through 19, 27, 35 as the bike pulls away and falling back as it coasts. cap0002 runs it over a real road ride, -58..305 raw, which is -13.6..71.8 A.
+
+**The sign is settled, and this side was right.** cap0002's State of Charge falls 18.6 points while this field is positive, so positive is discharge here and it is the BMS's register 41 that reads negative under load. The old note left open which of the two conventions was inverted; it was the BMS's, and that field's note now says so.
+
+**The scale is settled too.** `WF_CTRL_CURRENT_LSB_PER_A` is measured rather than guessed as of cap0002, by Coulomb count against the BMS's own `remaining_ah` and again by a lag-corrected regression against its amps. The 19 % divide the old note describes did not exist - it was the BMS's poll lag.
+
+Still consistent rather than proven, on this table's own rule: two of the bike's devices agreeing is not a meter, and no meter has been on this Pack. What cap0002 supplies is a measured gain, not an external calibration of it. The field declares `decimals` explicitly because the divisor is no longer a round fraction; see the constant.
+
+**`torque_current_raw`** (consistent with our own Captures) - The Controller's torque-producing current, in raw counts, and the one field in this table identified from our own Captures rather than transcribed from anywhere. It is what makes the power block's long-unexplained pair explicable: **line current is this number times rpm.**
+
+Fitting raw `line_current_a` against `torque_current_raw x cur_rpm` over cap0002's 5950 loaded samples gives r = 0.9897 and a residual of 11.6 counts on a signal spanning 0 to 305. That is motor physics rather than a correlation - line current times pack voltage is phase current times back-EMF, and back-EMF is proportional to rpm - which is why it is worth more than the coefficient alone.
+
+It is not `line_current_a` over again. This is the torque the motor is making; that is the current the Pack is delivering, and the two differ by the duty cycle. At 856 rpm this reads 5575 while the line draws 302 counts; at 2441 rpm it reads 2470 while the line draws 289.
+
+**No scale.** Nothing in cap0002 puts an ampere on it, so it is kept in counts the way `odometer_raw` is kept in counts, and anything wanting amps has to measure the constant first. Signed because the overrun takes it negative.
+
+The same value arrives three times per Controller cycle - here, at bytes 10-11 of the motion block, and at bytes 10-11 of the third block - so it is available at 15.5 Hz, three times anything else this Controller sends. It is declared once because a field belongs to one group; reading it at the full rate needs the table to be able to say "one field, several groups", which it cannot yet. The other two copies are recorded under Not decoded.
 
 **`wheel_ratio`** (consistent with our own Captures) - Tyre aspect ratio. cap0007 reads 70.
 
 **`wheel_radius`** (consistent with our own Captures) - Rim diameter. cap0007 reads 12.
 
-**`avg_speed_kmh`** (taken on trust from elsewhere) - blackTeaDisp's name, and cap0007 does not support it: the byte reads a constant 45 through a ride that never left 4-7 km/h, and no averaging window turns a crawl into 45 km/h. It is decoded because upstream decodes it, and it is named what upstream names it, but the name is probably wrong.
+**`avg_speed_kmh`** (taken on trust from elsewhere) - blackTeaDisp's name, and cap0002 rehabilitates it after cap0007 appeared to refute it. Over a 38.6 minute road ride the byte moves - 27 to 47, changing 64 times - and it correlates at r = 0.93 with a trailing mean of the GPS speed, best at windows of 1800 s and longer. It also reads 42 before the bike has moved a metre, so whatever window it averages over survives the ignition being switched off.
+
+That is what explains cap0007's constant 45 through a 4-7 km/h crawl, which the old note here read as evidence against the name: a 47 s ride cannot move an average this long, and 45 is what the previous riding left behind. So the name is now plausible where it was probably wrong.
+
+**Trusted stays, because the scale does not check out.** Over cap0002 the byte runs 27-47 while the GPS trip average runs 28-34 km/h, and no window or offset tried brings the two onto one line. Something about this is an average speed; its units are not established, and it must not be put on a screen as km/h.
 
 **`wheel_width`** (consistent with our own Captures) - Tyre section width. cap0007 reads 120. Taken together the three geometry bytes read 120/70-12, which is a real tyre marking for a bike this size - three independent bytes landing on one valid tyre is not something a slipped offset does by accident.
 
-**`rate_ratio`** (taken on trust from elsewhere) - The gearing constant the speed formula divides by. cap0007 reads a suspiciously round 4000, which is consistent with a configuration value but proves nothing about the scale.
+cap0002 reads the same three bytes, unchanged over 21 km of road riding, and the same `rate_ratio`.
 
-**`engine_temp`** (taken on trust from elsewhere) - Motor temperature, signed so that a sub-zero reading is not a huge positive one. Plausible in cap0007, but a plausible ambient temperature is what almost any small integer looks like.
+**`rate_ratio`** (taken on trust from elsewhere) - The gearing constant the speed formula divides by. cap0007 reads a suspiciously round 4000, and so does cap0002 over 21 km of road riding, so the byte is stable and the reading of it is right.
 
-**`controller_temp`** (taken on trust from elsewhere) - The weakest entry in the table, and deliberately kept visible rather than dropped. Two separate problems: blackTeaDisp's own author flags this one as a guess rather than something read off a working dashboard, and the upstream code contradicts itself about the width - it declares an i16 and then reads a single byte. This table decodes the single byte, signed, because that is what the code actually does, but the width is as unresolved as the meaning. Do not put this on a screen without checking it against something first. Payload byte 11 of the same frame alternates between 0 and 1 every 30-60 s and then back within about 2 s, which is not temperature-shaped and is not in this table at all.
+What cap0002 adds is that 4000 is **this Controller's configuration and not this bike's gearing**. Inverting the Odometer against motor revolutions says the Controller believes 3.9930 : 1, which is 4000/1000 to within 0.2 % and confirms both the field and the thousandths; the GPS says the bike actually turns 3.079 : 1. The 30 % between the two is `WF_CTRL_GEARING_CORRECTION`.
 
-**`odometer_raw`** (taken on trust from elsewhere) - Cumulative distance, in counts, kept exactly as the Controller sent it. cap0007 reads a constant 14 for the whole ride, and 1.4 km is far more than a 47 s parking-lot crawl covers, so this is a running total from earlier riding rather than a per-Capture counter - and a fixture that never moves cannot exercise the wrap, which is why the wrap is unit-tested against synthesised values instead. The metre conversion is `WF_CTRL_ODO_METRES_PER_COUNT`, an unverified upstream claim, and it is applied on the way to the screen rather than here: at u16 the count wraps every 65536 counts, ~6553 km at 100 m, and a difference across that wrap has to be taken in counts before it becomes a distance or the archive gains one 6553 km phantom trip. `wf_ctrl_odo_delta_counts()` is the wrap-safe subtraction; per ADR-0003 this is what Anchors distance, so #13 differences it rather than the raw number.
+Trusted stays, and the reason is worth being exact about: that this field is a reduction ratio in thousandths is now well supported, but it is a number this particular bike is misconfigured with, so nothing downstream may read it as the truth about the driveline.
+
+**`engine_temp`** (consistent with our own Captures) - Motor temperature, signed so that a sub-zero reading is not a huge positive one - and cap0002 makes it a temperature rather than a plausible small integer. Over 38.6 minutes of road riding it rises monotonically from 21 C to 61 C: starting where a September morning actually was, ending where a worked motor belongs, and never once falling. cap0007's 47 s could not tell that apart from any other constant.
+
+Consistent and not proven: no thermocouple has been on this motor. What the ride establishes is the shape - a monotone rise under load, from ambient, ordered correctly against the controller's own 20-38 C over the same ride - which is not something a slipped offset produces.
+
+**`soc_gauge`** (consistent with our own Captures) - The Controller's own charge gauge, found in cap0002 and not in this table before it. Over that ride it falls monotonically from 76 to 53 while the BMS's State of Charge falls from 65.9 % to 47.3 %, and the two track each other at **r = 0.9966** across 1335 frames - a second device's account of the same quantity, which is the strongest kind of evidence this table collects.
+
+**It is not the BMS's percentage and must never be shown as one.** Over the observed 53-76 band the relation is about 0.80 BMS points per count with an offset; what it reads on a full or an empty Pack is not measured, and running a two-point line fitted over 23 counts out to the ends of a byte's range is exactly the move this table exists to prevent. So it is decoded as a gauge in its own units and named for what it is rather than for what it resembles.
+
+ADR-0003 gives the BMS authority over State of Charge and this does not disturb that. What it is for is that the BMS link in cap0002 was down for 34.8 % of the ride while the Controller's stream never missed a frame, so this is a charge signal that survives the Anchor going away - as a sanity check on a stale Anchor, never as a replacement for it.
+
+**`controller_temp`** (consistent with our own Captures) - Two separate problems, and cap0002 answers one of them. blackTeaDisp's own author flags this as a guess rather than something read off a working dashboard, and the upstream code contradicts itself about the width - it declares an i16 and then reads a single byte. This table decodes the single byte, signed, because that is what the code actually does.
+
+**The value now behaves.** Over cap0002 it rises monotonically from 20 C to 38 C, warming less than the motor's 21-61 C over the same ride, which is the right ordering for a controller with its own heatsink and the wrong ordering for a coincidence. That is what takes it off trust.
+
+**The width is still open, and cap0002 cannot close it.** Payload byte 11 of this frame is a constant 0 for the whole ride, so a u8 and an i16le read the same number and nothing in the Capture distinguishes them. It is also not the alternating 0/1 an earlier note here described. So the entry is consistent as a value and unresolved as a width, and the two can only diverge on a Capture in which byte 11 is non-zero - which is worth watching for, because at u8 a negative controller temperature and a byte-11 of 0xff would be indistinguishable from a large positive one.
+
+**`odometer_raw`** (proven against an independent measurement) - Cumulative distance, in counts, kept exactly as the Controller sent it - and **cap0002 puts a GPS track against it**, which is what makes this and `cur_rpm` the first two entries in the table with an instrument outside the project behind them. Over that ride the count stepped 163 times and the recorded distance between the first step and the last is 21158 m: 129.80 m per count, against upstream's unchecked 100. `WF_CTRL_ODO_METRES_PER_COUNT` now carries the measured figure, and the reason the old one looked right.
+
+cap0007 read a constant 14 for its whole 47 s, so this is a running total from earlier riding rather than a per-Capture counter; cap0002 confirms that directly, opening at 18 and closing at 182.
+
+The wrap is still unit-tested against synthesised values, because 164 counts is nowhere near 65536. The metre conversion is applied on the way to the screen rather than here: at u16 the count wraps every 65536 counts, ~8520 km at 130 m, and a difference across that wrap has to be taken in counts before it becomes a distance or the archive gains one phantom trip of that length. `wf_ctrl_odo_delta_counts()` is the wrap-safe subtraction; per ADR-0003 this is what Anchors distance, so #13 differences it rather than the raw number.
 
 ### Hand-written, not generated
 
@@ -126,13 +216,34 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 ### Not decoded
 
-**phase_current** - 24-bit big-endian under a square root. Not decoded today in either language, and ADR-0002 says it stays hand-written when it is, rather than growing the table a syntax for it.
+**phase_current** - 24-bit big-endian under a square root, per upstream - and cap0002 finds where it lives without settling what it is. The third block of eight carries two 24-bit big-endian values, at payload bytes 4-6 and 7-9, whose top byte is always zero and which run 0 to about 19500; they are near-copies of one another. The square root of either tracks `torque_current_raw` at r = 0.97 and peaks at 139.8, which is the shape upstream describes.
 
-**payload bytes 2-3 and 6-11 of the power block** - The eight types of the power block carry more than pack voltage and line current. Bytes 8-9 and 10-11 are the pair the appendix below describes as the only thing moving in a parked Capture, idling at -1/-2 and 0/0xffff; phase current is one of the things in here, and is listed separately. Nothing in this range is assigned.
+Still not decoded, for two reasons. The fit is not proportional - 13 % residual - so the relation is not simply a square root of a current, and nothing in the Capture puts an ampere on the result. ADR-0002 says it stays hand-written when it is decoded, rather than growing the table a syntax for a 24-bit big-endian read under a root.
 
-**payload bytes 8-9 and 10-11 of the motion block** - Genuinely unassigned. They are not rate_ratio, not odometer_raw and not anything else in this table. Parked they idle at -1/-2 and 0/0xffff, which is what README.md and docs/capture.md describe.
+**payload bytes 2-3 and 6-11 of the power block** - Bytes 8-9 are `torque_current_raw` as of cap0002 and are no longer here. What is left, measured over that ride:
 
-**the third block of eight, 0x82 0x89 0x90 0x97 0x9e 0xa5 0xac 0xb2** - The Controller's third eight-type block, found by the same grouping of cap0007 that corrected the `motion` block in #13, and assigned nothing at all. Payload byte 0 reads a constant 35, byte 3 runs 21-25 and byte 2 moves over almost its whole range between consecutive frames, so it is live telemetry at 5.2 Hz rather than configuration - the only other signal this bike sends that fast. Not in the table because no upstream source names it and nothing in it has been identified; it is written down here so that the next person looks at it rather than rediscovering the block.
+* **bytes 6-7**, signed, -759 to 56. Rigidly coupled to `torque_current_raw`: the ratio is -0.0447 with a spread of 0.0113, and it is the same ratio in every rpm band from 0 to 3000. That rpm-independence is what rules out field weakening, which is the obvious guess for a negative current that accompanies a torque current. Something derived from the torque current rather than a measurement of its own, carrying nothing the torque current does not.
+* **byte 10**, 0 to 222, correlating 0.886 with line current and 0.910 with `torque_current_raw` but proportional to neither. Live and load-related; not identified.
+* **byte 2**, four values, 42 to 45, correlating 0.876 with pack voltage: it steps down to 43 under load and back to 45 off it, and drifts from 45 to 42 as the Pack empties over the ride. A coarse voltage or a gauge derived from one - four values are too few to say which, and `soc_gauge` at `0xb5` is the better-established version of the same idea.
+* **bytes 3 and 11** are a constant 0 across every Capture, and **byte 1** is the high byte of `pack_v`.
+
+Phase current is listed separately.
+
+**payload bytes 8-9 and 10-11 of the motion block** - **Identified in cap0002: these are the power block's bytes 6-7 and 8-9 again.** Matched frame to frame within 100 ms across 11762 pairs, the two blocks carry the same two quantities a few tens of milliseconds apart - bytes 10-11 here are `torque_current_raw`, and bytes 8-9 are the rigidly coupled companion described under the power block above. The third block carries the same pair at its own bytes 10-11.
+
+So the Controller sends this pair three times per 55-type cycle, at 15.5 Hz, which is three times the rate of anything else it sends and 23 times the BMS's poll. The Field Table declares `torque_current_raw` once, in the power block, because a field belongs to one group; reaching the full rate needs the table to be able to say "one field, several groups", which is the same shape of limitation #13 hit from the other direction.
+
+What the earlier note read as the only thing moving in a parked Capture - idling at -1/-2 and 0/0xffff - was this pair at zero torque.
+
+**the third block of eight, 0x82 0x89 0x90 0x97 0x9e 0xa5 0xac 0xb2** - The Controller's third eight-type block, found by the same grouping of cap0007 that corrected the `motion` block in #13. cap0002 assigns part of it:
+
+* **bytes 10-11** are `torque_current_raw`, the same value the power block carries at bytes 8-9 - and closer to the power block's copy, frame for frame, than the motion block's is.
+* **bytes 4-6 and 7-9** are two 24-bit big-endian values, top byte always zero, running 0 to about 19500 and near-copies of each other. See phase_current above; this is where it lives if upstream's description is right.
+* **byte 0** is a constant 35 in both Captures.
+* **byte 1** is a three-bit flag field: eight values, 38 to 63, which is 0b100110 with bits `0x01`, `0x08` and `0x10` varying independently. All three move with the riding rather than with the configuration, and none is identified.
+* **bytes 2 and 3** move over almost their whole range between consecutive frames.
+
+Only `torque_current_raw` is in the table, and it is declared at the power block rather than here. Still no upstream source names any of this.
 
 **type 0x8b** - Unknown here and unimplemented upstream too.
 
@@ -171,6 +282,7 @@ Reaching further than 125 registers therefore needs a second request at a second
 | `d2` | 55 | u16 | big | no | - | - | mV | `avg_cell_mv` | consistent |
 | `d2` | 56 | u16 | big | no | - | - | mV | `cell_delta_mv` | consistent |
 | `d2` | 57 | u16 | big | no | - | - | W | `power_w` | consistent |
+| `d2` | 47 | u16 | big | no | - | - | - | `charge_state` | consistent |
 
 Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before the bias where the Signed column says so. A `-` in the Bias/scale column means the raw number is the value; a `/ NAME` there means the scale is one over the constant of that name above, which is how a factor nobody has measured yet stays a single number in a single place.
 
@@ -178,13 +290,19 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **`cell_mv`** (consistent with our own Captures) - One register per Cell, 28 of them. In cap0007 they sit between 3750 and 3772 mV, which is where a healthy lithium cell at two thirds charge belongs, and their sum matches the pack voltage register to within a volt in every one of the 34 responses. `make test` asserts both, per response, so a slipped register map shows up as a wild number rather than as a subtly wrong one.
 
+cap0002 runs them 3746 mV down to 3335 mV as the Pack empties, still 28 of them and still ordered. The sum-against-`pack_v` check reaches 2.54 V there rather than cap0007's 1 V, because the two are sampled at different moments of a ride with 68 A load steps in it; like the Controller-versus-BMS voltage gap, that tolerance is a parked-Capture number and wants widening before a road ride joins `tests/fixtures/`.
+
 **`cell_count`** (consistent with our own Captures) - Reads 28. Register 51 carries the same number redundantly; `make test` asserts the two agree in every response, which is a cheap check that the map has not shifted.
 
 **`pack_v`** (consistent with our own Captures) - 105.1-105.5 V through cap0007, and equal to the sum of the 28 Cells to within a volt in every response - two readings of one Pack agreeing. A different ride's 106.1 V is consistent with this, just a fuller Pack.
 
-**`current_a`** (consistent with our own Captures) - Positive is discharge. The 30000 offset is the same convention the `a5` command set uses for its own current field, which is the main reason to believe it. The scale is the weak part: ADR-0001 records it as uncertain by 19 %, and settling it means fitting integrated current against the BMS's own State of Charge delta across a whole ride. Until that happens, treat Coulomb Counts built on this as provisional.
+**`current_a`** (consistent with our own Captures) - **Negative is discharge, and this note used to say the opposite.** cap0002 settles it past argument: across that ride the register is negative while the State of Charge falls 65.9 % to 47.3 %, reaching -68.8 A under acceleration, and it goes positive only on the overrun, to +12.1 A. Register 47 agrees independently - it reads 1, its charging state, for exactly the samples in which this is positive. The Controller's `line_current_a` is the field that reads positive under load.
 
-**`soc_pct`** (consistent with our own Captures) - State of Charge, the Anchor the Coulomb Count is corrected against. Constant at 66.7 % for the whole of cap0007, which is exactly right for 47 s of crawling and is also why that ride cannot say anything about how the value moves.
+**The scale is settled, and by the BMS against itself.** Integrating this register across the whole of cap0002 gives **-9.309 Ah** against a `remaining_ah` fall of **-9.300 Ah**: 0.1 % over a 9 Ah draw, two registers on two different scales describing one Pack and agreeing. The 30000 offset - the same convention the `a5` command set uses - and the 0.1 A step are both right.
+
+ADR-0001's note that this was uncertain by 19 % no longer holds. That figure was `WF_CTRL_CURRENT_LSB_PER_A`'s, it belonged to the Controller's side of the comparison, and cap0002 measured it.
+
+**`soc_pct`** (consistent with our own Captures) - State of Charge, the Anchor the Coulomb Count is corrected against. cap0007 held it at a constant 66.7 % for 47 s, which is exactly right for that ride and is also why it says nothing about how the value moves. **cap0002 moves it 18.6 points** - 65.9 % down to 47.3 % over 38.6 minutes, monotonically, in step with `remaining_ah`, and at a rate that matches the current register integrated. That is the field behaving like a State of Charge rather than merely reading like one, which is what an Anchor has to do before anything may be corrected against it.
 
 **`cell_max_mv`** (consistent with our own Captures) - Matches the highest of the 28 Cell registers to within 10 mV in every cap0007 response, asserted by `make test`.
 
@@ -192,17 +310,37 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 **`temp_hi_c`** (consistent with our own Captures) - The 40 offset is the usual convention for an unsigned temperature byte and gives 19 C through cap0007, which matches the conditions the ride was taken in. Register 32 carries the same raw value; what distinguishes the two is unknown.
 
+cap0002 gives 17 C rising to 24 C over 38.6 minutes of riding, which is a Pack warming from a September morning under load - the first Capture in which this register moves at all.
+
 **`temp_lo_c`** (consistent with our own Captures) - Same offset, and equal to temp_hi_c throughout cap0007 - a Pack that has been sitting is uniform, so this ride cannot separate the two sensors.
+
+cap0002 does not separate them either: equal to `temp_hi_c` in all 1546 of its responses, over a 7 C rise. Two registers that have never once differed, across three Captures and a real ride - so either the Pack is genuinely uniform at this resolution, or these are two reads of one sensor.
 
 **`remaining_ah`** (consistent with our own Captures) - The charge left in the Pack, and the closest this table gets to Rated Capacity. **Rated Capacity is not a field**: it is derived from this one, as `remaining_ah / (soc_pct / 100)`, and the two Captures we hold agree on the answer from different starting points - cap0006 reads 33.4 Ah at 66.8 % for 50.00 Ah, cap0007 reads 33.3 Ah at 66.7 % for 49.93 Ah. Two rides landing on 50 Ah from two different pairs of registers is what establishes both the 0.1 Ah scale and the meaning; `make test` re-derives it per response and fails outside 45-55 Ah, so a slipped register shows up as an absurd Pack rather than a plausible one.
 
 Derived is not read. A nameplate register would say what the Pack was sold as regardless of how full it is, would not inherit the State of Charge's own error, and - paired with the cycle count - is what makes State of Health measurable at all. Neither is in the polled window; #3 widened the poll to look for them and no Capture taken with the wider poll exists yet.
 
+**cap0002 gives that derivation a much longer lever.** It reads 32.9 Ah at 65.9 % and 23.6 Ah at 47.3 % - 49.92 Ah and 49.89 Ah, from one ride, 18.6 points of State of Charge apart. The earlier pair agreed on 50 Ah from within a point of each other, where almost any monotone pair of registers would; this one agrees with itself across a fifth of the Pack. It also integrates: the current register run across the same ride accounts for the 9.30 Ah this register lost, to 0.1 %.
+
+The register that would make Rated Capacity a field is still out of reach, and that is no longer a gap in the archive but a measurement - see registers 62-124.
+
 **`avg_cell_mv`** (consistent with our own Captures) - Reads 3767 against a mean of the 28 Cell registers of 3767.9-3768.0 across cap0007, i.e. the mean truncated rather than rounded. Agreeing with a number computed from 28 other registers is a strong check that this one is what it claims.
+
+cap0002 holds the same relation across a much wider band, 3741 mV down to 3488 mV.
 
 **`cell_delta_mv`** (consistent with our own Captures) - **Redundant. Do not build on it.** Exactly `cell_max_mv - cell_min_mv` in all 68 responses of cap0006 and cap0007, without a single exception, which is simultaneously the entire evidence for what it is and the reason it carries no information: anything that wants a Cell spread can subtract two registers this table already decodes. It is here because the identity is free to assert and, asserted per response by `make test`, it cross-checks registers 43, 44 and 56 against each other - a map that has slipped breaks the identity.
 
+cap0002 holds it in all 1546 of its responses too, and over a spread that reaches 49 mV rather than cap0007's 12 mV - so the identity is not an artefact of a Pack that happened to be tightly balanced.
+
 **`power_w`** (consistent with our own Captures) - **Redundant. Do not build on it.** The BMS's own instantaneous Pack power, and exactly `pack_v x |current_a|` truncated to a whole watt in all 68 responses we hold - 10 W parked at 0.1 A, 536 W at the hardest moment of cap0007's 5.1 A, and every value in between. Unsigned, so it says nothing about direction that `current_a` does not say better. Same reasoning as `cell_delta_mv`: worth an identity `make test` can check across registers 40, 41 and 57, worth nothing as a source. In particular it must never become an energy source - ADR-0003 gives the Controller authority over power, and a watt-hour counted from a register the BMS rounded to the watt at 1 Hz is not the same quantity.
+
+cap0002 holds the identity to within 0.99 W across 1546 responses reaching 6783 W, which is a far harder test of it than 536 W was - and confirms the register is unsigned, since it reads a positive number through the ride's regen as well as its draw.
+
+**`charge_state`** (consistent with our own Captures) - Which way charge is flowing: **0 idle, 1 charging, 2 discharging**. Out of Not decoded and into the table because cap0002 saw all three values and bracketed the thresholds between them.
+
+The earlier note here could say only that the register was a load state, because value 1 had never once been observed - neither Capture went near a charger - and writing a convention nobody had checked into the table is the move this table exists to prevent. cap0002 did not go near a charger either. It braked, and regenerated: across 1546 responses the register reads 0 for currents of -2.5 to +2.4 A, 1 for +2.6 to +12.1 A, and 2 for -2.6 to -68.8 A, with no sample of any value outside its own band. 90 responses at value 1, all of them on the overrun.
+
+So the obvious reading was right, the threshold sits between 2.4 and 2.6 A either side of zero, and value 1 means current entering the Pack whatever is pushing it. Consistent rather than proven: it is one ride, and a Capture with the charger plugged in is still worth taking - it would confirm that a charger and regen produce the same value, and it is the only thing that will move the four switch-state registers.
 
 ### Hand-written, not generated
 
@@ -212,21 +350,29 @@ Derived is not read. A nameplate register would say what the Pack was sold as re
 
 ### Not decoded
 
-**registers 62-124, the upper half of the poll** - **Never read.** #3 widened the poll from 62 registers to 125 to reach Rated Capacity and the cycle count, which are known not to be in the lower half; every Capture in this repository predates that change, so no response containing these bytes exists anywhere and there is nothing here to decode from. That is the honest state of it, and it is why this ticket left the table's upper half empty rather than transcribing a register map from a Daly document written for a different unit: `0xd2` is the protocol variant this BMS answers on and the addresses in the published maps belong to the `0x81` one, whose own address plan the console's `daly probe` already disagrees with (it reads status from `0x0041`, where this unit reads it from register 40).
+**registers 62-124, the upper half of the poll** - **Asked for, and refused.** #3 widened the poll from 62 registers to 125 to reach Rated Capacity and the cycle count, which are known not to be in the lower half. cap0002 is the first Capture taken with that poll running, and it settles the question in the negative rather than filling the gap: the ride opens with the event `bms answered none of 5 wide reads, asking for 62 registers`, and every one of the **57** reconnections it went on to make came back at 62 as well. **This BMS does not serve a 125-register read**, and that is now a measurement rather than an absence.
 
-What closes it is one Capture taken with the wider poll running. Then: a register that reads ~500 and does not move as the Pack empties is the Rated Capacity in 0.1 Ah, and the derivation from `remaining_ah` above says what number to look for; a small integer that never moves within a ride but is one higher after a full charge is the cycle count. Neither can be claimed from a single parked Capture alone - a constant register is what almost anything looks like over 47 s.
+`WF_BMS_PROVEN_REGS` doing its job is why the ride still had an Anchor at all. A poll width nobody had tested cost five seconds at the start of the Capture and nothing else.
 
-**registers 28-31 and 33-39** - Zero in every response of both Captures. Twelve registers between the 28 Cells and the status block, with register 32 alive in the middle of them, which is what a fixed-size array of temperature sensors with two populated looks like - but zero is zero and nothing here has been established.
+What is left is bisection, and it costs a bench session rather than a ride: `daly read 0xd2 0 <count>` walks the width down from 125 until the unit answers, which brackets the real ceiling, and `daly read 0xd2 <start> <count>` looks above register 61 at a second address, which is the other possibility - that the block exists but not in one reply. Until one of those comes back with data, Rated Capacity stays derived from `remaining_ah` and **State of Health is not measurable**.
 
-**register 47, the charge/discharge state** - The most nearly decodable register left in the polled block, and deliberately still out. It reads 0 through the whole of cap0006 (parked, 0.0 A) and takes exactly two values in cap0007: 0 whenever the Pack is delivering 2.0 A or less, and 2 whenever it is delivering 2.6 A or more, tracking the throttle bursts response for response. Nothing between those two currents was sampled, so the threshold is bracketed and not known.
+The table's upper half stays empty rather than borrowing a register map from a Daly document written for a different unit: `0xd2` is the protocol variant this BMS answers on, and the addresses in the published maps belong to the `0x81` one, whose own address plan the console's `daly probe` already disagrees with (it reads status from `0x0041`, where this unit reads it from register 40).
 
-That is enough to say the register is a load state and not enough to name its values. The obvious reading - 0 stationary, 1 charging, 2 discharging - would make the field useful, and value 1 has never once been seen, because neither Capture went anywhere near a charger. Writing 1 into the table on the strength of a convention nobody has checked on this unit is the exact move this table exists to prevent. **One Capture with the charger plugged in settles it**, and costs a bench session rather than a ride.
+**registers 28-31 and 33-39** - Zero in every response of all three Captures, cap0002's 1546 included. Eleven registers between the 28 Cells and the status block, with register 32 alive in the middle of them, which is what a fixed-size array of temperature sensors with one populated looks like - but zero is zero, and a ride that warms the Pack 7 C without moving any of them says only that they are not temperatures.
+
+**register 47 - now decoded** - Decoded as of cap0002; see `charge_state` above. Left named here as a pointer, because the register is referred to by number in `docs/capture.md` and in issue #9.
 
 **registers 50, 52, 53 and 54, the switch states** - Constant across every response of both Captures: 50 = 1, 52 = 0, 53 = 1, 54 = 1. Four flags, three of them set, on a bike that was riding - which is the shape of charge MOSFET, discharge MOSFET, charger-connected and load-connected, and is not evidence about which is which. A register that never changes cannot be told apart from its neighbour, so all four stay here. The same charging Capture that settles register 47 moves at least two of them, and that is the cheapest way to separate them.
 
+cap0002 leaves all four exactly where they were across 1546 responses, through 68 A draws, regen, and a fifth of the Pack. Worth knowing: the ride that promoted register 47 by regenerating into the Pack did **not** move any of these, so whatever they are, they do not follow current direction. Only a real charger will separate them.
+
 **registers 58-61** - Zero in every response of both Captures. The poll reached them, so their being zero is a measurement rather than a gap - unlike registers 62-124 above, which is a distinction worth keeping straight.
 
-**register 32** - Carries the same raw value as register 45 throughout cap0007. Probably another temperature; not assigned, because "probably" is what this table exists to avoid.
+cap0002 makes that 1614 responses across three Captures and one real ride.
+
+**register 32** - Tracks register 45 but is not a copy of it: identical in every response of cap0007, and identical in 1541 of cap0002's 1546 - differing by one count in the other five. Registers 45, 46 and 32 all read 57-64 over that ride, which is 17-24 C at the same 40 offset.
+
+So there are at least two temperature sensors here rather than one register duplicated, and the five responses that disagree are the whole evidence for it. Still not assigned: a sensor that shadows another to within a count for 99.7 % of a ride cannot be told apart from it by what it reads, only by the fact that it sometimes does not.
 
 **register 51** - A second copy of cell_count. Read by the test as a cross-check rather than decoded into a field of its own.
 

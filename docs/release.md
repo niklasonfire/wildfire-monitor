@@ -3,8 +3,14 @@
 A release is what update mode installs. It is two files attached to a GitHub
 release of this repository: the app image, and a manifest of four fields that
 names it. `scripts/release.sh` produces both from the working tree and
-publishes them; there is no CI, and ADR-0006 explains why the machine that
-builds the firmware is also the machine that publishes it.
+publishes them, and ADR-0006 explains why the machine that builds the firmware
+is also the machine that publishes it.
+
+CI does not come into it. `.github/workflows/build.yml` builds every push and
+every pull request on a self-hosted runner, in the same `espressif/idf:v6.1`
+image `./idf.sh` uses, so a branch that will not compile says so before it is
+merged - but it does not tag, does not write a manifest and does not publish.
+Nothing a rider's Monitor installs has been through it.
 
 ## The short version
 

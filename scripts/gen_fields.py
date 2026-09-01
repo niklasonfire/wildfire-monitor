@@ -122,7 +122,19 @@ def load(path):
                                      f"{dev['name']}'s constants")
                 f["scale"] = 1.0 / float(constants[f["divisor_name"]]["value"])
             f.setdefault("scale", 1)
-            f["decimals"] = decimals_for(f["scale"])
+            # `decimals` is normally the scale's own, but a scale that is not
+            # a round fraction - 1/4.25, say - has no last digit to stop at
+            # and decimals_for() runs to its ceiling of 6. Six decimals of a
+            # quarter-amp quantum is noise, and it is noise C's float and
+            # Python's double disagree about, which would fail the
+            # cross-language test for a digit neither decoder means. So a
+            # field whose divisor is measured rather than round says how many
+            # decimals it actually carries.
+            if "decimals" in f:
+                if not (isinstance(f["decimals"], int) and 0 <= f["decimals"] <= 6):
+                    raise SystemExit(f"{f['name']}: decimals must be 0..6")
+            else:
+                f["decimals"] = decimals_for(f["scale"])
             f["divisor"] = divisor_for(f["scale"])
             if f["ctype"] == "bool" and (f["mask"] is None or f["scale"] != 1):
                 raise SystemExit(f"{f['name']}: a bool field needs a mask and "

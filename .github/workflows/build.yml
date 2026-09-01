@@ -1,0 +1,38 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64]
+    # Run the build straight inside the official ESP-IDF image. The self-hosted
+    # runner is docker-in-docker, so this needs no toolchain baked into the
+    # runner image — the same image the local ./idf.sh wrapper uses.
+    container:
+      image: espressif/idf:v6.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py build
+
+      - name: Collect artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wildfire_monitor-firmware
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flash_args
+          if-no-files-found: error

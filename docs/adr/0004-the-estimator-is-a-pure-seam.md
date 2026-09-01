@@ -87,9 +87,10 @@ the decision is where the two copies start to differ.
 Keeping it separate from `main/wfdecode` is deliberate too. Decoding answers
 "what did the device say"; estimation answers "what does that mean for the
 rider". The first is settled by evidence about a protocol, the second by a
-model that will be wrong for a while - the Limp Point is assumed, the current
-scale is uncertain by 19 %, the pack voltage curve is a straight line through
-two points. Those churn at completely different rates, and a change to the
+model that will be wrong for a while - the Limp Point is assumed and the pack
+voltage curve is a straight line through two points. (The current scale was on
+that list at 19 % until cap0002 measured it; the decode settled, as decodes do,
+while the model around it did not.) Those churn at completely different rates, and a change to the
 model must not be able to touch a decode.
 
 Persisted state is a plain struct with an explicit byte encoding, and the NVS

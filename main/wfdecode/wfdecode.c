@@ -57,7 +57,12 @@ float wf_ctrl_speed_kmh(uint16_t rpm, uint8_t wheel_radius, uint8_t wheel_width,
     if (rate_ratio == 0) {
         return 0.0f;
     }
-    return rpm * 0.00376991136f *
+    /* The correction is a separate factor rather than folded into the constant
+     * on purpose: everything before it is what the Controller believes, and
+     * WF_CTRL_GEARING_CORRECTION is the measured amount by which this bike's
+     * Controller is misconfigured. Reconfigure the Controller and the factor
+     * goes to 1 with nothing else moving. See the Field Table. */
+    return rpm * 0.00376991136f * (float)WF_CTRL_GEARING_CORRECTION *
            ((float)wheel_radius * 1270.0f + (float)wheel_width * (float)wheel_ratio) /
            (float)rate_ratio;
 }

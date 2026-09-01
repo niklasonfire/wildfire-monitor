@@ -155,7 +155,7 @@
  * a full window of road, which a standing bike never gives it - and the
  * all-time average has an explicit floor, WF_EST_CONS_MIN_DIST_M, of one
  * Odometer count. Below that there is no figure at all and the screen shows a
- * dash. cap0007 is exactly this case: 16.7 m of fused Distance in 47 s, the
+ * dash. cap0007 is exactly this case: 21.7 m of fused Distance in 47 s, the
  * first eight of them stationary, and it must not produce a Consumption
  * figure.
  *
@@ -227,9 +227,10 @@
  * in ten kilometres, by one, never twice running. Removing that would take a
  * filter on Range itself, and no filter can tell it apart from the rise a
  * rider earns by easing off - which is the second criterion above, and is the
- * figure moving for exactly the right reason. The wobble is also some two
- * thousand times smaller than the 19 % this figure is uncertain by for as long
- * as WF_CTRL_CURRENT_LSB_PER_A is unsettled. So there is no filter, and
+ * figure moving for exactly the right reason. The wobble was also some two
+ * thousand times smaller than the 19 % WF_CTRL_CURRENT_LSB_PER_A carried
+ * before cap0002 measured it, and is still some two hundred times smaller than
+ * the residual that constant leaves behind. So there is no filter, and
  * tests/host/unit.c asserts the bound instead of pretending to a zero.
  *
  * There is one discontinuity that is none of those three, and it is expected
@@ -441,8 +442,8 @@
  *   Range(v) = Range now * Consumption_fit(cruise) / Consumption_fit(v)
  *
  * The fit's absolute level, its offset against this particular road and this
- * particular day, and the whole of WF_CTRL_CURRENT_LSB_PER_A's 19 % divide out
- * of that quotient. What survives is the shape of the curve, which is the one
+ * particular day, and the whole of WF_CTRL_CURRENT_LSB_PER_A, whatever it is,
+ * divide out of that quotient. What survives is the shape of the curve, which is the one
  * thing the archive can honestly say. It also means the advice cannot promise
  * a Range the hero row does not already imply: it is the hero row's own number
  * multiplied by a number greater than one.
@@ -544,18 +545,23 @@
  * cap0007 cannot produce a Range either.
  *
  * ---------------------------------------------------------------------------
- * WARNING: the 19 %, and which way it goes in each figure
+ * WARNING: the current scale, and which way it goes in each figure
  * ---------------------------------------------------------------------------
  *
- * WF_CTRL_CURRENT_LSB_PER_A is uncertain by 19 % - upstream says 4 LSB per
- * amp, regression against the BMS says 4.77 - so every current this file
- * integrates may be a fifth too high. Issue #12 closes it against Ride 1.
- * Until then the magnitude is a fifth everywhere and the *direction is not the
- * same in every figure*, which is the part a reader will otherwise get wrong:
+ * WF_CTRL_CURRENT_LSB_PER_A used to be uncertain by 19 % - upstream said 4 LSB
+ * per amp and a regression against the BMS said 4.77 - and issue #12 was open
+ * on settling it. cap0002 settled it, and the 19 % turned out never to have
+ * existed: 4.77 was the BMS's poll lag, and taking the lag out brings that
+ * same regression to 4.18-4.28 while an independent Coulomb count over a
+ * 9.30 Ah draw gives 4.236. The constant is 4.25.
+ *
+ * So the magnitude below is now about 2 % rather than a fifth. What has not
+ * changed is that the *direction is not the same in every figure*, which is
+ * the part a reader will otherwise get wrong, and is why this block stays:
  *
  *   Consumption, used_wh, used_ah and the two all-time totals scale DIRECTLY
  *   with the constant. They are integrals of current and nothing corrects
- *   them. If the true scale is 4.77, they read 19 % high.
+ *   them, so they carry its whole residual, about 2 %.
  *
  *   Remaining Energy is Anchored to the BMS's State of Charge, and the BMS
  *   knows nothing about the Controller's current scale. With a live Anchor the
@@ -567,32 +573,33 @@
  *   test_a_bms_gap_produces_no_step() drives.
  *
  *   Range is Remaining Energy over Consumption, so the error enters ONCE,
- *   through the denominator alone. A 19 % overestimate of current makes
- *   Consumption 19 % high and Range 1 - 1/1.19 = 16 % PESSIMISTIC. It does not
- *   enter twice, and the two halves do not cancel: the numerator is not scaled
- *   by it at all.
+ *   through the denominator alone. An overestimate of current makes
+ *   Consumption high by that fraction and Range PESSIMISTIC by very nearly the
+ *   same one. It does not enter twice, and the two halves do not cancel: the
+ *   numerator is not scaled by it at all.
  *
  *   Internal Resistance is Sag per amp, and current is in its denominator, so
- *   it sits where Range sits and not where Consumption sits: a 19 % high
- *   current scale reads a 16 % LOW resistance. Issue #21 reads this number as
- *   a State of Health signal and has to carry that bias with it.
+ *   it sits where Range sits and not where Consumption sits: a high current
+ *   scale reads a LOW resistance. Issue #21 reads this number as a State of
+ *   Health signal and has to carry that bias with it - a far smaller bias than
+ *   this file was written expecting, but in the same direction.
  *
  *   Sag is the one figure here that the constant CANCELS out of, and it is the
  *   one that moves the Limp Point. The resistance is measured as dV/dI in the
  *   Controller's own amps and is then multiplied by a load measured in the
  *   same amps: the scale appears once in a denominator and once in a numerator
  *   and leaves. The Sag-corrected Limp Point, and the watt-hours Range gives
- *   up because of it, are as good as the voltage readings alone - the one part
- *   of this file that does not have to wait for Ride 1.
+ *   up because of it, are as good as the voltage readings alone - and were the
+ *   one part of this file that never had to wait for a calibration ride.
  *
- *   The advice is two figures with two different answers, and saying "19 %
- *   uncertain" over both of them would be wrong twice. `advice_gain_km`'s
+ *   The advice is two figures with two different answers, and putting one
+ *   uncertainty over both of them would be wrong twice. `advice_gain_km`'s
  *   *fraction* - how much further, in percent - is a ratio of the fitted curve
  *   at two speeds. Both coefficients were fitted from currents on the same
  *   scale, so the scale multiplies numerator and denominator alike and leaves;
  *   the percentage is as good as the fit's shape, which is where its real
  *   uncertainty lives. `advice_range_km` and `advice_gain_km` themselves are
- *   that unbiased fraction applied to a Range, so they inherit Range's 16 %
+ *   that unbiased fraction applied to a Range, so they inherit Range's
  *   pessimism exactly and no more - once, through the same denominator, not
  *   twice. And the decision to speak at all carries less than either:
  *   `usable_frac` is Remaining Energy over a constant, and Remaining Energy is
@@ -647,7 +654,7 @@
  *            tests/host/replay.c's invariant quotes the same figure rounded to
  *            118 V.
  *   measured cap0007: the BMS held 66.7 % for the whole 47 s while its pack
- *            voltage register read 105.1-105.5 V, at -0.25..8.75 A. Near
+ *            voltage register read 105.1-105.5 V, at -0.24..8.24 A. Near
  *            enough to rest that Sag is not hiding in it.
  *
  * Cross-check worth having: integrating this line from 0 % to 100 % over a

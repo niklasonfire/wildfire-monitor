@@ -180,7 +180,7 @@ static const char *TAG = "ui";
  * row can hold and it is exactly 7, which is also why the weakest Cell's "!"
  * takes the "*"'s place rather than sitting beside it; draw_live() says why
  * nothing is lost by that. "~128 WH/KM*" is exactly 11.
- * "ODO 6553500 M ~4585WH" is 21 of the 22, at the Odometer's largest possible
+ * "ODO 8519550 M ~4585WH" is 21 of the 22, at the Odometer's largest possible
  * reading and a full Pack - and it is one field and not two, so a shrinking
  * Odometer cannot leave debris beside a figure drawn at a fixed left edge.
  * "EASE TO 100: ~917KM" is 19 of the 22 at the widest either figure can be:
@@ -775,13 +775,16 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
      * invented one, and it counts down to the resting 84.0 V exactly as it
      * always did. `limp_point_v` in the estimate is where it currently sits.
      *
-     * And every watt-hour behind it is scaled by a line current whose LSB is
-     * uncertain by 19 % until Ride 1 settles it. That 19 % enters Range ONCE,
-     * through Consumption in the denominator - Remaining Energy is Anchored to
-     * the BMS, which knows nothing of the Controller's current scale - so a
-     * current scale 19 % high makes these kilometres about 16 % pessimistic.
-     * It does not enter twice and the two halves do not cancel; wfest.h works
-     * the whole propagation out, figure by figure.
+     * And every watt-hour behind it is scaled by a line current whose LSB
+     * cap0002 measured, on two independent routes that agree - so the residual
+     * here is a couple of percent rather than the 19 % this comment used to
+     * warn about, and the 19 % turned out to be the BMS's poll lag rather than
+     * a real disagreement. What is left enters Range ONCE, through Consumption
+     * in the denominator - Remaining Energy is Anchored to the BMS, which
+     * knows nothing of the Controller's current scale - so a high current
+     * scale makes these kilometres pessimistic by about the same fraction. It
+     * does not enter twice and the two halves do not cancel; wfest.h works the
+     * whole propagation out, figure by figure.
      *
      * Dim rather than hint-coloured while the figure rests on state restored
      * from NVS that no BMS answer has confirmed yet, exactly as the energy
@@ -864,7 +867,7 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
 
     /* The power block, from any of its eight frame types. One decimal on the
      * volts because that is the resolution the field has; one on the amps
-     * because the scale behind them is still unsettled by 19 % (see
+     * because the raw count is a quarter of an amp wide (see
      * WF_CTRL_CURRENT_LSB_PER_A) and a second decimal would be a precision
      * this number does not have. The sign is the Controller's own, positive
      * while the Pack is being drawn from - which is the convention the
@@ -884,11 +887,10 @@ static void draw_live(const wf_ctrl_live_t *lv, const wf_est_out_t *est)
     /* The reference row, at scale 1: the Odometer and Remaining Energy, both
      * demoted from riding figures to things worth being able to read.
      *
-     * The Odometer in metres, not counts: the calibration ride reads this at
-     * two landmarks a known distance apart to settle
-     * WF_CTRL_ODO_METRES_PER_COUNT, and a raw count is useless for that. The
-     * step is 100 m wide, so the last two digits are always zero - that is the
-     * Odometer's resolution showing, not a formatting accident.
+     * The Odometer in metres, not counts, because metres are what a rider
+     * reads. cap0002's GPS track settled WF_CTRL_ODO_METRES_PER_COUNT at 130,
+     * so the step is 130 m wide and the figure moves in jumps of it - that is
+     * the Odometer's resolution showing, not a formatting accident.
      *
      * Remaining Energy beside it because it is the hero row's numerator, and
      * a Range that looks wrong is either a wrong energy or a wrong
