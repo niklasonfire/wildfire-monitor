@@ -146,7 +146,11 @@ What that proves precisely is that this number is proportional to road speed at 
 
 cap0002 extends that check over a 12 V swing rather than cap0007's half-volt one: the Controller reads 104.8 V down to 92.6 V and the BMS 104.7 down to 93.7 over the same ride, tracking each other across 1546 responses at a mean gap of 0.61 V.
 
-**It also shows the 2 V assertion is a parked-Capture threshold.** The worst instantaneous gap over cap0002 is 5.00 V, under 68 A of draw - two instruments at different points of the same circuit, sampled 1 s apart, seeing different amounts of Sag. That is physics rather than a slipped offset, and a ride added to `tests/fixtures/` will fail the assertion as it stands. The threshold wants to be a function of current before that happens.
+**It also showed the 2 V assertion was a parked-Capture threshold, and cap0002 is now the fixture that replaced it.** The worst gap over that ride, paired response by response the way `make test` pairs them, is 4.90 V.
+
+The obvious reading of that number was Sag - two instruments at different points of one circuit, sampled about a second apart, seeing different amounts of it - and the obvious fix was to make the threshold a function of current. **Measured over the ride, that reading is wrong.** The worst gap is 4.60 V below 5 A and 4.90 V above 60 A, flat across every band in between; only the *mean* gap rises with load, 0.31 V to 1.38 V. What bounds the maximum is not the current at either sampling instant but the fact that a load step can land entirely between the two readings, and the gap is then the whole step whatever its endpoints read. Scaling the threshold by instantaneous current would have been reading Sag into a number that is really about sampling.
+
+So `make test` budgets it at twice the ride's own measured Sag - cap0002 measures 3.70 V, giving 7.40 V against that 4.90 V worst case - and falls back to the original 2 V for a Capture with no load step big enough to measure Sag at all, which is what cap0007 is still held to.
 
 **`line_current_a`** (consistent with our own Captures) - Line current, signed, positive while the Pack is being drawn from. Across cap0007 the raw value runs -1..35 and tracks the ride: flat zero while parked, rising through 19, 27, 35 as the bike pulls away and falling back as it coasts. cap0002 runs it over a real road ride, -58..305 raw, which is -13.6..71.8 A.
 
@@ -288,9 +292,13 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 ### What each field is, and how far it is trusted
 
-**`cell_mv`** (consistent with our own Captures) - One register per Cell, 28 of them. In cap0007 they sit between 3750 and 3772 mV, which is where a healthy lithium cell at two thirds charge belongs, and their sum matches the pack voltage register to within a volt in every one of the 34 responses. `make test` asserts both, per response, so a slipped register map shows up as a wild number rather than as a subtly wrong one.
+**`cell_mv`** (consistent with our own Captures) - One register per Cell, 28 of them. In cap0007 they sit between 3750 and 3772 mV, which is where a healthy lithium cell at two thirds charge belongs, and their sum matches the pack voltage register closely in every one of the 34 responses. `make test` asserts both, per response, so a slipped register map shows up as a wild number rather than as a subtly wrong one.
 
-cap0002 runs them 3746 mV down to 3335 mV as the Pack empties, still 28 of them and still ordered. The sum-against-`pack_v` check reaches 2.54 V there rather than cap0007's 1 V, because the two are sampled at different moments of a ride with 68 A load steps in it; like the Controller-versus-BMS voltage gap, that tolerance is a parked-Capture number and wants widening before a road ride joins `tests/fixtures/`.
+cap0002 runs them 3746 mV down to 3335 mV as the Pack empties, still 28 of them and still ordered. The sum-against-`pack_v` check reaches 2.54 V there rather than cap0007's 1 V, and adding that ride to `tests/fixtures/` is what forced the tolerance to be understood rather than simply widened.
+
+**The Cell block and the aggregate registers are not one snapshot.** Across cap0002 the whole Cell array shifts common-mode against registers 40, 43 and 44 by up to 90.6 mV per Cell - and 90.6 mV times 28 Cells is 2.537 V, which is the worst Pack-sum gap in the ride to the millivolt. The same shift explains the highest and lowest Cell registers drifting off the array, at r = 0.97. One quantity, both discrepancies, and it is a property of how this BMS assembles a response rather than of the ride.
+
+It is **not** Sag and not a function of current: below 5 A the skew already reaches 92 mV, above 40 A it reaches 99 mV. It is largest wherever the Pack voltage is moving fastest, which includes the moment the throttle is released at almost no current at all. `make test` therefore budgets one number per Cell, and pins the skew itself as `cell_skew_mv_max` in both `.expect` files - 4.4 mV parked, 90.6 mV riding - so that the budget cannot hide a decode regression underneath it.
 
 **`cell_count`** (consistent with our own Captures) - Reads 28. Register 51 carries the same number redundantly; `make test` asserts the two agree in every response, which is a cheap check that the map has not shifted.
 

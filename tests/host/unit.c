@@ -3719,10 +3719,17 @@ static void check_no_second_number(const wf_est_out_t *o, const char *when)
 
 /* THE DORMANCY, and it is a real assertion and not a placeholder.
  *
- * The archive holds one 47-second parking-lot ride, the fit refused over it,
- * and so the counterfactual has no curve to evaluate. The rule that follows is
- * absolute: no ride, however low its Pack and however fast its rider, may put
- * this row on the screen on this build. */
+ * When the archive cannot be fitted the counterfactual has no curve to
+ * evaluate, and the rule that follows is absolute: no ride, however low its
+ * Pack and however fast its rider, may put this row on the screen. That was
+ * the whole of this test while the archive held one 47-second parking-lot
+ * ride.
+ *
+ * cap0002 gave it a curve - 299 accepted spans from 20.2 to 86.8 km/h - so the
+ * committed build is now on the other side of that branch, and the test asserts
+ * both directions rather than skipping the one the archive is not in. With a
+ * fit behind it, the low-Pack ride below is precisely the case the advice
+ * exists for, and silence would be the bug. */
 static void test_the_advice_is_silent_without_a_fit(void)
 {
     wf_est_curve_t committed;
@@ -3749,22 +3756,33 @@ static void test_the_advice_is_silent_without_a_fit(void)
 
     /* And end to end, on the estimator the Monitor actually runs: a Pack down
      * to a fifth of its usable energy, a rider holding a speed the advice
-     * would love to talk about, and twenty minutes of it. */
+     * would love to talk about, and twenty minutes of it. wf_est_init() seeds
+     * the advice curve from wf_fit.h, so this is the committed archive's own
+     * answer and not a synthesised one. */
     wf_est_t e;
     wf_est_init(&e, NULL);
     feed_soc(&e, 0, 29.0);
     wf_est_curve_t c;
     synth_curve(&c);
+    bool saw_advice = false;
+    wf_est_out_t first_advice;
+    memset(&first_advice, 0, sizeof(first_advice));
     for (uint32_t t = SAMPLE_MS; t <= 20u * 60u * 1000u; t += SAMPLE_MS) {
         feed_ride(&e, t, 55.0, amps_on_curve(&c, 55.0));
         wf_est_out_t o;
         wf_est_get(&e, &o);
         if (o.advice_valid) {
-            CHECK(false, "the advice appeared at %u ms with no fit behind it",
+            CHECK(committed.fitted,
+                  "the advice appeared at %u ms with no fit behind it",
                   (unsigned)t);
-            break;
+            if (!saw_advice) {
+                first_advice = o;
+                saw_advice = true;
+            }
+            continue;
         }
-        check_no_second_number(&o, "an unfitted ride");
+        check_no_second_number(&o, committed.fitted ? "a fitted ride"
+                                                    : "an unfitted ride");
     }
     wf_est_out_t o;
     wf_est_get(&e, &o);
@@ -3774,6 +3792,31 @@ static void test_the_advice_is_silent_without_a_fit(void)
           "the dormancy ride ended at %.3f of a usable Pack, above the %.2f "
           "the advice needs - so it never asked the question",
           o.usable_frac, WF_EST_ADVICE_LOW_FRAC);
+
+    /* The branch itself. A build whose archive fits has to answer this ride,
+     * and a build whose archive does not has to stay silent through it; either
+     * way the outcome is the archive's and not this test's. */
+    CHECK(saw_advice == (committed.fitted != false),
+          "the archive %s fitted and the low-Pack ride %s advice",
+          committed.fitted ? "is" : "is not",
+          saw_advice ? "produced" : "produced no");
+
+    if (saw_advice) {
+        /* And it has to be advice, not a filled-in triple: a speed slower than
+         * the 55 km/h being ridden, buying a positive number of kilometres on
+         * top of a Range that exists. */
+        CHECK(first_advice.advice_speed_kmh > 0.0 &&
+              first_advice.advice_speed_kmh < 55.0,
+              "the advice suggested %.1f km/h to a rider doing 55",
+              first_advice.advice_speed_kmh);
+        CHECK(first_advice.advice_gain_km > 0.0,
+              "the advice suggested slowing to %.1f km/h for %.2f km",
+              first_advice.advice_speed_kmh, first_advice.advice_gain_km);
+        CHECK(first_advice.advice_range_km > first_advice.range_km,
+              "slowing to %.1f km/h was costed at %.2f km against a Range of "
+              "%.2f km", first_advice.advice_speed_kmh,
+              first_advice.advice_range_km, first_advice.range_km);
+    }
 }
 
 /* The counterfactual itself, with no policy in it: Range times the ratio of

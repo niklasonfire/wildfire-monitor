@@ -17,6 +17,7 @@ The refusals are tested just as hard, because a tool that emits confident
 numbers from three points at 4 km/h is worse than one that emits nothing.
 """
 import io
+import math
 import os
 import subprocess
 import sys
@@ -466,9 +467,12 @@ class TheHeaderCarriesItsProvenance(unittest.TestCase):
 class OverTheArchiveAsItStands(unittest.TestCase):
     """What the tool says about today's archive, asserted rather than hoped.
 
-    These are the tests that will change when the calibration ride lands, and
-    changing them is the point: right now the honest answer is that there is
-    nothing to fit, and the suite says so out loud.
+    These are the tests that changed when the first road ride landed, and
+    changing them was the point. They used to assert that the archive could
+    not be fitted at all - one 47-second parking-lot crawl, every span
+    excluded, and the suite saying so out loud rather than shipping a curve
+    fitted to nothing. cap0002 is 21.28 km with a GPS track beside it, and
+    these now assert the fit it supports.
     """
 
     def samples(self):
@@ -488,17 +492,38 @@ class OverTheArchiveAsItStands(unittest.TestCase):
         for s in samples:
             self.assertIn(s.closed, ("dist", "time", "eof"))
 
-    def test_the_archive_supports_no_fit_and_the_tool_says_so(self):
+    def test_the_archive_supports_a_fit_and_the_tool_reports_it(self):
         samples, captures = fc.parse_samples(self.samples())
         f = fc.fit(samples, captures, fc.Rules())
-        self.assertFalse(
+        self.assertTrue(
             f.fitted,
-            "the archive now supports a fit - the calibration ride has "
-            "landed, so update this test and commit the fitted wf_fit.h")
-        self.assertIsNotNone(f.refusal)
+            "the archive no longer supports a fit - a Capture has been "
+            "removed from tests/fixtures/, or the exclusions have tightened")
+        self.assertIsNone(f.refusal)
+
+        # The shape the physics predicts, and the reason the form is a + c*v^2:
+        # a rolling-and-driveline term that is positive at rest, and a drag
+        # term that is positive and grows. A negative either way would be a
+        # curve that says going faster is cheaper.
+        self.assertEqual(len(f.coeffs), 2, "the linear term is not fitted")
+        for c in f.coeffs:
+            self.assertTrue(math.isfinite(c))
+        self.assertGreater(f.coeffs[0], 0.0, "a rest cost of %g" % f.coeffs[0])
+        self.assertGreater(f.coeffs[-1], 0.0, "a drag term of %g" % f.coeffs[-1])
+
+        # A fit is only honest inside the speeds it saw, and the header carries
+        # that band so the firmware can flag extrapolation. An empty band would
+        # let every speed claim support.
+        self.assertLess(f.accepted_min_kmh, f.accepted_max_kmh)
+
+        # Provenance: the ride that carried the fit is named, and it is the
+        # road ride rather than the parking-lot one.
+        self.assertIn("cap0002", f.accepted_captures)
+
         text = fc.report(f)
-        self.assertIn("NO FIT", text)
-        self.assertIn("issue #6", text)
+        self.assertNotIn("NO FIT", text)
+        self.assertIn("THE FIT", text)
+        self.assertIn("cap0002", text)
 
     def test_the_committed_header_is_what_the_archive_produces(self):
         """The other half of the provenance promise: the constants the
@@ -526,9 +551,13 @@ class OverTheArchiveAsItStands(unittest.TestCase):
             finally:
                 sys.stdout = stdout
             self.assertEqual(rc, 0)
-            self.assertIn("NO FIT", quiet.getvalue())
+            report = quiet.getvalue()
+            self.assertNotIn("NO FIT", report)
+            self.assertIn("THE FIT", report)
             with open(out, encoding="utf-8") as f:
-                self.assertIn("WF_FIT_FITTED", f.read())
+                written = f.read()
+            self.assertIn("WF_FIT_FITTED", written)
+            self.assertIn("#define WF_FIT_FITTED                1", written)
 
 
 class AFailedRunLeavesTheHeaderAlone(unittest.TestCase):

@@ -1,0 +1,231 @@
+# What replaying cap0002.wfl has to produce. See README.md for the ride.
+#
+# `name value`, compared to within +/-0.05 - half a display digit, which is the
+# precision docs/field-table.md quotes its values to. A name this harness
+# does not measure is a failure, so a typo here cannot quietly assert nothing.
+#
+# This is the archive's first road ride, and the first Capture held against an
+# instrument outside this project: a GPS track was recorded alongside it. Three
+# constants in docs/field-table.md were measured from it, so most of what is
+# pinned below is not "what the decoder happens to say" but "what the GPS
+# agreed with". A diff here is a decode regression against real evidence.
+
+# Records. 38.6 minutes at the Controller's 35.5 Hz.
+ctrl_records      81777
+bms_records       1556
+event_records     240
+marker_records    0
+telem_records     447
+imu_records       46377
+dropped           0
+
+# Every Controller frame's checksum verifies across 81777 of them, which is
+# what makes the frame envelope and the 0x7f3c CRC init a settled question
+# rather than a 1674-frame sample.
+#
+# Ten BMS answers are rejected and that is the honest number, not a defect in
+# the decoder: this ride lost its BMS link 57 times (issue #34) and a response
+# cut short by a link going down is a response the decoder must refuse. The
+# count is pinned so that a change in either direction is deliberate.
+ctrl_frames_ok    81777
+ctrl_frames_bad   0
+bms_responses_ok  1546
+bms_responses_bad 10
+
+# BMS. The Pack fell 65.9 % to 47.3 % over the ride, monotonically, in step
+# with register 48 - which is the field behaving like a State of Charge rather
+# than merely reading like one, and is what lets it be the Anchor at all.
+# cap0007 held 66.7 % for 47 s and could say nothing about this.
+pack_v_min        93.7
+pack_v_max        104.7
+soc_pct_min       47.3
+soc_pct_max       65.9
+cell_count        28
+cell_mv_min       3335
+cell_mv_max       3746
+
+# Negative is discharge, and this ride is what settled it: the register is
+# negative while the State of Charge falls, reaching -68.8 A under
+# acceleration, and goes positive only on the overrun. The Controller's
+# line_current_a is the one that reads positive under load.
+current_a_min     -68.8
+current_a_max     12.1
+
+# Three readings of the same Pack, checked per response. See cap0007.expect
+# for what the two mismatch counters mean; what this ride adds is the skew
+# itself, at 90.6 mV per Cell against cap0007's parked 4.4 mV. That number is
+# the reason CELL_SNAPSHOT_SKEW_MV exists, and 90.6 x 28 Cells is 2.537 V,
+# which is exactly the worst Pack-sum gap in the ride. One skew, both
+# discrepancies. It is not a function of current - below 5 A it already
+# reaches 92 mV - so it is sampling and not Sag.
+cell_sum_mismatch     0
+cell_extreme_mismatch 0
+cell_count_disagree   0
+cell_skew_mv_max      90.61
+
+# Rated Capacity, still derived rather than read, and this ride gives the
+# derivation a far longer lever than cap0007's: 32.9 Ah at 65.9 % and 23.6 Ah
+# at 47.3 % are 49.92 and 49.89 Ah, one ride, 18.6 points of State of Charge
+# apart. cap0007's pair agreed from within a point of each other, where almost
+# any monotone register would. The register that would make this a reading
+# rather than a derivation is above this poll's window and the BMS refuses to
+# serve it; see issue #35.
+remaining_ah_min      23.6
+remaining_ah_max      32.9
+rated_ah_min          49.89
+rated_ah_max          50.00
+
+# The two redundant registers, pinned as identities and not as values, exactly
+# as in cap0007 - but now across 1546 responses, 68 A of draw and regen rather
+# than 34 parked ones. register 56 == cell_max_mv - cell_min_mv and register
+# 57 == pack_v x |current_a| truncated, in every single response.
+cell_delta_mv_max     49
+power_w_max           6783
+cell_delta_redundant_mismatch 0
+power_redundant_mismatch      0
+
+# Controller. 85.88 km/h is the corrected peak, and it is the single most
+# valuable number in this fixture: the GPS track reads 85.7-86.4 km/h over the
+# same twenty seconds. That agreement is what WF_CTRL_GEARING_CORRECTION was
+# measured from - this Controller is configured for a 4.000:1 reduction the
+# bike does not have - and it is why rate_ratio is pinned beside it. Without
+# the correction this reads 66.2.
+#
+# The wheel geometry from type 0xaf is pinned for the same reason it is in
+# cap0007: the speed is computed from it, so a slip there moves every speed in
+# the ride and every kilometre derived from one.
+speed_kmh_max     85.88
+speed_samples     11893
+rpm_max           2972
+wheel_radius      12
+wheel_width       120
+wheel_ratio       70
+rate_ratio        4000
+odometer_raw      182
+gear_last         0
+
+# The power block. 11895 frames over 2319 s is 5.1 Hz, the same eight-of-55
+# duty cycle cap0007 measures at 5.2 Hz over 47 s - which is the rate ADR-0003
+# rests on, confirmed over a ride three orders of magnitude longer.
+power_frames      11895
+ctrl_pack_v_min   92.6
+ctrl_pack_v_max   104.8
+
+# Raw -58..305 at WF_CTRL_CURRENT_LSB_PER_A = 4.25, which this ride measured.
+# The lever is the point: cap0007 reached 8.24 A, and a scale fitted to that
+# is a scale fitted to nothing. 71.77 A against a 9.30 Ah Coulomb count is.
+ctrl_current_a_min -13.65
+ctrl_current_a_max 71.77
+
+# The Controller and the BMS on one Pack, and the number that made this check
+# a function of the ride rather than a constant. 4.90 V is not a slipped
+# offset: the two are sampled up to one BMS poll apart, so a load step can
+# land entirely between them, and the gap is then the whole step. It is flat
+# across current - 4.60 V below 5 A, 4.90 V above 60 A - which is why the
+# budget is twice the measured Sag and not a multiple of the current.
+pack_v_device_gap_max 4.90
+
+# The estimation seam, main/wfest. The plumbing check first: the estimator saw
+# every BMS answer and every power-block frame the decoder did, and nothing
+# else.
+est_points          83128
+est_power_samples   11895
+est_anchor_samples  1546
+
+# The ride. 904.57 Wh out of the Pack over 21.28 km, so Remaining Energy fell
+# from 2687 Wh to 1691 Wh. The minimum is below the last point because the
+# final metres are on the overrun, with energy coming back - the same sign
+# convention cap0007 shows in miniature, here at 13.6 A of regen.
+est_wh_first        2686.98
+est_wh_last         1690.80
+est_wh_min          1541.19
+est_wh_max          2686.98
+est_used_wh         904.57
+est_used_ah         9.28
+
+# The Coulomb Count against its Anchor, and this is the whole of ADR-0003
+# working: 9.275 Ah integrated from the Controller's line current lands the
+# count at 47.35 % against the BMS's own 47.30 %, having started 18.6 points
+# higher. 0.05 points apart after 38.6 minutes of integration is the evidence
+# that WF_CTRL_CURRENT_LSB_PER_A is right, and est_soc_gap_max is how far the
+# two ever drifted from each other in between.
+est_soc_last        47.35
+est_anchor_soc_last 47.30
+est_soc_gap_max     0.56
+
+# Internal Resistance, measured here for the first time - cap0007 never saw a
+# load step worth the name. 59.5 mOhm over 64 accepted steps with 39 refused,
+# and the refusals matter: the estimator is choosing which steps are clean
+# enough rather than taking all of them. 3.70 V of Sag is what the device-gap
+# budget above is derived from.
+est_ir_ohm          0.059
+est_ir_weight       64
+est_ir_steps        186
+est_ir_rejected     39
+est_ir_soc_pct      47.70
+est_sag_v_max       3.70
+
+# Cells, over a fifth of the Pack. 9.1 mV of spread sits inside the 13.2 mV the
+# Pack model already carries, so this healthy Pack produces neither the Range
+# clamp nor the divergence warning - which is #18's criterion proved on a real
+# ride rather than on a 47 s crawl. The synthesised weak-Cell replay is what
+# proves the other half.
+est_cell_samples    1546
+est_cell_rejected   0
+est_cell_spread_mv  9.12
+est_cell_clamped    0
+est_cell_diverged   0
+est_cell_reserve_wh 0
+
+# Distance. 21284.6 m fused against the Odometer's own 21320.0 m - 35 m apart
+# over 21 km, which is a fifth of one Odometer count per kilometre and well
+# inside the count's own 129.8 m quantisation. This is #13's fusion doing what
+# it exists for over a real ride: the integrated speed and the Anchor
+# disagreeing by less than the Anchor's resolution.
+est_dist_points     83306
+est_distance_m      21284.60
+est_odo_distance_m  21320.00
+est_distance_samples 11894
+est_odo_samples     1486
+est_alltime_m       21284.60
+est_alltime_wh      904.57
+
+# Consumption, the archive's first real figure - cap0007 covers 21.7 m and
+# cannot produce one at all. 33.9 Wh/km from the rolling window, and source 2
+# is the window rather than the all-time fallback, which is the guard in #15
+# being satisfied by a ride long enough to satisfy it.
+est_cons_source     2
+est_cons_wh_per_km  33.86
+
+# Range, counting down to a Limp Point that is still provisional at 84.0 V -
+# issue #8 is the ride that measures it, and until then this is an assumption
+# wearing a number. 50.1 km to 49.9 km across the ride is Range staying almost
+# flat while a fifth of the Pack went: the Consumption window and the falling
+# energy move together.
+#
+# est_range_step_up_max is the one number here worth arguing about, and it is
+# pinned rather than explained: at some instant of this ride the Range figure
+# rose by 17.3 km between consecutive samples. That is a third of the figure
+# itself, on a screen a rider is meant to trust. The cause is not established -
+# it is most likely the rolling Consumption window turning over after a slow
+# section, but nothing here measures that - so this is recorded as an
+# observation and not as a characterisation. If the smoothing changes, this
+# number moves and the diff will say so.
+est_range_source    2
+est_range_points    81005
+est_range_km_first  50.11
+est_range_km_last   49.94
+est_range_step_up_max 17.30
+
+# No advice at any point of the ride - and, pleasingly, not for want of a
+# curve: this is the ride the curve was fitted from, so WF_FIT_FITTED is 1 and
+# wf_est_consumption_at_speed() answers across 20.2 to 86.8 km/h. The row stays
+# off because the condition for showing it was never met - the Pack never fell
+# to 20 % of its usable energy with a slower speed worth 15 % on the board.
+# This ride ends at 47.3 %, nowhere near it. Issue #8 is the ride that goes low
+# enough to move this.
+est_advice_shown    0
+
+# Housekeeping.
+duration_ms         2318998
+engine_temp_last    60

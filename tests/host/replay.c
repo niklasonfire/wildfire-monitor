@@ -44,6 +44,7 @@
  * two different routes and only one of them is deterministic.
  */
 #include <dirent.h>
+#include <float.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -56,6 +57,36 @@
 
 #define MAX_FIXTURE_BYTES (16 * 1024 * 1024)
 #define MAX_METRICS       96
+
+/* How far the BMS's Cell block may sit from its own aggregate registers,
+ * per Cell.
+ *
+ * Registers 0-27 are the Cell array; 40, 43 and 44 are the Pack voltage and
+ * the highest and lowest Cell. They are three readings of one Pack, and
+ * cap0002 shows they are not three readings taken at one *instant*: across
+ * that ride the whole Cell array shifts common-mode against the aggregates by
+ * up to 90.6 mV per Cell, and the highest/lowest registers follow that same
+ * shift at r = 0.97. One skew explains both discrepancies exactly - 90.6 mV
+ * times 28 Cells is 2.537 V, which is the worst Pack-sum gap in the ride to
+ * the millivolt.
+ *
+ * It is NOT a function of current, which is what the ticket that predicted
+ * this failure assumed. Below 5 A the skew already reaches 92 mV; above 40 A
+ * it reaches 99 mV. Sag would scale with load; a snapshot skew does not, and
+ * it is largest wherever the Pack voltage is moving fastest - which includes
+ * the moment the throttle is released, at almost no current at all.
+ *
+ * 150 mV is that worst case with half again on top. What the two checks below
+ * still catch is a slipped register map, which does not miss by a tenth of a
+ * volt: reading the current register as a voltage gives 3000 V, and a Cell
+ * block off by one register puts a temperature in the array, which the
+ * 2000-4500 mV Cell bounds reject before the sum is ever formed. */
+#define CELL_SNAPSHOT_SKEW_MV  150u
+
+/* The floor under the Controller-versus-BMS Pack voltage check, in volts, for
+ * a Capture with no measured Sag to scale it by. cap0007 is parked and keeps
+ * the 2 V this check has always used. */
+#define PACK_V_DEVICE_GAP_MIN_V 2.0
 
 /* ------------------------------------------------------- measured values */
 
@@ -186,6 +217,12 @@ typedef struct {
     /* Cross-checks between registers that must describe the same Pack. Each
      * counts the responses where they disagree by more than the BMS's own
      * sampling jitter, so the assertion is "0", not "close enough". */
+    /* The worst per-Cell common-mode shift between the Cell block and the
+     * aggregate registers, which is the quantity CELL_SNAPSHOT_SKEW_MV is a
+     * budget for. Pinned in .expect so that widening that budget cannot hide
+     * a real decode regression underneath it: the two mismatch counters go to
+     * zero either way, this does not. */
+    double   cell_skew_mv_max;
     long     cell_sum_mismatch;      /* reg 40 vs the sum of reg 0-27 */
     long     cell_extreme_mismatch;  /* reg 43/44 vs the extremes of reg 0-27 */
     long     cell_count_disagree;    /* reg 49 vs reg 51 */
@@ -804,24 +841,43 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
             if (b.current_a > r->current_a_max) r->current_a_max = b.current_a;
             unsigned lo = 0xffffu, hi = 0;
             unsigned sum_mv = 0;
+            unsigned n_cells = 0;
             for (unsigned i = 0; i < b.cell_count && i < WF_BMS_MAX_CELLS; i++) {
                 if (b.cell_mv[i] < lo) lo = b.cell_mv[i];
                 if (b.cell_mv[i] > hi) hi = b.cell_mv[i];
                 sum_mv += b.cell_mv[i];
+                n_cells++;
             }
             if (lo < r->cell_mv_min) r->cell_mv_min = lo;
             if (hi > r->cell_mv_max) r->cell_mv_max = hi;
 
             /* The Cells, the Pack voltage and the two extreme registers are
-             * three separate readings of one Pack. They are sampled a moment
-             * apart, so they are allowed to differ by a little and by nothing
-             * more: a slipped register map shows up here as a wild number. */
+             * three separate readings of one Pack, and they are not sampled at
+             * one instant: the Cell block may sit CELL_SNAPSHOT_SKEW_MV per
+             * Cell away from the aggregates. Both budgets below are that one
+             * number - the sum's is it times the Cells actually summed, which
+             * is how the skew reaches the Pack total. A slipped register map
+             * shows up here as a wild number all the same. */
+            double skew_v = (double)(n_cells * CELL_SNAPSHOT_SKEW_MV) / 1000.0;
             double from_cells = sum_mv / 1000.0;
-            if (from_cells < b.pack_v - 1.0 || from_cells > b.pack_v + 1.0) {
+            if (n_cells > 0) {
+                double skew_mv = (from_cells - b.pack_v) * 1000.0 /
+                                 (double)n_cells;
+                if (skew_mv < 0.0) {
+                    skew_mv = -skew_mv;
+                }
+                if (skew_mv > r->cell_skew_mv_max) {
+                    r->cell_skew_mv_max = skew_mv;
+                }
+            }
+            if (from_cells < b.pack_v - skew_v ||
+                from_cells > b.pack_v + skew_v) {
                 r->cell_sum_mismatch++;
             }
-            if (b.cell_max_mv + 10u < hi || hi + 10u < b.cell_max_mv ||
-                b.cell_min_mv + 10u < lo || lo + 10u < b.cell_min_mv) {
+            if (b.cell_max_mv + CELL_SNAPSHOT_SKEW_MV < hi ||
+                hi + CELL_SNAPSHOT_SKEW_MV < b.cell_max_mv ||
+                b.cell_min_mv + CELL_SNAPSHOT_SKEW_MV < lo ||
+                lo + CELL_SNAPSHOT_SKEW_MV < b.cell_min_mv) {
                 r->cell_extreme_mismatch++;
             }
             if (b.reg[49] != b.reg[51]) {
@@ -987,6 +1043,7 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "cell_mv_min", (double)r->cell_mv_min);
         put(ms, "cell_mv_max", (double)r->cell_mv_max);
         put(ms, "cell_count", (double)r->cell_count);
+        put(ms, "cell_skew_mv_max", r->cell_skew_mv_max);
         put(ms, "cell_sum_mismatch", (double)r->cell_sum_mismatch);
         put(ms, "cell_extreme_mismatch", (double)r->cell_extreme_mismatch);
         put(ms, "cell_count_disagree", (double)r->cell_count_disagree);
@@ -1213,13 +1270,35 @@ static void check_invariants(const char *fixture, const run_t *r)
     }
     /* The check that is worth more than all of the above: two devices with
      * separate instruments on one Pack, and they have to agree. cap0007 keeps
-     * them within 0.30 V; 2 V is loose enough for the Controller's reading
-     * being up to a poll old under load, and tight enough that a slipped
-     * offset on either side cannot hide inside it. */
-    if (r->pack_v_device_samples > 0 && r->pack_v_device_gap_max > 2.0) {
+     * them within 0.30 V.
+     *
+     * The budget is the ride's own Sag, not a constant and not a function of
+     * current. The BMS is polled at 1 Hz and the Controller sends at 5.2 Hz,
+     * so the two readings are up to one poll apart and a load step can land
+     * entirely between them - and then the gap is the whole step, whatever the
+     * current happened to be at either sampling instant. cap0002 makes that
+     * concrete: its worst gap is 4.90 V, and it is 4.60 V below 5 A and
+     * 4.90 V above 60 A, flat across every band in between. Scaling this by
+     * instantaneous current would be reading Sag into a number that is really
+     * about sampling.
+     *
+     * Twice the measured Sag, because the excursion the two devices can
+     * straddle is not one step but the swing from regen to full draw: cap0002
+     * runs +12.1 A to -68.8 A, and its 3.70 V of Sag gives a 7.40 V budget
+     * against that 4.90 V worst gap. A Capture with no load step big enough to
+     * measure Sag - anything parked - keeps the 2 V this check has always
+     * used, which is what cap0007 is still held to. */
+    double gap_budget_v = PACK_V_DEVICE_GAP_MIN_V;
+    if (r->sag_v_max > 0.0 && 2.0 * r->sag_v_max > gap_budget_v) {
+        gap_budget_v = 2.0 * r->sag_v_max;
+    }
+    if (r->pack_v_device_samples > 0 &&
+        r->pack_v_device_gap_max > gap_budget_v) {
         fail(fixture, "the Controller and the BMS disagree about pack voltage "
-                      "by up to %.2f V across %ld responses",
-             r->pack_v_device_gap_max, r->pack_v_device_samples);
+                      "by up to %.2f V across %ld responses, more than the "
+                      "%.2f V that %.2f V of measured Sag allows",
+             r->pack_v_device_gap_max, r->pack_v_device_samples, gap_budget_v,
+             r->sag_v_max);
     }
 
     /* ---- the estimation seam, main/wfest ---- */
@@ -1374,8 +1453,21 @@ static void check_invariants(const char *fixture, const run_t *r)
         /* Monotone by construction. The Odometer corrects an over-reading
          * speed by slowing distance to a standstill, never by running it
          * backwards, so any backwards move at all is a fault and not a
-         * tolerance to widen. */
-        if (r->dist_step_back_max > 0.0) {
+         * tolerance to widen.
+         *
+         * The one exception is a run that was power-cycled, and it is the
+         * storage format rather than the fusion: est_store persists
+         * distance_m as a float, so the figure that comes back is the saved
+         * double rounded to single precision and can sit under the last
+         * sample before the break by one ULP. cap0002 is the first Capture
+         * long enough for that to be visible - 0.000472 m at 9942 m, which is
+         * exactly float(9942.183088927). Anything larger is the fusion
+         * reversing and is still a fault. */
+        double back_budget_m = 0.0;
+        if (r->cycled) {
+            back_budget_m = (double)FLT_EPSILON * r->dist_m_last;
+        }
+        if (r->dist_step_back_max > back_budget_m) {
             fail(fixture, "distance moved backwards by up to %.6f m",
                  r->dist_step_back_max);
         }
@@ -2236,7 +2328,11 @@ int main(int argc, char **argv)
                      d_m, WF_CTRL_ODO_METRES_PER_COUNT, whole.alltime_m,
                      broken.alltime_m);
             }
-            if (cyc.dist_step_back_max > 0.0) {
+            /* Same budget as the unbroken invariant, and for the same
+             * reason: one float ULP is the persisted distance coming back at
+             * single precision, anything more is the fusion reversing. */
+            if (cyc.dist_step_back_max >
+                (double)FLT_EPSILON * cyc.dist_m_last) {
                 fail(paths[i], "distance moved backwards by up to %.6f m "
                                "across the simulated power cycle",
                      cyc.dist_step_back_max);
