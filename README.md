@@ -207,7 +207,7 @@ short press of the power button, or ten seconds of nothing at all closes it.
 
 | Entry | What it does |
 | --- | --- |
-| `READOUT` | Wi-Fi access point, Captures over HTTP, back only by reboot |
+| `READOUT` | Wi-Fi access point, Captures and settings over HTTP, back only by reboot |
 | `UPDATE` | joins a hotspot it knows and installs the published release |
 | `INFO` | the running firmware version and app slot; any key goes back |
 
@@ -268,8 +268,9 @@ together, so BLE goes down when it starts and the way back to capturing is a
 reboot. A failure is left failed - it names which failure it was and hands the
 panel back, and nothing retries on its own.
 
-The networks it may join live in NVS and arrive from the console, never from
-this repository, which is public:
+The networks it may join live in NVS and arrive either from the console or
+from the settings page readout mode serves - never from this repository, which
+is public:
 
 | Command | Effect |
 | --- | --- |
@@ -280,6 +281,16 @@ this repository, which is public:
 | `ota pin <tag>` / `ota pin` | Read one release instead of `latest` / go back to `latest` |
 | `ota check` | Run the check from the console, without the menu |
 | `ota install` | Check and install without waiting for the button press - how this is exercised on the bench |
+
+The same list is on the settings page at `http://192.168.4.1/settings`, linked
+from the capture listing readout mode puts up: it shows what is stored, adds a
+network and forgets one, which is `wifi add|list|del` without a PC. Typing a
+stored network's name again replaces its passphrase, which is the rotation a
+phone hotspot eventually needs. It never shows a passphrase back, only counts
+its characters - so what the access point's shared key buys someone in range is
+the ability to change the list, not to read it. Readout mode has to be running
+for the page to exist, which means BLE is down and the way back to capturing is
+a reboot: the same price pulling a Capture off the board already costs.
 
 The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
 the right kind of secret to keep on a bike, and it can be rotated on the
