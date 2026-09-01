@@ -292,9 +292,14 @@ est_sag_v_max         0.00
 # at. A Pack fanning out at low charge multiplies both halves of that ratio and
 # leaves it where it is, which is the whole reason the threshold is written
 # this way; wfest.h works it through.
-est_cell_samples      34
+#
+# 27 of the 34 answers are folded; the other 7 caught the crawl drawing more
+# than WF_EST_CELL_QUIET_A and are skipped rather than rejected. Ungated this
+# ride reads 4.24 mV, so the gate moves a parked Capture by a twentieth of a
+# millivolt - which is what it should do to a Pack that is barely working.
+est_cell_samples      27
 est_cell_rejected     0
-est_cell_spread_mv    4.24
+est_cell_spread_mv    4.16
 est_cell_clamped      0
 est_cell_diverged     0
 est_cell_reserve_wh   0.00
