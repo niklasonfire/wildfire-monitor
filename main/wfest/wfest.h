@@ -344,9 +344,43 @@
  * 150 A a Cell reads a quarter of a volt low, which taken absolutely would
  * wipe a third off the Range every time the rider opened the throttle. Sag is
  * common to all 28 Cells, so it cancels out of the difference and what is left
- * is imbalance. (A weak Cell's own extra resistance does not cancel, and shows
- * as the spread widening under load - which is real, and is the weak Cell
- * genuinely reaching the Limp Point first when the rider pulls hard.)
+ * is imbalance.
+ *
+ * THE CELL BLOCK IS A SCAN AND NOT A SNAPSHOT, which is what cap0001 cost this
+ * model and the whole reason for WF_EST_CELL_QUIET_A. This BMS reads its 28
+ * Cells one after another, so under a throttle the array is a ramp in *time*
+ * rather than a profile across Cells: at t = 97 s of that ride the mean Cell
+ * moves 3867 -> 3969 -> 4104 mV over three answers, about 100 mV per Cell per
+ * second, and the array inside the middle one climbs monotonically 3921 ->
+ * 4003 up the index while the BMS's own highest, lowest and delta registers
+ * still describe the answer before it. Read as imbalance that is 48 mV, an
+ * order past the deadband, on a Pack whose Cells sit 5 mV apart at rest.
+ *
+ * Two things say it is the scan and not a Cell. The lowest Cell is a different
+ * one every time - index 0, then 8, then 15, then 18 - where a weak Cell would
+ * be the same one all ride. And the array's own order is monotone in the index
+ * it was read in, which no arrangement of 28 real Cells produces. Regressing
+ * the spread on current through the origin gives a negative R^2 on both road
+ * rides: the artefact is not proportional to current, because it is
+ * proportional to how fast the Pack's voltage is moving, so there is nothing
+ * linear here to subtract.
+ *
+ * So an answer is folded only while the Pack is electrically quiet. What that
+ * gives up is real and worth naming: a weak Cell's own extra resistance does
+ * *not* cancel out of the difference, so a weak Cell should show as the spread
+ * widening under load - the Cell genuinely reaching the Limp Point first when
+ * the rider pulls hard. That route is abandoned here, because the scan
+ * artefact is larger than the effect and one answer cannot tell them apart.
+ * Imbalance is read at rest, where it is a fact about charge rather than about
+ * the last half-second of throttle.
+ *
+ * A busy answer is skipped and not rejected: `cell_rejected` is for a Pack
+ * that cannot be true, and a Pack under load is simply not being asked. A ride
+ * that never once falls under WF_EST_CELL_QUIET_A therefore folds nothing,
+ * `cell_valid` stays false, and Range is the unclamped Pack-average estimate -
+ * the same "no invented number" rule as everywhere else here. The archive's
+ * two road rides spend 39 % and 45 % of their answers under it; the stationary
+ * Captures spend all of them.
  *
  * THE DEADBAND, which is why a healthy Pack pays nothing. WF_EST_PACK_V_AT_REF
  * was measured on cap0007 - a Pack whose lowest Cell ran 3 to 7 mV under its
@@ -396,7 +430,10 @@
  * ratio - they raise the denominator together - and that is a real limitation
  * and not a case this can catch from one response.
  *
- * WHAT IS NOT BELIEVED. A response whose Cell block is not a plausible 28-Cell
+ * WHAT IS NOT BELIEVED, as distinct from what is not asked. A response taken
+ * while more than WF_EST_CELL_QUIET_A is flowing is not read for imbalance at
+ * all, and that is not a rejection: the answer is fine, the question is wrong.
+ * A response whose Cell block is not a plausible 28-Cell
  * Pack is refused whole, the previous reading stands, and `cell_rejected`
  * counts it - a Monitor producing nothing but rejections is a decode problem
  * and not a quiet zero. Refused: a cell count that is not
@@ -876,7 +913,7 @@
 
 /* ------------------------------------------------- the weakest Cell's limits
  *
- * The prose is in the header comment above; these are the five numbers it
+ * The prose is in the header comment above; these are the six numbers it
  * settles, and none of them is a second Limp Point - the per-Cell one is
  * WF_EST_LIMP_POINT_V divided by WF_EST_PACK_CELLS and is written that way.
  *
@@ -903,6 +940,13 @@
  *                   runs 0.00-0.33 and this is 2.0.
  * SAMPLES_MAX       the weight cap on the running mean over BMS answers, about
  *                   sixteen seconds at the ~1 Hz poll.
+ * QUIET_A           the current under which a response may be folded into the
+ *                   imbalance at all, and it is the BMS's own number rather
+ *                   than one of ours: `charge_state` reads its idle value for
+ *                   -2.5 to +2.5 A across both road rides, independently, so
+ *                   this is the Pack saying what it counts as no current
+ *                   flowing. See the header comment for why a busy response is
+ *                   skipped rather than believed.
  */
 #define WF_EST_CELL_MIN_MV           2000u
 #define WF_EST_CELL_MAX_MV           4500u
@@ -914,6 +958,7 @@
 #define WF_EST_CELL_MAX_SPREAD_V     0.5
 #define WF_EST_CELL_OUTLIER_K        2.0
 #define WF_EST_CELL_SAMPLES_MAX      16u
+#define WF_EST_CELL_QUIET_A          2.5
 
 /* ------------------------------------------------- the advice's thresholds
  *

@@ -172,14 +172,22 @@ est_ir_rejected     39
 est_ir_soc_pct      47.70
 est_sag_v_max       3.70
 
-# Cells, over a fifth of the Pack. 9.1 mV of spread sits inside the 13.2 mV the
+# Cells, over a fifth of the Pack. 7.8 mV of spread sits inside the 13.2 mV the
 # Pack model already carries, so this healthy Pack produces neither the Range
 # clamp nor the divergence warning - which is #18's criterion proved on a real
 # ride rather than on a 47 s crawl. The synthesised weak-Cell replay is what
 # proves the other half.
-est_cell_samples    1546
+#
+# 707 of the ride's 1546 answers are folded and the other 839 are skipped, not
+# rejected: imbalance is read only while under WF_EST_CELL_QUIET_A is flowing,
+# because the Cell block is scanned rather than snapshotted and a scan taken
+# under a throttle is a ramp in time. Read ungated this ride settles at 9.1 mV
+# and its worst moment reaches 12.2 mV - one millivolt short of clamping a Pack
+# with nothing wrong with it. cap0001 is the ride that went the last millivolt,
+# at 13.9 mV, and it is the reason this gate exists.
+est_cell_samples    707
 est_cell_rejected   0
-est_cell_spread_mv  9.12
+est_cell_spread_mv  7.76
 est_cell_clamped    0
 est_cell_diverged   0
 est_cell_reserve_wh 0

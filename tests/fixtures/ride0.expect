@@ -175,7 +175,13 @@ est_sag_v_max       0.00
 # the Pack model already carries, so no clamp and no warning - #18's healthy-
 # Pack half again, now at the top of the charge rather than the middle. Worth
 # recording that a full Pack fans out more than a two-thirds one: cap0007 sits
-# at 4.2 mV and cap0002 at 9.1.
+# at 4.2 mV and cap0002 at 7.8.
+#
+# All 71 answers are folded: the drive is disengaged and the line current is
+# exactly 0.00 A throughout, so nothing here is ever over WF_EST_CELL_QUIET_A.
+# That makes this the archive's cleanest reading of what this Pack's imbalance
+# actually is, and the largest of the three - 10.0 mV against a 13.2 mV
+# deadband is 3.2 mV of margin, which is the number to watch as the Pack ages.
 est_cell_samples    71
 est_cell_rejected   0
 est_cell_spread_mv  10.03

@@ -68,6 +68,17 @@ totals, so there is no second energy-and-distance integrator anywhere - and
 `Wh/km = a + c*v^2`. It refuses rather than inventing coefficients when the
 archive cannot support a fit, which is what it does today.
 
+`scripts/gps.py` reads a GPS Track recorded alongside a ride, measures the
+Monitor's clock error against it by cross-correlation, and finds the ride's
+Manoeuvres - rests, steady holds, full-throttle launches, rollouts, regen
+decelerations - from the speed curve and the Capture's own throttle and
+current, so a test ride no longer depends on the rider pressing a button at
+speed. A Track is the only instrument this project has that stands outside it,
+and it is why two Field Table entries are `proven`; it settles speed and
+distance against the ground and nothing else. A rollout is the exception, and
+measures the bike's drag without going through the current scale at all. See
+`docs/gps.md` and ADR-0007.
+
 ## What the firmware does
 
 Stage one of the project: a BLE central that finds the two devices on the

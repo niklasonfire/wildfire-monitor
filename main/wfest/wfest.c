@@ -534,6 +534,19 @@ static void cell_fold(wf_est_t *e, const wf_bms_t *bms)
         return;
     }
 
+    /* Imbalance is read at rest and nowhere else. The Cell block is scanned
+     * one Cell at a time, so under load it is a ramp in time rather than a
+     * profile across Cells - cap0001 puts 48 mV of that into a Pack that sits
+     * 5 mV apart when it is quiet. Not a rejection: the answer is true, it
+     * just does not answer this question. See the header comment. */
+    double amps = (double)bms->current_a;
+    if (amps < 0.0) {
+        amps = -amps;
+    }
+    if (amps >= WF_EST_CELL_QUIET_A) {
+        return;
+    }
+
     /* The lowest, the second-lowest and the highest, in one pass. The
      * second-lowest is what the Pack's own fan-out is measured against, and it
      * is the reason the highest and lowest registers are not simply read: they

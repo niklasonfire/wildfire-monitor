@@ -119,9 +119,33 @@ One recording session, from starting to stopping the Monitor. Holds only what
 the devices actually said, never anything the Monitor worked out.
 _Avoid_: log, session, dump, recording
 
+**Track**:
+A GPS recording taken alongside a Capture, in its own file. The only
+instrument this project has that stands outside it, which is why it is the
+only thing that can move a Field Table entry to `proven`. It measures speed and
+distance against the ground and nothing else — never volts, amps, charge or
+temperature.
+_Avoid_: GPS log, GPX, trace, route
+
+**Manoeuvre**:
+A deliberate thing the rider did that a measurement is taken over — a rest, a
+steady hold, a full-throttle launch, a rollout, a regen deceleration. A Marker
+labels one by hand; a Track lets one be found without the rider labelling
+anything.
+_Avoid_: step, segment, span (a span is the fit's unit of road, not this),
+event
+
+**Rollout**:
+A Manoeuvre: throttle shut, brake untouched, the bike left to slow down on its
+own. The only measurement of the bike's drag that does not go through the
+current scale, so the only independent check on Consumption.
+_Avoid_: coastdown in prose (fine in code), freewheel, glide
+
 **Marker**:
 A rider-pressed timestamp inside a Capture, marking the start or end of a
-deliberate manoeuvre. What separates an experiment from a blob of frames.
+Manoeuvre. What used to be the only thing separating an experiment from a blob
+of frames; a Track does the same job without a button, and Markers are now
+optional rather than load-bearing.
 _Avoid_: annotation, event, flag
 
 **Field Table**:
