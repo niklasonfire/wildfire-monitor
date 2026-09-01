@@ -201,6 +201,13 @@ typedef struct {
     unsigned rpm_max;
     double   speed_kmh_max;
     long     speed_samples;
+    /* The throttle, at type 0x99 and 0.65 Hz. Extremes rather than a curve:
+     * one frame per 55-type cycle is a record of what the rider did and not a
+     * signal, and what a .expect can usefully hold to is the span. ride0 is
+     * the Capture this exists for; every other one only ever sees the closed
+     * end of it. */
+    long     throttle_frames;
+    unsigned throttle_raw_min, throttle_raw_max;
     /* The power block: pack voltage and line current, eight of the 55 frame
      * types, and the only Controller telemetry fast enough for ADR-0003's
      * split of authority to mean anything. */
@@ -225,7 +232,7 @@ typedef struct {
     double   cell_skew_mv_max;
     long     cell_sum_mismatch;      /* reg 40 vs the sum of reg 0-27 */
     long     cell_extreme_mismatch;  /* reg 43/44 vs the extremes of reg 0-27 */
-    long     cell_count_disagree;    /* reg 49 vs reg 51 */
+    unsigned cycle_count_min, cycle_count_max;  /* reg 51, the charge cycles */
     /* Rated Capacity, which is not a register: remaining_ah divided by the
      * State of Charge. Collected per response so that a ride watching the Pack
      * empty says whether the derivation holds as the divisor shrinks - which
@@ -786,6 +793,19 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
             if (r->live.motion_valid && r->live.cur_rpm > r->rpm_max) {
                 r->rpm_max = r->live.cur_rpm;
             }
+            if (r->live.throttle_valid && f.type == WF_CTRL_TYPE_THROTTLE) {
+                if (r->throttle_frames == 0) {
+                    r->throttle_raw_min = r->throttle_raw_max =
+                        r->live.throttle_raw;
+                }
+                if (r->live.throttle_raw < r->throttle_raw_min) {
+                    r->throttle_raw_min = r->live.throttle_raw;
+                }
+                if (r->live.throttle_raw > r->throttle_raw_max) {
+                    r->throttle_raw_max = r->live.throttle_raw;
+                }
+                r->throttle_frames++;
+            }
             if (r->live.speed_valid && motion_frame) {
                 r->speed_samples++;
                 if (r->live.cur_speed_kmh > r->speed_kmh_max) {
@@ -880,8 +900,21 @@ static void replay(const uint8_t *buf, size_t len, wflog_hdr_t *hdr, run_t *r,
                 lo + CELL_SNAPSHOT_SKEW_MV < b.cell_min_mv) {
                 r->cell_extreme_mismatch++;
             }
-            if (b.reg[49] != b.reg[51]) {
-                r->cell_count_disagree++;
+            /* Register 51 read 28 in every response of every Capture taken
+             * before ride0, which is also the Cell count - so it was checked
+             * as a redundant copy of register 49 until ride0 read 29 there,
+             * after a charge. It is the charge cycle count; see the Field
+             * Table. Collected as a span rather than checked against anything,
+             * because a count that only ever goes up by one has nothing in
+             * this file to be identical to. */
+            if (r->bms_responses_ok == 1) {
+                r->cycle_count_min = r->cycle_count_max = b.cycle_count;
+            }
+            if (b.cycle_count < r->cycle_count_min) {
+                r->cycle_count_min = b.cycle_count;
+            }
+            if (b.cycle_count > r->cycle_count_max) {
+                r->cycle_count_max = b.cycle_count;
             }
             if (b.remaining_ah < r->remaining_ah_min) {
                 r->remaining_ah_min = b.remaining_ah;
@@ -1016,6 +1049,11 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "engine_temp_last", (double)r->live.engine_temp);
         put(ms, "gear_last", (double)r->live.gear);
     }
+    if (r->throttle_frames > 0) {
+        put(ms, "throttle_frames", (double)r->throttle_frames);
+        put(ms, "throttle_raw_min", (double)r->throttle_raw_min);
+        put(ms, "throttle_raw_max", (double)r->throttle_raw_max);
+    }
     if (r->speed_samples > 0) {
         put(ms, "speed_kmh_max", r->speed_kmh_max);
         /* How many times the ride produced a fresh road speed. One per frame
@@ -1046,7 +1084,8 @@ static void collect(const run_t *r, metrics_t *ms)
         put(ms, "cell_skew_mv_max", r->cell_skew_mv_max);
         put(ms, "cell_sum_mismatch", (double)r->cell_sum_mismatch);
         put(ms, "cell_extreme_mismatch", (double)r->cell_extreme_mismatch);
-        put(ms, "cell_count_disagree", (double)r->cell_count_disagree);
+        put(ms, "cycle_count_min", (double)r->cycle_count_min);
+        put(ms, "cycle_count_max", (double)r->cycle_count_max);
         put(ms, "remaining_ah_min", r->remaining_ah_min);
         put(ms, "remaining_ah_max", r->remaining_ah_max);
         put(ms, "cell_delta_mv_max", (double)r->cell_delta_mv_max);
@@ -1224,11 +1263,6 @@ static void check_invariants(const char *fixture, const run_t *r)
                           "registers do not match the cell array",
                  r->cell_extreme_mismatch, r->bms_responses_ok);
         }
-        if (r->cell_count_disagree != 0) {
-            fail(fixture, "%ld of %ld responses: the two cell-count registers "
-                          "disagree", r->cell_count_disagree,
-                 r->bms_responses_ok);
-        }
         if (r->soc_pct_min < 0.0 || r->soc_pct_max > 100.0) {
             fail(fixture, "state of charge %.1f-%.1f %% is not a percentage",
                  r->soc_pct_min, r->soc_pct_max);
@@ -1317,7 +1351,16 @@ static void check_invariants(const char *fixture, const run_t *r)
      * Outside this the model or the current scale has gone wrong, not the
      * ride. */
     if (r->est_points > 0) {
+        /* One float ULP of headroom, and it is the persisted state coming
+         * back rather than slack in the model - the same budget and the same
+         * reason as the distance checks below. The power-cycle replay puts
+         * Remaining Energy through wf_est_persist_t, which stores it as a
+         * float, so a Pack at exactly 100 % comes back a ULP above the double
+         * this compares against. ride0 is the archive's first Capture that
+         * sits on the bound at all; every other one starts below it and the
+         * question never arose. */
         double full = wf_est_energy_above_limp_wh(100.0);
+        full += (double)FLT_EPSILON * full;
         if (r->est_wh_min < 0.0 || r->est_wh_max > full) {
             fail(fixture, "Remaining Energy ran %.1f-%.1f Wh, outside the "
                           "0-%.1f Wh a full Pack holds above the Limp Point",

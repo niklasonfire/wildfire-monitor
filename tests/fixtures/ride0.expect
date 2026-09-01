@@ -1,0 +1,197 @@
+# What replaying ride0.wfl has to produce. See README.md for the ride.
+#
+# `name value`, compared to within +/-0.05 - half a display digit, which is the
+# precision docs/field-table.md quotes its values to. A name this harness
+# does not measure is a failure, so a typo here cannot quietly assert nothing.
+#
+# This is the archive's bench Capture: 97 s standing still with the drive
+# disengaged, so that the one thing the rider moved is the one thing that can
+# have moved anything else. Almost every number below is a zero, and the zeros
+# are the point - they are what makes `throttle_raw` at the bottom mean
+# something.
+
+# Records. 97.1 s at the Controller's 35.5 Hz.
+ctrl_records      3446
+bms_records       71
+event_records     19
+telem_records     20
+imu_records       1943
+dropped           0
+
+# Seven Markers, and the archive's first Capture to hold any: cap0007 and
+# cap0002 both predate the protocol. They are numbered 2-8 rather than 1-7,
+# because main.c's counter is per boot and not per Capture - one press this
+# power cycle happened before `rec` started and is not in this file. Worth
+# knowing before counting presses against issue #5's step list.
+marker_records    7
+
+ctrl_frames_ok    3446
+ctrl_frames_bad   0
+bms_responses_ok  71
+bms_responses_bad 0
+
+# Nothing moved. rpm is zero in every one of the 502 motion frames, so the
+# speed the geometry computes from it is zero too, and the Odometer sits on
+# one count for the whole Capture. These are the isolation, asserted: if a
+# future decode change makes any of them non-zero on this file, the ride stops
+# being able to say what it says about the throttle.
+rpm_max           0
+speed_kmh_max     0.00
+speed_samples     495
+odometer_raw      13
+est_distance_m    0.00
+est_odo_distance_m 0.00
+est_dist_points   3496
+est_distance_samples 501
+est_odo_samples   63
+
+# The wheel geometry, pinned as it is in both other fixtures: the speed above
+# is computed from it, so a slip here would move a number this file asserts is
+# zero for a reason that has nothing to do with the wheel.
+wheel_radius      12
+wheel_width       120
+wheel_ratio       70
+rate_ratio        4000
+
+# The gear selector, cycled deliberately as issue #5's last step: 0 for 82.0 s,
+# then 1, then 2, and the Capture ends there. Three positions and no fourth,
+# which is what the two-bit field allows and what the bike has.
+gear_last         2
+
+# The throttle, and the reason this file is in the archive.
+#
+# `throttle_raw` is type 0x99's payload bytes 0-1, which no upstream project
+# describes and which no Capture before this one could have found: on the road
+# every signal moves at once, and the two channels upstream calls ThrottleDepth
+# sit at zero here through a full sweep.
+#
+# 29 is the closed grip, and it is the same 29 in all four Captures the archive
+# holds - parked, crawling, and at every stop of a 38.6 minute road ride. 484
+# is the mechanical stop, and it exists only here: cap0002 never went past 295,
+# because a wrist on the road does not reach the end of the travel.
+#
+# 63 frames over 97.1 s is 0.65 Hz, one per 55-type cycle. That rate is pinned
+# rather than assumed, because it is the whole reason nothing on the screen is
+# built on this field.
+throttle_frames   63
+throttle_raw_min  29
+throttle_raw_max  484
+
+# The zero-current offset, which is the other thing issue #5 asked for and the
+# strongest form of it available: the line current reads exactly 0.00 A in all
+# 501 power frames, with the throttle shut *and* with it wide open. The whole
+# power block is one byte-identical twelve-byte payload from the first frame to
+# the last, so the pack voltage does not move a tenth of a volt either.
+power_frames      501
+ctrl_pack_v_min   115.4
+ctrl_pack_v_max   115.4
+ctrl_current_a_min 0.00
+ctrl_current_a_max 0.00
+
+# The BMS, on a full Pack at rest - the archive's first, and the only Capture
+# in it where State of Charge reads 100.0 %.
+pack_v_min        116.1
+pack_v_max        116.1
+soc_pct_min       100.0
+soc_pct_max       100.0
+current_a_min     0.0
+current_a_max     0.0
+cell_count        28
+cell_mv_min       4138
+cell_mv_max       4159
+cell_delta_mv_max 20
+power_w_max       0
+
+# Register 51, which read 28 in every response of cap0006, cap0007 and cap0002
+# and was checked as a second copy of the Cell count until this file read 29.
+# The Pack was charged 47.3 % -> 100 % in the 2 h 39 min between cap0002 and
+# this Capture; the register moved by one. It is the charge cycle count, and
+# the next Capture taken after a charge has to read 30.
+cycle_count_min   29
+cycle_count_max   29
+
+# Three readings of one Pack. 2.6 mV of per-Cell skew between the Cell block
+# and the aggregates, between cap0007's parked 4.4 and cap0002's riding 90.6 -
+# a Pack at rest with no current at all is where this is smallest, which is
+# what CELL_SNAPSHOT_SKEW_MV's explanation predicts.
+cell_sum_mismatch     0
+cell_extreme_mismatch 0
+cell_skew_mv_max      2.61
+cell_delta_redundant_mismatch 0
+power_redundant_mismatch      0
+
+# Rated Capacity, and the cleanest the derivation will ever get: 50.0 Ah at
+# 100.0 % is 50.00 Ah with no division by a small number anywhere in it. The
+# third Capture to land on 50 Ah, against cap0007's 49.93 and cap0002's 49.89,
+# and the one with no leverage problem. It is still a derivation and not a
+# nameplate read - issue #35 is why - but a Pack read at full is the one
+# measurement that makes remaining_ah and Rated Capacity the same number.
+remaining_ah_min      50.0
+remaining_ah_max      50.0
+rated_ah_min          50.00
+rated_ah_max          50.00
+
+# The Controller and the BMS on one Pack, 0.70 V apart and flat, because
+# nothing is drawing: no load step can land between the two readings when
+# there is no load. cap0007's parked crawl reaches 0.30 V and cap0002's ride
+# 4.90.
+pack_v_device_gap_max 0.70
+
+# The estimation seam. Every figure here is the same figure it started as,
+# which is what a Capture that draws nothing has to produce: 0.00 Wh out of
+# the Pack over 97 s, and Remaining Energy sitting on the model's own ceiling
+# for a full Pack from the first point to the last.
+#
+# That ceiling is worth a note. This is the archive's first Capture at 100.0 %
+# State of Charge, so it is the first one whose Remaining Energy touches the
+# upper bound tests/host/replay.c asserts - and it found that the bound was
+# being compared at double precision against a value that had been through
+# wf_est_persist_t's float on the power-cycle replay. The invariant carries a
+# float ULP of headroom now, and the reason it never came up before is that
+# every other ride starts below the bound.
+est_points          3506
+est_power_samples   501
+est_anchor_samples  71
+est_wh_first        4584.68
+est_wh_last         4584.68
+est_wh_min          4584.68
+est_wh_max          4584.68
+est_used_wh         0.00
+est_used_ah         0.00
+est_soc_last        100.00
+est_anchor_soc_last 100.00
+est_soc_gap_max     0.00
+est_alltime_m       0.00
+est_alltime_wh      0.00
+
+# No load step, so no Internal Resistance and no Sag - and here that is not the
+# threshold being missed narrowly, as it is in cap0007. The current is zero in
+# every frame, so there is no step at all.
+est_ir_steps        0
+est_ir_rejected     0
+est_sag_v_max       0.00
+
+# Cells. 10.0 mV of spread on a Pack at full charge, still inside the 13.2 mV
+# the Pack model already carries, so no clamp and no warning - #18's healthy-
+# Pack half again, now at the top of the charge rather than the middle. Worth
+# recording that a full Pack fans out more than a two-thirds one: cap0007 sits
+# at 4.2 mV and cap0002 at 9.1.
+est_cell_samples    71
+est_cell_rejected   0
+est_cell_spread_mv  10.03
+est_cell_clamped    0
+est_cell_diverged   0
+est_cell_reserve_wh 0.00
+
+# No distance, so no Consumption, so no Range, so no advice. Four honest zeros
+# in a chain, and the chain is what is being asserted: a Capture that never
+# moves must not produce a Consumption figure, and everything downstream of one
+# must decline rather than divide.
+est_cons_source     0
+est_range_source    0
+est_advice_shown    0
+
+# Housekeeping. 29 C is the motor at ambient, which is what it should be on a
+# bike that has not turned a revolution.
+duration_ms         97140
+engine_temp_last    29

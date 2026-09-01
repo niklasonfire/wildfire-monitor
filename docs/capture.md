@@ -91,11 +91,17 @@ description of a parked capture, but it does not mean these are the only
 telemetry fields: `cur_rpm` lives at payload bytes 6..7 of all eight of those
 types - they are the `motion` block - and simply reads 0 while parked,
 indistinguishable from a static field. See `docs/field-table.md` for the Field
-Table, the Confidence of each entry and what it's sourced from. Bytes
-8..9/10..11 of the motion block remain genuinely unassigned. Assigning
-meaning to a field from scratch still needs a capture taken **while riding**,
-which the host-driven flow above cannot deliver, because it needs a PC on the
-serial link. That is what the standalone capture below is for.
+Table, the Confidence of each entry and what it's sourced from.
+
+Bytes 8..9/10..11 of the motion block are the torque current and its companion,
+assigned by cap0002 and confirmed by ride0 - which opened the throttle to its
+stop with the drive disengaged and watched them stay at zero, because there was
+no torque to report. The throttle itself is at type `0x99`, payload bytes 0..1,
+and a parked capture is exactly what found it: it is the only field on the link
+a stationary rider can move, so it is the one thing the flow above *can*
+assign. Everything else still needs a capture taken **while riding**, which the
+host-driven flow cannot deliver because it needs a PC on the serial link. That
+is what the standalone capture below is for.
 
 ## Standalone capture
 

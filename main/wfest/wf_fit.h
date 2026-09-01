@@ -45,11 +45,12 @@
  * THE ARCHIVE THIS WAS RUN OVER.
  *   cap0002: 130397 records, 2319.0 s, 21284.6 m, 904.572 Wh, peak 85.9 km/h, 419 spans
  *   cap0007: 2668 records, 47.1 s, 21.7 m, 1.629 Wh, peak 7.3 km/h, 2 spans
+ *   ride0: 5499 records, 97.1 s, 0.0 m, 0.000 Wh, peak 0.0 km/h, 4 spans
  *
- * 421 spans closed, 299 accepted.
+ * 425 spans closed, 299 accepted.
  *   111 excluded - accelerating: more spread than 20 % of the mean speed, or 3.0 km/h, whichever is larger
- *   2 excluded - incomplete: the Capture ended inside it
- *   9 excluded - stationary: never covered its span of road
+ *   3 excluded - incomplete: the Capture ended inside it
+ *   12 excluded - stationary: never covered its span of road
  */
 #ifndef WF_FIT_H
 #define WF_FIT_H

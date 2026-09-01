@@ -60,8 +60,15 @@ current_a_max     12.1
 # reaches 92 mV - so it is sampling and not Sag.
 cell_sum_mismatch     0
 cell_extreme_mismatch 0
-cell_count_disagree   0
 cell_skew_mv_max      90.61
+
+# Register 51, which this file used to assert was a second copy of the Cell
+# count. It reads 28 here, as it does in every Capture taken before ride0 - and
+# 29 in ride0, after the Pack was charged in the 2 h 39 min following this
+# ride. It is the charge cycle count, not a Cell count, and the identity that
+# used to be asserted here is gone rather than loosened.
+cycle_count_min       28
+cycle_count_max       28
 
 # Rated Capacity, still derived rather than read, and this ride gives the
 # derivation a far longer lever than cap0007's: 32.9 Ah at 65.9 % and 23.6 Ah
