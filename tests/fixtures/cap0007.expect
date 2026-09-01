@@ -31,12 +31,28 @@ cell_mv_min       3750
 cell_mv_max       3772
 
 # Three readings of the same Pack that have to agree, checked per response:
-# the sum of the 28 Cells against the pack voltage register, the highest and
-# lowest Cell registers against the Cell array, and the two redundant
-# cell-count registers against each other.
+# the sum of the 28 Cells against the pack voltage register, and the highest
+# and lowest Cell registers against the Cell array.
+#
+# There used to be a third: register 49 against register 51, on the strength of
+# both reading 28. ride0 read 29 at register 51 after a charge, so it is the
+# cycle count and the two were never redundant - they were a Pack with as many
+# cycles on it as it has Cells. The span is pinned below instead.
+#
+# The two mismatch counters are budgeted by CELL_SNAPSHOT_SKEW_MV, because the
+# Cell block and the aggregates are not sampled at one instant. cell_skew_mv_max
+# is the shift itself, and it is pinned here rather than left to the budget: a
+# decode regression that moved the whole Cell array would be absorbed by the
+# 150 mV budget and show up in this number. Parked, the Pack barely moves
+# between the two snapshots and it is 4.4 mV; cap0002 rides and reaches 90.6.
 cell_sum_mismatch     0
 cell_extreme_mismatch 0
-cell_count_disagree   0
+cell_skew_mv_max      4.43
+
+# Register 51, the charge cycle count, pinned as a span. See the note above
+# and ride0.expect for why it is no longer checked against register 49.
+cycle_count_min       28
+cycle_count_max       28
 
 # Rated Capacity, still derived rather than read. Register 48 is the charge
 # left in the Pack, and dividing it by the State of Charge is the only route
@@ -217,19 +233,20 @@ est_range_source      0
 # honest zero, for a reason one level further back than the two above.
 #
 # The other zeros here are about this ride: 16.7 m is not a kilometre, so there
-# is no Consumption and so no Range. This one is about the archive. The advice
-# is a counterfactual off the fitted speed curve, scripts/fit_consumption.py
-# refused to fit one over an archive holding 47 s of crawling, and so
-# WF_FIT_FITTED is 0 and wf_est_consumption_at_speed() produces nothing at any
-# speed. No Capture this build can be given can put this row on the screen -
-# not a low Pack, not a motorway, not a rider who would benefit from it.
+# is no Consumption and so no Range. This one used to be about the archive -
+# WF_FIT_FITTED was 0, so no Capture this build could be given could put the
+# row on the screen at all.
 #
-# That is the correct behaviour and it is asserted rather than assumed:
-# tests/host/replay.c fails any Capture that produces advice while FITTED is 0,
-# and tests/host/unit.c drives the behaviour itself against a curve it
-# synthesises. When the calibration ride (issue #6) lands and the header
-# carries a real fit, this number can move off 0 on a ride that earns it, and
-# the diff will say which ride.
+# cap0002 changed that. The archive now carries a fit, over 299 accepted spans
+# from 20.2 to 86.8 km/h, so wf_est_consumption_at_speed() answers and the
+# advice is genuinely available. This stays 0 for the narrower and more
+# interesting reason the replay now prints: the Pack never fell to 20 % of its
+# usable energy with a slower speed worth 15 % on the board. A parked crawl
+# does not earn the row; it is no longer barred from it.
+#
+# Still asserted rather than assumed: tests/host/replay.c fails any Capture
+# that produces advice while FITTED is 0, and tests/host/unit.c drives the
+# behaviour against a curve it synthesises.
 est_advice_shown      0
 
 # Internal Resistance, and the honest zero again. This ride's line current runs

@@ -47,7 +47,7 @@ Each group carries its own "seen at least once" flag, which is what lets a scree
 
 | Frame type | Group | What it carries |
 | --- | --- | --- |
-| `0x80`, `0x87`, `0x8e`, `0x95`, `0x9c`, `0xa3`, `0xaa`, `0xb0` | motion | Gear, the two motion flags, the brake switch and rpm. **This group was declared as `0xb0` alone until #13**, which is the third time the mistake ADR-0002 exists to prevent has been found: upstream implements one of the Controller's three eight-type blocks, and the transcription inherited the gap. All eight types carry the same twelve bytes, measured against cap0007 - payload byte 0 takes its values from the same small set in every one of them, and `cur_rpm` at bytes 6-7 spans 0 to 243-253 in every one. Together they are 244 frames in 47.1 s, **5.17 Hz**, against 0.64 Hz for `0xb0` by itself.
+| `0x80`, `0x87`, `0x8e`, `0x95`, `0x9c`, `0xa3`, `0xaa`, `0xb0` | motion | Gear, the two motion flags, the drive-inhibit bit and rpm. **This group was declared as `0xb0` alone until #13**, which is the third time the mistake ADR-0002 exists to prevent has been found: upstream implements one of the Controller's three eight-type blocks, and the transcription inherited the gap. All eight types carry the same twelve bytes, measured against cap0007 - payload byte 0 takes its values from the same small set in every one of them, and `cur_rpm` at bytes 6-7 spans 0 to 243-253 in every one. Together they are 244 frames in 47.1 s, **5.17 Hz**, against 0.64 Hz for `0xb0` by itself.
 
 What the missing seven cost is measurable rather than theoretical. Gear went to sport for 400 ms at t = 4.7 s in cap0007, and it appears in `0x87` and `0x8e` and in no other frame of the ride - the single-type decode did not see that gear change at all. Worst-case staleness on rpm falls from 1.66 s to 0.32 s.
 
@@ -56,6 +56,9 @@ Road speed is computed from this group's rpm, so speed updates at 5.2 Hz too - w
 
 Also the torque current, as of cap0002, at bytes 8-9 - the block's long-unexplained pair turning out to be the one signal that explains the other two. |
 | `0xaf` | wheel | Wheel geometry and the gearing constant. Static configuration rather than telemetry, but it only arrives on the link, so nothing can compute speed until one of these has been seen. |
+| `0x99` | throttle | The throttle, and the one group in this table a Capture had to find rather than confirm: nothing upstream describes type `0x99` at all. Payload bytes 0-1 are the grip; bytes 2-11 are constant in every Capture the archive holds.
+
+One frame per 55-type cycle, so this is sampled at **0.65 Hz** - a twentieth of the rate the power block reports current at. Fast enough to record what a rider did with a wrist, far too slow to put anything on a screen from, which is why the field below is decoded and nothing consumes it. |
 | `0xb5` | temp | Motor temperature, and the Controller's own charge gauge - which cap0002 found here, three bytes along from a field that had been in the table since the beginning. |
 | `0xb3` | ctrl_temp | Controller temperature, and the least trustworthy group in the table - see the note on the field itself. |
 | `0x94` | odo | The Odometer, which Anchors distance: coarse and it wraps, but it does not drift. |
@@ -103,8 +106,9 @@ Correct it here and `wf_ctrl_speed_kmh()`, the Odometer's metres, the live scree
 | `motion` | 0 | 1 byte | - | no | `& 0x0c` `>> 2` | - | - | `gear` | consistent |
 | `motion` | 0 | 1 byte | - | no | `& 0x10` `>> 4` | - | - | `sliding_backwards` | consistent |
 | `motion` | 0 | 1 byte | - | no | `& 0x20` `>> 5` | - | - | `motion` | consistent |
-| `motion` | 3 | 1 byte | - | no | `& 0x80` `>> 7` | - | - | `brake_switch` | trusted |
+| `motion` | 3 | 1 byte | - | no | `& 0x80` `>> 7` | - | - | `drive_inhibited` | consistent |
 | `motion` | 6-7 | 2 bytes | little | no | - | - | rpm | `cur_rpm` | proven |
+| `0x99` | 0-1 | 2 bytes | little | no | - | - | - | `throttle_raw` | consistent |
 | `power` | 0-1 | 2 bytes | little | no | - | x 0.1 | V | `pack_v` | consistent |
 | `power` | 4-5 | 2 bytes | little | yes | - | / `WF_CTRL_CURRENT_LSB_PER_A` | A | `line_current_a` | consistent |
 | `power` | 8-9 | 2 bytes | little | yes | - | - | - | `torque_current_raw` | consistent |
@@ -126,15 +130,26 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 cap0002 rode 2319 s entirely in eco, and byte 1 read a constant 24 throughout - consistent with the 24/25/26 pairing cap0006 showed, and still no explanation of it.
 
+ride0 repeats cap0006's cycle deliberately, as issue #5's last step, and settles the range: three positions and no fourth, 0 for 82.0 s, then 1, then 2. It also finds that the Controller sends the same index four times over. Across both Captures, with no exception outside the frames a change straddles: motion byte 1 is **24 + gear** (24/25/26), the third block's payload byte 0 is 0x23/0x03/0x43, and type `0xb6`'s payload byte 8 is 0x01/0x11/0x21 - bits 4-5 holding the index directly. Four encodings, one selector. Byte 1's offset of 24 is still explained by nothing, and is now unexplained across two Captures rather than one.
+
 **`sliding_backwards`** (consistent with our own Captures) - blackTeaDisp's name for it, and **cap0002 is the first Capture in which it is ever set**. 21 episodes over 2319 s, 24.8 s in total, and every one of them at a GPS speed of 0.0-2.2 km/h. The flag comes up only while the bike is stopped or creeping and never once above walking pace, which is where a backwards roll happens and nowhere else. That is what takes it off trust.
 
 It is not proof of the direction. `cur_rpm` is unsigned, and a 6 s GPS fix cannot resolve a metre of backwards roll, so what cap0002 establishes is that the bit means something about being stationary and that the name is not contradicted. A Capture with a marked deliberate roll-back would settle it.
 
 **`motion`** (consistent with our own Captures) - Set while the wheel is turning, per blackTeaDisp, and cap0002 is the cross-check the old note here asked for. Payload byte 0 takes exactly three values across that ride: `0x01` in 1234 frames, mean rpm 0; `0x21` in 10512 frames, mean rpm 1296; and `0x31` in 149 frames, which is `0x21` with `sliding_backwards` added. The bit is clear in every frame whose motor is stopped and set in every frame whose motor turns, over 38.6 minutes of real riding.
 
-**`brake_switch`** (taken on trust from elsewhere) - The brake lever switch, per blackTeaDisp - and two Captures now argue against it, in opposite directions. The bit reads 1 for the whole 47 s of cap0007, including while the bike is moving at 5 km/h. It reads **0 for the whole 2319 s of cap0002**, including every one of that ride's stops from motorway speed. Constant in both, at opposite values, so an inverted polarity does not explain it either: whatever this bit is, it is not tracking a brake lever.
+**`drive_inhibited`** (consistent with our own Captures) - Payload byte 3's top bit. blackTeaDisp reads it as the brake lever switch and **it is not a brake**: ride0's rider skipped the brake step because the levers are not wired to this Controller, touched neither lever for 97 s, and the bit is set in all 502 motion frames of that Capture.
 
-Kept in the table at trusted rather than dropped, because it is what upstream reads, but it must not go on a screen. What would settle it is a Capture with a marked brake pull; what cap0002 adds is that the answer is not simply the other polarity.
+What it tracks is whether the Controller will drive. Four Captures:
+
+* **ride0** - set for the whole ride. The throttle goes to its stop and the line current never leaves 0.00 A.
+* **cap0007** - set for the first 5.70 s, clear for the remaining 41.3 s. It clears at 5.88 s; the ride's first amp arrives at 8.44 s.
+* **cap0002** - clear in all 11895 motion frames, including the 1384 with the motor stopped, on a ride that draws 71.8 A.
+* **cap0006** - clear in 234 of 235 frames, on a parked bench Capture whose throttle was never opened.
+
+No Capture has this bit set with any current flowing, and the one Capture that opened the throttle with it set produced none. The gear selector does not control it - ride0 moves through all three positions with the bit set throughout - so whatever enables the drive is a different input, a side stand or a ready switch being the obvious candidates and neither of them tested.
+
+The note that stood here recorded the bit as reading 1 for the whole of cap0007. That was wrong: it reads 1 for the first 5.7 s and 0 for the rest, and the transition is the evidence. Restated because the misreading is what made the field look inexplicable.
 
 **`cur_rpm`** (proven against an independent measurement) - Motor rpm, and the field whose absence from an earlier version of this document caused the trouble ADR-0002 exists to prevent - then, in #13, caused it a second time, because the entry was here but declared at one frame type out of the eight that carry it. cap0007 peaks at 253 rpm across the whole block, which through the speed formula is 5.6 km/h, against ride notes of a 4-7 km/h parking-lot crawl; reading `0xb0` alone the peak was 246, because the fastest moment of the ride landed on one of the other seven. That check leans on the wheel geometry too, so it establishes rpm and geometry together rather than either alone.
 
@@ -142,11 +157,25 @@ Kept in the table at trusted rather than dropped, because it is what upstream re
 
 What that proves precisely is that this number is proportional to road speed at a measured constant. It does not independently establish that the count is literally motor revolutions per minute rather than a fixed multiple of them, and nothing built on it needs that. The constant is `WF_CTRL_GEARING_CORRECTION`, which is where the 30 % this Controller's own configuration is out gets written down.
 
+**`throttle_raw`** (consistent with our own Captures) - The throttle position, and **ride0 is the Capture that found it**. That ride is 97 s of bench work with the drive disengaged: `cur_rpm` is 0 in every one of its 502 motion frames, the line current is exactly 0.00 A in all 501 power frames, and the whole power block is one byte-identical payload from the first frame to the last. Nothing in the Capture moved except the rider's wrist, which is the isolation issue #5 was written to get.
+
+This field walks that ride's script. 29 at rest; four flat holds at 138, 243, 358 and 484, each held 8-9 s, against a rider aiming at 25/50/75/100 %; back to exactly 29 on release; then a closed-to-full sweep over 12 s and a full-to-closed sweep over 9 s, monotone in both. Each of the ride's seven Markers falls 1.0-1.5 s before the transition it marks. Nothing else in the Capture follows it - the nearest rival is payload byte 2 of type `0xb6`, a three-level 1/2/3 indicator at r = 0.89 that is plainly derived from this one.
+
+**This is what closes the throttle channel conflict, and not in upstream's favour.** blackTeaDisp calls the motion block's bytes 10-11 `ThrottleDepth`; through a full closed-to-stop-and-back sweep they never leave -3..+2 counts. See the motion block under Not decoded.
+
+The zero point is the same number in all four Captures the archive holds: exactly 29, parked (cap0006), crawling (cap0007), and at every stop of a 38.6 minute road ride (cap0002). The other end exists only here, because cap0002 never went past 295 - a wrist on the road does not reach the stop a bench test does, so a road ride could not have bracketed this field even if it had found it.
+
+Consistent rather than proven, and the distinction is worth being exact about. Nothing measured the grip: the four levels are a rider's estimate of 25/50/75/100 % and land at 24.0/47.0/72.3/100 % of the 29..484 span, which is as much linearity as an eyeballed input can establish. What the ride does establish, and what no road ride could, is *which channel* the throttle is on - it is the only channel that moved. A meter on the grip would make this proven and would settle the unit with it: type `0x86` carries a constant 500 at its payload bytes 2-3, which would read this span as 0.29-4.84 V on a 5.00 V reference, but that is a guess with one number behind it, so the table records counts.
+
 **`pack_v`** (consistent with our own Captures) - Pack voltage as the Controller measures it - the same quantity the BMS reports in register 40, from a second instrument on the same Pack, which is what makes this the best-corroborated entry in the whole table. Across cap0007 all eight types of the power block read 105.0-105.5 V, and the BMS's own `pack_v` reads 105.1-105.5 V over the same 47 s. Compared response by response, the two devices are never further apart than 0.30 V and average 0.09 V; `make test` asserts that gap stays under 2 V for any Capture that carries both, so a slipped offset on either side shows up as a device disagreement rather than as a plausible number. Consistent rather than proven all the same: two devices agreeing is not a meter, and no meter has been on this Pack.
 
 cap0002 extends that check over a 12 V swing rather than cap0007's half-volt one: the Controller reads 104.8 V down to 92.6 V and the BMS 104.7 down to 93.7 over the same ride, tracking each other across 1546 responses at a mean gap of 0.61 V.
 
-**It also shows the 2 V assertion is a parked-Capture threshold.** The worst instantaneous gap over cap0002 is 5.00 V, under 68 A of draw - two instruments at different points of the same circuit, sampled 1 s apart, seeing different amounts of Sag. That is physics rather than a slipped offset, and a ride added to `tests/fixtures/` will fail the assertion as it stands. The threshold wants to be a function of current before that happens.
+**It also showed the 2 V assertion was a parked-Capture threshold, and cap0002 is now the fixture that replaced it.** The worst gap over that ride, paired response by response the way `make test` pairs them, is 4.90 V.
+
+The obvious reading of that number was Sag - two instruments at different points of one circuit, sampled about a second apart, seeing different amounts of it - and the obvious fix was to make the threshold a function of current. **Measured over the ride, that reading is wrong.** The worst gap is 4.60 V below 5 A and 4.90 V above 60 A, flat across every band in between; only the *mean* gap rises with load, 0.31 V to 1.38 V. What bounds the maximum is not the current at either sampling instant but the fact that a load step can land entirely between the two readings, and the gap is then the whole step whatever its endpoints read. Scaling the threshold by instantaneous current would have been reading Sag into a number that is really about sampling.
+
+So `make test` budgets it at twice the ride's own measured Sag - cap0002 measures 3.70 V, giving 7.40 V against that 4.90 V worst case - and falls back to the original 2 V for a Capture with no load step big enough to measure Sag at all, which is what cap0007 is still held to.
 
 **`line_current_a`** (consistent with our own Captures) - Line current, signed, positive while the Pack is being drawn from. Across cap0007 the raw value runs -1..35 and tracks the ride: flat zero while parked, rising through 19, 27, 35 as the bike pulls away and falling back as it coasts. cap0002 runs it over a real road ride, -58..305 raw, which is -13.6..71.8 A.
 
@@ -235,6 +264,10 @@ So the Controller sends this pair three times per 55-type cycle, at 15.5 Hz, whi
 
 What the earlier note read as the only thing moving in a parked Capture - idling at -1/-2 and 0/0xffff - was this pair at zero torque.
 
+**ride0 closes upstream's `ThrottleDepth` label on bytes 10-11.** That Capture is a full throttle sweep - closed to the stop and back, with the drive disengaged - and across all 502 motion frames of it this pair never leaves -3..+2 counts, which is exactly the idle noise `docs/capture.md` describes on a parked bike. A throttle channel cannot sit still through a throttle sweep. The real one is `throttle_raw` at type `0x99`, which no upstream project mentions.
+
+Read the other way round it is also the cleanest confirmation cap0002's identification could have got: bytes 10-11 are the torque current, the drive was disengaged, so there was no torque, and the pair says so.
+
 **the third block of eight, 0x82 0x89 0x90 0x97 0x9e 0xa5 0xac 0xb2** - The Controller's third eight-type block, found by the same grouping of cap0007 that corrected the `motion` block in #13. cap0002 assigns part of it:
 
 * **bytes 10-11** are `torque_current_raw`, the same value the power block carries at bytes 8-9 - and closer to the power block's copy, frame for frame, than the motion block's is.
@@ -271,6 +304,7 @@ Reaching further than 125 registers therefore needs a second request at a second
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `d2` | 0-27 | u16 | big | no | - | - | mV | `cell_mv` | consistent |
 | `d2` | 49 | u16 | big | no | - | - | - | `cell_count` | consistent |
+| `d2` | 51 | u16 | big | no | - | - | - | `cycle_count` | consistent |
 | `d2` | 40 | u16 | big | no | - | x 0.1 | V | `pack_v` | consistent |
 | `d2` | 41 | u16 | big | no | - | -30000, then x 0.1 | A | `current_a` | consistent |
 | `d2` | 42 | u16 | big | no | - | x 0.1 | % | `soc_pct` | consistent |
@@ -288,11 +322,32 @@ Read a value as `(((raw & mask) >> shift) + bias) * scale`, sign-extended before
 
 ### What each field is, and how far it is trusted
 
-**`cell_mv`** (consistent with our own Captures) - One register per Cell, 28 of them. In cap0007 they sit between 3750 and 3772 mV, which is where a healthy lithium cell at two thirds charge belongs, and their sum matches the pack voltage register to within a volt in every one of the 34 responses. `make test` asserts both, per response, so a slipped register map shows up as a wild number rather than as a subtly wrong one.
+**`cell_mv`** (consistent with our own Captures) - One register per Cell, 28 of them. In cap0007 they sit between 3750 and 3772 mV, which is where a healthy lithium cell at two thirds charge belongs, and their sum matches the pack voltage register closely in every one of the 34 responses. `make test` asserts both, per response, so a slipped register map shows up as a wild number rather than as a subtly wrong one.
 
-cap0002 runs them 3746 mV down to 3335 mV as the Pack empties, still 28 of them and still ordered. The sum-against-`pack_v` check reaches 2.54 V there rather than cap0007's 1 V, because the two are sampled at different moments of a ride with 68 A load steps in it; like the Controller-versus-BMS voltage gap, that tolerance is a parked-Capture number and wants widening before a road ride joins `tests/fixtures/`.
+cap0002 runs them 3746 mV down to 3335 mV as the Pack empties, still 28 of them and still ordered. The sum-against-`pack_v` check reaches 2.54 V there rather than cap0007's 1 V, and adding that ride to `tests/fixtures/` is what forced the tolerance to be understood rather than simply widened.
 
-**`cell_count`** (consistent with our own Captures) - Reads 28. Register 51 carries the same number redundantly; `make test` asserts the two agree in every response, which is a cheap check that the map has not shifted.
+**The Cell block and the aggregate registers are not one snapshot.** Across cap0002 the whole Cell array shifts common-mode against registers 40, 43 and 44 by up to 90.6 mV per Cell - and 90.6 mV times 28 Cells is 2.537 V, which is the worst Pack-sum gap in the ride to the millivolt. The same shift explains the highest and lowest Cell registers drifting off the array, at r = 0.97. One quantity, both discrepancies, and it is a property of how this BMS assembles a response rather than of the ride.
+
+It is **not** Sag and not a function of current: below 5 A the skew already reaches 92 mV, above 40 A it reaches 99 mV. It is largest wherever the Pack voltage is moving fastest, which includes the moment the throttle is released at almost no current at all. `make test` therefore budgets one number per Cell, and pins the skew itself as `cell_skew_mv_max` in both `.expect` files - 4.4 mV parked, 90.6 mV riding - so that the budget cannot hide a decode regression underneath it.
+
+**`cell_count`** (consistent with our own Captures) - Reads 28, which is the length of the Cell array in front of it and is checked against it on every response.
+
+Register 51 was read as a redundant second copy of this until ride0, on the strength of its also reading 28 in every response of cap0006, cap0007 and cap0002 - and `make test` asserted the two agree, which is the check that caught it. It reads 29 there. See `cycle_count`.
+
+**`cycle_count`** (consistent with our own Captures) - The Pack's charge cycle count, and it was hiding in plain sight as a second copy of `cell_count`: this Pack has 28 Cells and had done 28 cycles, so the two registers read the same number in every response of every Capture taken before this one.
+
+ride0 separates them. Four Captures over four days:
+
+| Capture | taken | State of Charge | register 49 | register 51 |
+|---|---|---|---|---|
+| cap0006 | 2026-08-29 | 66.8 % | 28 | 28 |
+| cap0007 | 2026-08-30 | 66.7 % | 28 | 28 |
+| cap0002 | 2026-09-01 06:59 | 65.9 -> 47.3 % | 28 | 28 |
+| ride0 | 2026-09-01 10:16 | 100.0 % | 28 | **29** |
+
+cap0002 ends at 47.3 % and ride0 starts 2 h 39 min later at 100.0 %, so the Pack was charged in between - and this register moved by exactly one across exactly one charge, having sat still through three days and a 21 km discharge. Nothing else the poll reaches behaves like that.
+
+It matters beyond the register map. Issue #21 wants the cycle count for State of Health and issue #35 records this BMS refusing the 125-register read that was supposed to reach it - and the count is in the lower half after all, in every Capture the archive holds. `consistent` and not `proven` because one increment is one increment: the next Capture taken after a charge has to read 30, and if it reads 29 this entry is wrong.
 
 **`pack_v`** (consistent with our own Captures) - 105.1-105.5 V through cap0007, and equal to the sum of the 28 Cells to within a volt in every response - two readings of one Pack agreeing. A different ride's 106.1 V is consistent with this, just a fuller Pack.
 
@@ -362,13 +417,17 @@ The table's upper half stays empty rather than borrowing a register map from a D
 
 **register 47 - now decoded** - Decoded as of cap0002; see `charge_state` above. Left named here as a pointer, because the register is referred to by number in `docs/capture.md` and in issue #9.
 
-**registers 50, 52, 53 and 54, the switch states** - Constant across every response of both Captures: 50 = 1, 52 = 0, 53 = 1, 54 = 1. Four flags, three of them set, on a bike that was riding - which is the shape of charge MOSFET, discharge MOSFET, charger-connected and load-connected, and is not evidence about which is which. A register that never changes cannot be told apart from its neighbour, so all four stay here. The same charging Capture that settles register 47 moves at least two of them, and that is the cheapest way to separate them.
+**registers 50, 52 and 54, the switch states** - Constant across every response of both Captures: 50 = 1, 52 = 0, 53 = 1, 54 = 1. Four flags, three of them set, on a bike that was riding - which is the shape of charge MOSFET, discharge MOSFET, charger-connected and load-connected, and is not evidence about which is which. A register that never changes cannot be told apart from its neighbour, so all four stay here. The same charging Capture that settles register 47 moves at least two of them, and that is the cheapest way to separate them.
 
 cap0002 leaves all four exactly where they were across 1546 responses, through 68 A draws, regen, and a fifth of the Pack. Worth knowing: the ride that promoted register 47 by regenerating into the Pack did **not** move any of these, so whatever they are, they do not follow current direction. Only a real charger will separate them.
 
-**registers 58-61** - Zero in every response of both Captures. The poll reached them, so their being zero is a measurement rather than a gap - unlike registers 62-124 above, which is a distinction worth keeping straight.
+**ride0 separates register 53 from the other three**, with no charger, and without settling what any of them is. It reads 0 there and 1 in all 1614 responses of the three Captures before it - and ride0 is the Capture whose drive was disengaged, whose line current is exactly 0.00 A throughout, and whose Controller sets `drive_inhibited` in every motion frame. Two devices, two flags, one state. That is what a load-connected or discharge-MOSFET flag would do and it is not proof that it is one; what it does mean is that 53 is no longer indistinguishable from its neighbours, while 50, 52 and 54 are still constant across all four Captures.
+
+**registers 58-61 - and 58 is not always zero** - Zero in every response of both Captures. The poll reached them, so their being zero is a measurement rather than a gap - unlike registers 62-124 above, which is a distinction worth keeping straight.
 
 cap0002 makes that 1614 responses across three Captures and one real ride.
+
+ride0 breaks that. Register 58 reads a constant **18** in all 71 of its responses, where 59, 60 and 61 stay 0. It is the only Capture in the archive taken on a full Pack, which makes balancing the obvious guess - and the guess does not survive being checked: as a bitmap 18 is bits 1 and 4, and Cells 1 and 4 are among the *lowest* in the array, 4138 and 4140 mV against 4158 at the top, which is the wrong end for a balancer to be bleeding. So: not zero, not explained, and now known to move.
 
 **register 32** - Tracks register 45 but is not a copy of it: identical in every response of cap0007, and identical in 1541 of cap0002's 1546 - differing by one count in the other five. Registers 45, 46 and 32 all read 57-64 over that ride, which is 17-24 C at the same 40 offset.
 

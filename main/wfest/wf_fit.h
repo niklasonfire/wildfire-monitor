@@ -34,26 +34,23 @@
  * wf_est_consumption_at_speed() in wfest.h, which is the only thing
  * that reads these, and ADR-0005 for why it is built this way.
  *
- * THERE IS NO FIT. The coefficients below are placeholders and are
- * marked UNFITTED, in the same spirit as WF_EST_LIMP_POINT_V's
- * provisional marking and the unsettled WF_CTRL_CURRENT_LSB_PER_A.
- * WF_FIT_FITTED is 0, wf_est_consumption_at_speed() produces
- * nothing at any speed, and no figure on the Monitor rests on
- * them.
- *
- *   Why: 0 spans of road survived the exclusions, and 20 is the fewest
- *   worth fitting 2 coefficients to. The archive does not support a
- *   fit.
- *
- *   The steady-speed holds this wants are in the calibration ride,
- *   issue #6, and that ride has not happened.
+ * THE FIT BEHIND THESE NUMBERS.
+ *   R^2 0.1139 over 299 spans of road, RMS residual 26.770 Wh/km.
+ *   Supported from 20.2 to 86.8 km/h. Outside that the evaluator
+ *   flags the answer as extrapolated; it is not silently produced.
+ *   Captures that contributed: cap0002.
+ *   35 of those spans recovered energy rather than spending
+ *   it, and were kept - see the note on gradient above.
  *
  * THE ARCHIVE THIS WAS RUN OVER.
+ *   cap0002: 130397 records, 2319.0 s, 21284.6 m, 904.572 Wh, peak 85.9 km/h, 419 spans
  *   cap0007: 2668 records, 47.1 s, 21.7 m, 1.629 Wh, peak 7.3 km/h, 2 spans
+ *   ride0: 5499 records, 97.1 s, 0.0 m, 0.000 Wh, peak 0.0 km/h, 4 spans
  *
- * 2 spans closed, 0 accepted.
- *   1 excluded - incomplete: the Capture ended inside it
- *   1 excluded - stationary: never covered its span of road
+ * 425 spans closed, 299 accepted.
+ *   111 excluded - accelerating: more spread than 20 % of the mean speed, or 3.0 km/h, whichever is larger
+ *   3 excluded - incomplete: the Capture ended inside it
+ *   12 excluded - stationary: never covered its span of road
  */
 #ifndef WF_FIT_H
 #define WF_FIT_H
@@ -61,35 +58,35 @@
 /* 1 when the constants below came out of a fit over real riding, 0
  * when they are the unfitted placeholder. Everything that reads them
  * has to check this first. */
-#define WF_FIT_FITTED                0
+#define WF_FIT_FITTED                1
 
 /* The rolling and driveline term: watt-hours per kilometre at rest,
  * before any drag. */
-#define WF_FIT_A_WH_PER_KM           0.0
+#define WF_FIT_A_WH_PER_KM           22.451450807572009
 
 /* No linear term was fitted; see the tool's header comment. */
 #define WF_FIT_LINEAR                0
 #define WF_FIT_B_WH_PER_KM_PER_KMH   0.0
 
 /* The drag term: watt-hours per kilometre per (km/h) squared. */
-#define WF_FIT_C_WH_PER_KM_PER_KMH2  0.0
+#define WF_FIT_C_WH_PER_KM_PER_KMH2  0.0053165823038795017
 
 /* The speed range the data actually covers. Asking outside it is
  * extrapolation and is flagged as such - issue #20's suggested speed
  * has to be one of these. Both are zero when there is no fit, so no
  * speed at all is inside the range. */
-#define WF_FIT_SPEED_MIN_KMH         0.0
-#define WF_FIT_SPEED_MAX_KMH         0.0
+#define WF_FIT_SPEED_MIN_KMH         20.2027
+#define WF_FIT_SPEED_MAX_KMH         86.843900000000005
 
 /* How well it fits, and over how much. Constants so that a Confidence
  * figure on the screen can be built out of the fit rather than out of
  * a comment nobody compiles. */
-#define WF_FIT_R2                    0.0
-#define WF_FIT_SAMPLES               0
-#define WF_FIT_RMS_WH_PER_KM         0.0
+#define WF_FIT_R2                    0.11391774860932535
+#define WF_FIT_SAMPLES               299
+#define WF_FIT_RMS_WH_PER_KM         26.769931820820556
 
 /* The Captures that went in, so a coefficient can be traced to the
  * riding it came from. Empty when there is no fit. */
-#define WF_FIT_CAPTURES              ""
+#define WF_FIT_CAPTURES              "cap0002"
 
 #endif /* WF_FIT_H */

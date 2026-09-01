@@ -100,7 +100,13 @@ $(BUILD)/wf_fields.o: $(GEN_STAMP) | $(BUILD)
 	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) \
 	    -c $(GEN)/wf_fields.c -o $@
 
-$(BUILD)/wfest.o: $(WFEST)/wfest.c $(WFEST)/wfest.h $(GEN_STAMP) | $(BUILD)
+# wfest.h includes wf_fit.h, so the fitted coefficients are compiled into this
+# object. Naming the header here is what makes `make fit` followed by
+# `make test` mean anything: without it the estimator keeps the coefficients it
+# was last built with, the replay measures a fit nobody ran, and the drift
+# check passes against a stale binary.
+$(BUILD)/wfest.o: $(WFEST)/wfest.c $(WFEST)/wfest.h $(FIT_H) $(GEN_STAMP) \
+                  | $(BUILD)
 	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
 
 # The pure half of update mode - the manifest, its URL, and which network to
@@ -112,14 +118,14 @@ $(BUILD)/wfota.o: $(WFOTA)/wfota.c $(WFOTA)/wfota.h | $(BUILD)
 $(BUILD)/%.o: $(WFDECODE)/%.c $(GEN_STAMP) | $(BUILD)
 	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
 
-$(REPLAY): tests/host/replay.c $(PURE_OBJ) | $(BUILD)
+$(REPLAY): tests/host/replay.c $(FIT_H) $(PURE_OBJ) | $(BUILD)
 	$(CC) $(HOST_STD) $(WARN) $(OPT) $(FPDET) $(INC) \
 	    tests/host/replay.c $(PURE_OBJ) -o $@
 
 # Built with PURE_STD, not HOST_STD: it links nothing but main/wfdecode and
 # main/wfest, so it holds those seams to the same C99-and-nothing-else rule the
 # firmware needs.
-$(UNIT): tests/host/unit.c $(PURE_OBJ) | $(BUILD)
+$(UNIT): tests/host/unit.c $(FIT_H) $(PURE_OBJ) | $(BUILD)
 	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) \
 	    tests/host/unit.c $(PURE_OBJ) -o $@
 
