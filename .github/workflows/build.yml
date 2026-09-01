@@ -8,24 +8,30 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, x64]
-    # Run the build straight inside the official ESP-IDF image. The self-hosted
-    # runner is docker-in-docker, so this needs no toolchain baked into the
-    # runner image — the same image the local ./idf.sh wrapper uses.
-    container:
-      image: espressif/idf:v6.1
+    runs-on: [self-hosted, linux, x64, dind]
+    env:
+      IDF_IMAGE: espressif/idf:v6.1
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Build
-        shell: bash
+      # The build runs in the ESP-IDF image, but the *job* does not: a step
+      # running inside `container:` never receives ACTIONS_RESULTS_URL, and
+      # without it upload-artifact cannot reach the artifact backend — which is
+      # what failed every run of this workflow from b1598e7 onwards. Driving
+      # docker ourselves, the way release.yml already does on this runner,
+      # keeps the toolchain in the image and leaves the artifact upload on the
+      # runner where its environment is intact.
+      - name: Build firmware in the ESP-IDF container
         run: |
-          . "$IDF_PATH/export.sh"
-          idf.py build
+          set -eux
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" -w /project \
+            -e HOME=/tmp \
+            "$IDF_IMAGE" bash -lc 'idf.py build'
 
       - name: Collect artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wildfire_monitor-firmware
           path: |
