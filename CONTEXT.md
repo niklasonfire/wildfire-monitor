@@ -139,8 +139,10 @@ _Avoid_: certainty, status, reliability
 
 **Readout Mode**:
 The Monitor stops listening, puts up its own access point, and serves the
-Captures over HTTP so a phone or a laptop can pull them off. Bluetooth is down
-throughout, so the only way back to capturing is a reboot.
+Captures over HTTP so a phone or a laptop can pull them off. It serves the
+settings page too, which is where the networks Update Mode may join are edited
+without a cable. Bluetooth is down throughout, so the only way back to
+capturing is a reboot.
 _Avoid_: download mode, webdump, AP mode, dump mode
 
 **Update Mode**:
