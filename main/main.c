@@ -40,6 +40,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
@@ -140,11 +141,12 @@ static int cmd_info(int argc, char **argv)
     return 0;
 }
 
-/* Service Mode, and the update that runs over it. Declared up here
- * because the console reaches both without passing the menu, and main.c owns
- * the sequence either way - taking BLE down is a one-way door wherever the
- * request came from. See "Service Mode" below. `install_now` is what
- * replaces the button press the console cannot give. */
+/* Service Mode, and the update that runs over it. Declared up here because
+ * the console reaches both without passing the menu, and main.c owns the
+ * sequence either way - taking BLE down is a one-way door wherever the
+ * request came from. See "Service Mode" below. `install_now` means "and
+ * install what the check found", which on a bench is the whole of `ota
+ * install`. */
 bool        app_service_up(void);
 static bool app_service_update(bool install_now);
 
@@ -170,10 +172,13 @@ static bool app_service_update(bool install_now);
  *
  * `ota check` and `ota install` bring Service Mode up if it is not already
  * and then ask the manifest over it, so they still mean what they always did
- * even though there is now one mode rather than two (#41). Both refuse when
- * the mode fell back to the access point: there is no upstream behind it, and
- * the honest answer to "check" is that there was nothing to ask. Run `wifi
- * on` first and the mode is already up, so these are only the question.
+ * even though the mode no longer asks on its own way in. They go through the
+ * same worker the settings page's buttons do, which is what keeps the console
+ * and the phone from being shown two different manifests - and keeps one
+ * thing at a time doing TLS. Both refuse when the mode fell back to the
+ * access point: there is no upstream behind it, and the honest answer to
+ * "check" is that there was nothing to ask. Run `wifi on` first and the mode
+ * is already up, so these are only the question.
  */
 static int cmd_ota(int argc, char **argv)
 {
@@ -200,10 +205,10 @@ static int cmd_ota(int argc, char **argv)
         }
         return 0;
     } else if (argc >= 2 && strcmp(argv[1], "install") == 0) {
-        /* The menu's run without the button press nobody is there to give.
-         * This is how the update gets exercised on the bench, where the
-         * Monitor is on a cable rather than on a handlebar - and it is the
-         * only path that ends in a reboot rather than in a return. */
+        /* The settings page's two presses, without the phone nobody has on a
+         * bench. This is how the update gets exercised where the Monitor is
+         * on a cable rather than on a handlebar - and it is the only path
+         * here that ends in a reboot rather than in a return. */
         if (!app_service_up() || !app_service_update(true)) {
             printf("OTA error=install failed\n");
             return 1;
@@ -303,10 +308,16 @@ static void heartbeat_task(void *arg)
  *
  * What a station link buys on top of that is an upstream, so the update is
  * offered over it and not over the access point, where there is nowhere to
- * fetch from. Nothing about the install itself changes: the rider confirms it
- * on the device, the image is checked against the manifest before the
- * bootloader is pointed at it, and it comes up on probation with
- * ota_health.c's gates in front of it.
+ * fetch from. What the mode does *not* do any more is go and look: it comes
+ * up, starts the server and settles on the address, and the check is a button
+ * on the settings page. That is where the channel already was, and a channel
+ * saved a moment before a check that reads it is one operation rather than
+ * two separated by a reboot. Nothing about the install itself changed - the
+ * image is checked against the manifest before the bootloader is pointed at
+ * it, and it comes up on probation with ota_health.c's gates in front of it -
+ * except where the rider confirms it, which is the phone in their hand and no
+ * longer the button on the handlebar. ADR-0006's amendment says what that
+ * cost.
  */
 static bool capture_busy(const char *what)
 {
@@ -332,9 +343,10 @@ static bool s_ble_spent;
 
 /*
  * The three lines the mode leaves on the panel, kept rather than rebuilt
- * because more than one thing paints over them: the update borrows the screen
- * on the way in, and the console can borrow it again minutes later, and each
- * of those has to be able to put the address back afterwards.
+ * because more than one thing paints over them: a check asked for from the
+ * settings page borrows the screen for a few seconds, an install borrows it
+ * for a minute, and each of those has to be able to put the address back
+ * afterwards - from a task that was not there when the lines were written.
  *
  * Lines and not a role and an address, because the two links do not want the
  * same facts in the same order, or even the same three facts. Joined to a
@@ -379,6 +391,15 @@ static void update_stage(const char *l1, const char *l2)
     ui_message("UPDATE", l1, l2, NULL, NULL);
 }
 
+/* Hands webdump.c the calls behind the settings page's update buttons.
+ * Declared up here because service_enter() has to do it before the server
+ * starts, and the worker it registers lives further down with the rest of the
+ * update. */
+static bool update_ops_register(void);
+/* Whether that worker has a request in hand. Two callers here, and both are
+ * about not pulling the ground out from under it. */
+static bool update_busy(void);
+
 /* Whichever link the mode landed on. It is one or the other and never both,
  * so asking is cheaper than calling both and letting each decide it has
  * nothing to do. */
@@ -408,6 +429,18 @@ static bool service_enter(bool force_ap)
 
     if (web_running()) {
         return true;
+    }
+    if (update_busy()) {
+        /* Reached with the server down, which now has one meaning and one
+         * only: an install took it down for the length of the transfer and is
+         * a minute from either a reboot or putting it back. Coming in here
+         * meanwhile would ask the radio for a second link on top of the one
+         * the install is downloading through. Only the console can reach this
+         * - the menu is a one-way door and the page has no route to it - and
+         * it could not before the update moved off the panel, because the
+         * console was the thing doing the installing. */
+        ESP_LOGW(TAG, "refusing service mode while the update is working");
+        return false;
     }
     if (capture_busy("service mode")) {
         return false;
@@ -467,6 +500,12 @@ static bool service_enter(bool force_ap)
         snprintf(s_service_line[2], SERVICE_LINE_MAX, "http://%s", ip);
     }
 
+    /* Before the server, so the first request cannot arrive at a page whose
+     * update card is half true. A false here is not a reason to refuse the
+     * mode: the Captures and the settings page are most of what it is for,
+     * and the card says there is nothing holding the update. */
+    (void)update_ops_register();
+
     err = web_serve_start();
     if (err != ESP_OK) {
         /* A link with nothing listening on it is not this mode, so it goes
@@ -488,9 +527,21 @@ static bool service_enter(bool force_ap)
 
 /* Takes the mode down again: the server first, then the link under it. Only
  * the console calls this - from the menu the mode is a one-way door and the
- * way out is the reboot the screen offers. */
+ * way out is the reboot the screen offers.
+ *
+ * It refuses while the worker has a request in hand. That case has only
+ * existed since the update moved onto the page: the console used to be busy
+ * for the length of a check because it was the console that asked for it, and
+ * now a phone can be installing while the prompt sits there free. Pulling the
+ * link out from under a running install would leave a half-written slot and a
+ * task fetching from a radio that had gone. */
 void app_service_stop(void)
 {
+    if (update_busy()) {
+        ESP_LOGW(TAG, "refusing to stop service mode while the update is "
+                      "working");
+        return;
+    }
     web_serve_stop();
     service_link_stop();
     for (int i = 0; i < 3; i++) {
@@ -512,9 +563,10 @@ bool app_service_up(void)
  * decides whether they move the bike, open the hotspot on their phone, or go
  * and look at what was published. The second line is whatever detail the check
  * collected - an HTTP status, why the JSON was refused - and it too is words
- * rather than an esp_err_t name, which ota_update.c logs instead. The console
- * is for whoever is debugging this; the panel is for whoever is standing next
- * to the bike. */
+ * rather than an esp_err_t name, which ota_update.c logs instead. These are
+ * the page's words now as much as the panel's, which changes nothing about
+ * what they have to be: the esp_err_t stays where there is a keyboard to look
+ * it up with. */
 static const char *update_fail_line(otaup_err_t err)
 {
     switch (err) {
@@ -576,15 +628,22 @@ static const char *install_fail_line(otain_err_t err)
  * restarts into the new image, which then has sixty seconds and three gates
  * to earn its place before the bootloader takes it away again (ota_health.c).
  *
- * A failure returns false with the message already up, and nothing retries:
- * otadata still points at the running app, so the half-written slot is dead
- * weight, and the rider - who is standing right here - decides whether the
- * hotspot is worth another try (ADR-0006). The link and the server are both
- * still up underneath that message, which is the difference this mode makes:
- * a cut download leaves the settings page in reach rather than taking it
- * away.
+ * A failure returns which one it was, with the message already up and `out`
+ * carrying the detail line, and nothing retries: otadata still points at the
+ * running app, so the half-written slot is dead weight and the rider decides
+ * whether the hotspot is worth another try (ADR-0006). The link and the
+ * server are both still up underneath that message, which is the difference
+ * this mode makes: a cut download leaves the settings page in reach rather
+ * than taking it away - and now that the second attempt is a button on that
+ * page rather than one on the handlebar, that is the whole of how a rider
+ * makes it.
+ *
+ * It must not be called from an httpd handler. web_serve_stop() below is
+ * httpd_stop(), and a handler that stops its own server is a task waiting for
+ * itself to return; the mode's worker is what calls this.
  */
-static bool app_update_install(const wfota_manifest_t *m)
+static otain_err_t app_update_install(const wfota_manifest_t *m,
+                                      otain_result_t *out)
 {
     otain_result_t res;
 
@@ -601,6 +660,7 @@ static bool app_update_install(const wfota_manifest_t *m)
      * whole attempt. */
     web_serve_stop();
     otain_err_t err = otaup_install(m, &res, install_stage);
+    *out = res;
     if (err != OTAIN_OK) {
         ESP_LOGE(TAG, "install %s: %s (%s)", m->version, otain_err_str(err),
                  res.detail[0] ? res.detail : "-");
@@ -613,10 +673,12 @@ static bool app_update_install(const wfota_manifest_t *m)
             ESP_LOGE(TAG, "server did not come back: %s",
                      esp_err_to_name(werr));
         }
+        /* No button hint on the fourth line, because nothing is waiting for a
+         * press any more: the rider who started this is holding a phone, and
+         * the worker puts the address back on its own after a beat. */
         ui_message("INSTALL", install_fail_line(err),
-                   res.detail[0] ? res.detail : NULL, "not installed",
-                   "any: BACK");
-        return false;
+                   res.detail[0] ? res.detail : NULL, "not installed", NULL);
+        return err;
     }
 
     ESP_LOGW(TAG, "installed %s into %s, %" PRIu32 " bytes, sha256 %s",
@@ -628,115 +690,385 @@ static bool app_update_install(const wfota_manifest_t *m)
     ui_message("INSTALL", "DONE", m->version, "rebooting", NULL);
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
-    return true;                /* not reached */
+    return OTAIN_OK;            /* not reached */
 }
 
-/* Nothing installs without this. ADR-0006: never silent and never automatic -
- * the rider chose the mode, and now chooses the image. A screen nobody answers
- * falls away rather than installing by default, which is the same rule the
- * menu itself follows. */
-static bool update_confirmed(void)
-{
-    board_btn_evt_t evt;
+/* ---- the worker -----------------------------------------------------------
+ *
+ * The update used to be part of coming into the mode: the link came up, the
+ * server started, and the manifest was read before the address screen
+ * settled, with the offer and the install answered by button A. It is a
+ * button on the settings page now, and this is what stands behind it.
+ *
+ * Two things forbid the httpd's own task doing this work, and both of them
+ * hang rather than fail. The install stops the server before the transfer, to
+ * leave TLS, the image buffer and the OTA write the heap they need, and a
+ * handler that stops the server is a task waiting for itself to return. And
+ * the handler stack is 8 KB, sized for fread and HTML formatting, where a
+ * manifest read is an HTTP client with a TLS handshake on top of it - which
+ * is why ota_update.c already runs the fetch on a task with a stack it chose.
+ * A handler that merely *waited* for that would still be one of four sockets
+ * and the one httpd task held open for the length of a handshake.
+ *
+ * So a request is one task. It is created on the press and deletes itself
+ * when it is done, rather than sitting on a queue between two presses a rider
+ * may never make: there is at most one request in flight, so there is nothing
+ * for a permanent worker to buy except its stack. The answer is left in
+ * `s_upd` and the page reads it back on its next load, which is why a check
+ * is two page loads and not one.
+ *
+ * The panel is not the answer any more, and does not try to be. It shows the
+ * check running, because a rider standing at the bike should be able to see
+ * that a button pressed on a phone did something, and then goes back to the
+ * address - the answer is on the phone that asked for it. Only the install
+ * keeps the panel, and it keeps it for the whole minute: the percentage is
+ * the one thing this server cannot show, because it is not running.
+ */
+/* The fetch and the write are on ota_update.c's own task, so what is left
+ * here is an otaup_result_t on the stack, an otain_result_t beside it and a
+ * handful of snprintf. */
+#define UPDATE_STACK     4096
+#define UPDATE_PRIO      4      /* the button task's, which is what it replaces */
+/*
+ * How long the install waits before taking the server down. httpd_stop()
+ * cannot run until the handler that asked for this has returned - it is the
+ * httpd task that is inside it - so this is not the handler's return being
+ * waited for; it is the last of that response leaving the socket afterwards.
+ * A kilobyte over a link in the same room does not need a second, and against
+ * a minute of downloading nobody notices one.
+ */
+#define INSTALL_GRACE_MS 1000
+/* How long a failure stays on the panel before the address comes back. Long
+ * enough to read three words off a bike, short enough that a rider who walks
+ * back finds the address rather than a stale complaint - which the page is
+ * still holding anyway. */
+#define UPDATE_PANEL_MS  5000
+/* The console's patience, and only the console's: the page never waits. A
+ * check is twenty seconds at worst and an install is a download, so this is a
+ * bound on a worker that has stopped answering rather than a timeout anything
+ * is expected to reach. */
+#define UPDATE_WAIT_MS   180000
 
-    if (!board_btn_wait(&evt, MENU_IDLE_MS)) {
-        return false;
+/* All five guarded by the mutex: the worker writes them and the httpd task
+ * reads them, and a web_upd_status_t is three fields that have to agree. */
+static SemaphoreHandle_t s_upd_mtx;
+static web_upd_status_t  s_upd;
+static wfota_manifest_t  s_upd_offer;
+static bool              s_upd_have_offer;
+static bool              s_upd_busy;
+
+static void upd_lock(void)
+{
+    xSemaphoreTake(s_upd_mtx, portMAX_DELAY);
+}
+
+static void upd_unlock(void)
+{
+    xSemaphoreGive(s_upd_mtx);
+}
+
+/* NULL for either string means "nothing to say", not "leave what was there":
+ * a stale detail line under a fresh answer would read as part of it. */
+static void update_status_set(web_upd_state_t st, const char *text,
+                              const char *detail)
+{
+    upd_lock();
+    s_upd.state = st;
+    snprintf(s_upd.text, sizeof(s_upd.text), "%s", text != NULL ? text : "");
+    snprintf(s_upd.detail, sizeof(s_upd.detail), "%s",
+             detail != NULL ? detail : "");
+    upd_unlock();
+}
+
+static void service_update_status(web_upd_status_t *out)
+{
+    upd_lock();
+    *out = s_upd;
+    upd_unlock();
+}
+
+static bool update_busy(void)
+{
+    bool busy;
+
+    if (s_upd_mtx == NULL) {
+        return false;               /* no worker was ever registered */
     }
-    return evt.btn == BOARD_BTN_A_ID && evt.press == BOARD_PRESS_SHORT;
+    upd_lock();
+    busy = s_upd_busy;
+    upd_unlock();
+    return busy;
 }
 
 /*
- * The update, over the link the mode came up on. It is its own function and
- * not part of service_enter() because it answers a different question - is the
- * published version a different one from this - and because it can be asked
- * again over a link that is already up, which is what `ota check` is for.
- *
- * `install_now` replaces the button press the console cannot give.
- *
- * Every path here ends by putting the address screen back, because the mode
- * outlives the update: whatever the answer was, the rider is left where they
- * were, on a page they can still reach. False means the question could not be
- * answered - no upstream, no manifest - or that an accepted install did not
- * happen. A version that matches is a true: the check worked, and the answer
- * was no.
+ * The check. The channel is read inside otaup_manifest_check(), on this task
+ * and at this moment, which is the point of moving the check off the way in:
+ * a channel saved on the settings page a moment ago is the one this resolves.
  */
-static bool app_service_update(bool install_now)
+static void update_do_check(void)
 {
-    otaup_result_t  res;
-    board_btn_evt_t evt;
+    otaup_result_t res;
+    otaup_err_t    uerr = otaup_manifest_check(&res, update_stage);
 
-    if (!web_running() || !otaup_running()) {
-        /* The access point has no route anywhere, so there is nothing to ask.
-         * Only the console gets here - app_service_enter() offers the update
-         * only when there is a link to offer it over - so it is a log line
-         * and not a screen. A message screen here would paint over the
-         * address the rider is reading and then hold the console for ten
-         * seconds waiting for a button nobody is standing next to. */
-        ESP_LOGW(TAG, "no upstream to check: the Monitor is its own "
-                      "access point");
-        return false;
-    }
-
-    otaup_err_t uerr = otaup_manifest_check(&res, update_stage);
     if (uerr != OTAUP_OK) {
         /* The link is still up and the pages are still served: only the
-         * update is off the table, so this is a message and not the end of
-         * the mode. */
+         * update is off the table, so this is a line on the page and not the
+         * end of the mode. */
         ESP_LOGE(TAG, "update: %s (%s)", otaup_err_str(uerr),
                  res.detail[0] ? res.detail : "-");
-        ui_message("UPDATE", update_fail_line(uerr),
-                   res.detail[0] ? res.detail : NULL, NULL, "any: BACK");
-        (void)board_btn_wait(&evt, MENU_IDLE_MS);
-        service_screen();
-        return false;
-    }
-
-    if (!res.differs) {
+        upd_lock();
+        s_upd_have_offer = false;
+        upd_unlock();
+        update_status_set(WEB_UPD_FAILED, update_fail_line(uerr), res.detail);
+    } else if (!res.differs) {
         ESP_LOGI(TAG, "update: %s is current, from %s at %s", res.running,
                  res.ssid, res.ip);
-        /* A beat rather than a screen. There is nothing to decide, and the
-         * address the rider came for is waiting underneath it - but the
-         * question was worth asking out loud, or a Monitor that looked and a
-         * Monitor that did not would look the same. */
-        ui_message("UPDATE", "UP TO DATE", res.running, NULL, "any: BACK");
-        (void)board_btn_wait(&evt, MENU_REFUSE_MS);
-        service_screen();
-        return true;
+        upd_lock();
+        s_upd_have_offer = false;
+        upd_unlock();
+        update_status_set(WEB_UPD_CURRENT, res.running, NULL);
+    } else {
+        /* Named, not judged: versions are compared for inequality, so the tag
+         * on offer may be older than the one running and installing it is the
+         * same operation either way (ADR-0006). */
+        ESP_LOGI(TAG, "update: %s on offer, running %s", res.manifest.version,
+                 res.running);
+        upd_lock();
+        s_upd_offer      = res.manifest;
+        s_upd_have_offer = true;
+        upd_unlock();
+        update_status_set(WEB_UPD_OFFER, res.manifest.version, NULL);
     }
-
-    /* Named, not judged: versions are compared for inequality, so the tag on
-     * offer may be older than the one running and installing it is the same
-     * operation either way. */
-    ESP_LOGI(TAG, "update: %s on offer, running %s", res.manifest.version,
-             res.running);
-    ui_message("UPDATE", "ON OFFER", res.manifest.version,
-               install_now ? "installing" : NULL,
-               install_now ? NULL : "A: INSTALL  B: BACK");
-
-    if (!install_now && !update_confirmed()) {
-        ESP_LOGI(TAG, "update: %s was offered and not installed",
-                 res.manifest.version);
-        service_screen();
-        return true;
-    }
-
-    /* Downloaded through the link the join deliberately left up. This returns
-     * only if the install did not happen; otherwise the Monitor is already
-     * restarting into the new image. */
-    if (app_update_install(&res.manifest)) {
-        return true;                /* not reached */
-    }
-    /* The message on the panel is the install's own. */
-    (void)board_btn_wait(&evt, MENU_IDLE_MS);
+    /* Straight back to the address, with no beat on the answer: the rider who
+     * pressed the button is looking at the page it is printed on, and the one
+     * thing the panel has that the page has not is the address to reach the
+     * page by. */
     service_screen();
+}
+
+/*
+ * The install. It works from a copy of the manifest rather than from the live
+ * one, because the check that replaces it can start the moment this task
+ * clears the busy flag, and an install reading a manifest another check is
+ * writing would be a download of one release checked against another.
+ */
+static void update_do_install(void)
+{
+    wfota_manifest_t m;
+    otain_result_t   res;
+    otain_err_t      ierr;
+
+    upd_lock();
+    m = s_upd_offer;
+    upd_unlock();
+
+    vTaskDelay(pdMS_TO_TICKS(INSTALL_GRACE_MS));
+
+    /* Returns only if the install did not happen; otherwise the Monitor is
+     * already restarting into the new image. */
+    ierr = app_update_install(&m, &res);
+    ESP_LOGW(TAG, "install of %s did not happen: %s", m.version,
+             otain_err_str(ierr));
+    update_status_set(WEB_UPD_FAILED, install_fail_line(ierr), res.detail);
+    /* app_update_install() has already brought the server back up, so the
+     * page carrying that answer is in reach again. The panel keeps the
+     * failure for a beat first, because the rider who was watching the
+     * percentage is watching the panel. */
+    vTaskDelay(pdMS_TO_TICKS(UPDATE_PANEL_MS));
+    service_screen();
+}
+
+static void update_worker(void *arg)
+{
+    if (arg != NULL) {
+        update_do_install();
+    } else {
+        update_do_check();
+    }
+    upd_lock();
+    s_upd_busy = false;
+    upd_unlock();
+    vTaskDelete(NULL);
+}
+
+/*
+ * Takes a request or refuses it, and never queues one: a second press while
+ * the first is still running is a rider who did not see the page change, and
+ * answering it with "busy" is more honest than doing the same thing twice.
+ *
+ * The busy flag and the state go up together, before the task exists, so the
+ * page a 303 sends the browser back to is already showing the new state even
+ * if the worker has not been scheduled yet.
+ */
+static bool update_request(bool install)
+{
+    if (s_upd_mtx == NULL) {
+        return false;               /* nothing registered; see below */
+    }
+    upd_lock();
+    if (s_upd_busy || (install && !s_upd_have_offer)) {
+        upd_unlock();
+        return false;
+    }
+    s_upd_busy  = true;
+    s_upd.state = install ? WEB_UPD_INSTALLING : WEB_UPD_BUSY;
+    snprintf(s_upd.text, sizeof(s_upd.text), "%s",
+             install ? s_upd_offer.version : "");
+    s_upd.detail[0] = '\0';
+    upd_unlock();
+
+    if (xTaskCreate(update_worker, "svcupdate", UPDATE_STACK,
+                    (void *)(uintptr_t)install, UPDATE_PRIO, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "the update worker would not start");
+        upd_lock();
+        s_upd_busy = false;
+        upd_unlock();
+        update_status_set(WEB_UPD_FAILED, "no task", NULL);
+        return false;
+    }
+    return true;
+}
+
+static bool service_update_check(void)
+{
+    return update_request(false);
+}
+
+static bool service_update_install(void)
+{
+    return update_request(true);
+}
+
+static const web_update_ops_t k_update_ops = {
+    .check   = service_update_check,
+    .install = service_update_install,
+    .status  = service_update_status,
+};
+
+/*
+ * Lends the server the three calls above, before the server exists to use
+ * them. The mutex is the only thing here that can fail, and it fails by the
+ * page saying there is nothing holding the update rather than by the mode
+ * refusing to come up - a Monitor that cannot allocate a mutex still serves
+ * the Captures and the settings page, which is most of what the mode is for.
+ *
+ * Every entry starts the page at "nothing asked yet". An answer from the last
+ * time the mode was up would be about a link that is no longer the same one,
+ * and an offer read then is one this Monitor may already be running.
+ */
+static bool update_ops_register(void)
+{
+    if (s_upd_mtx == NULL) {
+        s_upd_mtx = xSemaphoreCreateMutex();
+        if (s_upd_mtx == NULL) {
+            ESP_LOGE(TAG, "no mutex for the update worker: the settings page "
+                          "will not offer one");
+            return false;
+        }
+    }
+    upd_lock();
+    s_upd_have_offer = false;
+    upd_unlock();
+    update_status_set(WEB_UPD_IDLE, NULL, NULL);
+    web_update_ops(&k_update_ops);
+    return true;
+}
+
+/* Polls, because the worker has no completion object to wait on and the page
+ * - its other caller - never waits for one. Adding a semaphore for the
+ * console alone would be a second way for the worker to end and a second
+ * thing for it to get wrong on the way out. */
+static bool update_wait(web_upd_status_t *out)
+{
+    for (int waited = 0; waited < UPDATE_WAIT_MS; waited += 100) {
+        bool busy;
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+        upd_lock();
+        busy = s_upd_busy;
+        *out = s_upd;
+        upd_unlock();
+        if (!busy) {
+            return true;
+        }
+    }
+    ESP_LOGE(TAG, "the update worker has not finished in %d s",
+             UPDATE_WAIT_MS / 1000);
     return false;
 }
 
 /*
- * What the menu calls, and it does both halves: the rider standing at the bike
- * has no second command to type, so the mode comes up and, if it came up on
- * somebody's network, the update is offered before the screen settles on the
- * address.
+ * `ota check` and `ota install`, which is all this is now. The question it
+ * asks is the page's question, asked through the same worker and answered out
+ * of the same status, so the console cannot see a different manifest from the
+ * one the phone was shown - and so there is one thing at a time doing TLS.
+ *
+ * `install_now` used to replace the button press the console cannot give.
+ * There is no button press to replace any more; it now means "and install
+ * what the check found", which is what `ota install` on a bench always meant
+ * and is the only path here that ends in a reboot rather than in a return.
+ *
+ * False means the question could not be asked - no upstream, a worker already
+ * busy - or that it was asked and the answer was a failure. A version that
+ * matches is true: the check worked, and the answer was no.
+ */
+static bool app_service_update(bool install_now)
+{
+    web_upd_status_t st;
+
+    if (!otaup_running()) {
+        /* The access point has no route anywhere, so there is nothing to ask.
+         * Only the console gets here - the settings page does not draw the
+         * button over a fallback link - so it is a log line and not a screen.
+         * A message screen here would paint over the address the rider is
+         * reading in order to tell a console nobody is watching. */
+        ESP_LOGW(TAG, "no upstream to check: the Monitor is its own "
+                      "access point");
+        return false;
+    }
+    /* A worker already busy is the other way this fails, and it is the case
+     * that has arrived since the update moved onto the page: the console is
+     * free while a phone is installing, where before both were the same
+     * thumb. update_request() refuses it rather than queueing a second. */
+    if (!update_request(false) || !update_wait(&st)) {
+        ESP_LOGW(TAG, "the check was not asked, or did not come back");
+        return false;
+    }
+
+    switch (st.state) {
+    case WEB_UPD_CURRENT:
+        printf("check      up to date, %s\n", st.text);
+        return true;
+    case WEB_UPD_OFFER:
+        printf("check      %s on offer\n", st.text);
+        break;
+    default:
+        printf("check      failed: %s%s%s\n", st.text,
+               st.detail[0] ? " - " : "", st.detail);
+        return false;
+    }
+
+    if (!install_now) {
+        return true;
+    }
+    if (!update_request(true) || !update_wait(&st)) {
+        ESP_LOGW(TAG, "the install was not asked, or did not come back");
+        return false;
+    }
+    /* Only a failure comes back: a successful install restarted the board. */
+    printf("install    failed: %s%s%s\n", st.text,
+           st.detail[0] ? " - " : "", st.detail);
+    return false;
+}
+
+/*
+ * What the menu calls, and it does one thing: the mode comes up, and the
+ * screen settles on the address. It used to read the manifest on the way in
+ * too, so that a rider standing at the bike with nothing to type was offered
+ * the update before anything else happened. The offer is on the settings page
+ * now, so the first thing the rider reaches is the page - which is also the
+ * only place the channel can be changed, and the reason the two had to end up
+ * together.
  *
  * B still down when A picked the entry forces the access point. In practice
  * that is the opening long-press never released: SERVICE is the first entry,
@@ -754,13 +1086,7 @@ static bool app_service_update(bool install_now)
  */
 static bool app_service_enter(void)
 {
-    if (!service_enter(board_btn_b())) {
-        return false;
-    }
-    if (otaup_running()) {
-        (void)app_service_update(false);
-    }
-    return true;
+    return service_enter(board_btn_b());
 }
 
 /* ---- the info page ------------------------------------------------------

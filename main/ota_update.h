@@ -9,14 +9,21 @@
  * and its SHA-256 against the manifest, and only then points the bootloader
  * at it. Whether it stays pointed there is main/ota_health.c's question.
  *
- * Those are three calls and not one, because the Monitor now has one Wi-Fi
- * mode rather than two (#41) and only the first of the three is what that
- * mode needs to be up. main.c asks for the link; if it gets one, the server
- * in webdump.c goes on top of it and the update is on offer, and if it does
- * not, the same server goes on top of the access point webdump.c puts up
- * instead. So a failure here is a fallback and not a dead end - which is the
- * thing that keeps a rotated hotspot key from costing a rider the cable
- * ADR-0006 exists to avoid.
+ * Those are three calls and not one, because the Monitor has one Wi-Fi mode
+ * rather than two (#41) and only the first of the three is what that mode
+ * needs to be up. main.c asks for the link; if it gets one, the server in
+ * webdump.c goes on top of it and the update is on offer, and if it does not,
+ * the same server goes on top of the access point webdump.c puts up instead.
+ * So a failure here is a fallback and not a dead end - which is the thing
+ * that keeps a rotated hotspot key from costing a rider the cable ADR-0006
+ * exists to avoid.
+ *
+ * The separation earns its keep a second time now that the check and the
+ * install are buttons on the settings page rather than something the mode
+ * does on its way in. Neither of the last two calls is made until a rider
+ * asks, and both are made from a worker main.c owns rather than from the
+ * httpd task, which is the caller's problem and not this file's - but it is
+ * why "the rider then says so" now means a press on a phone.
  *
  * Wi-Fi and NimBLE do not fit in this chip's RAM together, so the caller
  * takes BLE down first and the only way back to capturing is a reboot. A

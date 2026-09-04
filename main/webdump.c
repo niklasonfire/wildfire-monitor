@@ -9,11 +9,12 @@
  *
  * The same server carries the settings page, because a phone already joined
  * to pull a capture off is the one place on this bike a rider can type. What
- * it settles is the list of networks the Monitor may join, and the channel
- * the next update reads - ADR-0006 asked that a provisioning screen find its
- * way into wifi_store rather than start a second store, and this is that way
- * in. Passphrases go in and are never rendered back out; the page counts
- * their characters the way `wifi list` does on the console.
+ * it settles is the list of networks the Monitor may join, the channel a
+ * check reads, and - since the update came off the panel - the check and the
+ * install themselves. ADR-0006 asked that a provisioning screen find its way
+ * into wifi_store rather than start a second store, and this is that way in.
+ * Passphrases go in and are never rendered back out; the page counts their
+ * characters the way `wifi list` does on the console.
  *
  * Two halves, and the split is the point (#41). web_ap_start() puts up the
  * SoftAP - one netif, one DHCP server, one WPA2 key - and web_serve_start()
@@ -25,9 +26,14 @@
  *
  * On the access point there is no authentication beyond the pre-shared key,
  * and on a joined network there is none at all - anyone else on the rider's
- * hotspot can reach these pages. That is the same bargain either way: what is
- * on offer is a recording of a bike and a list of SSIDs, and the one secret
- * in reach, a stored passphrase, never leaves the board.
+ * hotspot can reach these pages. What is on offer is a recording of a bike, a
+ * list of SSIDs whose one secret never leaves the board, and now the update:
+ * anyone who can reach the settings page can install a release over the
+ * running firmware. That last is bounded by the chain that was already there
+ * rather than by anything here - a manifest fetched over TLS from a public
+ * GitHub release, an image checked by length and SHA-256 before the
+ * bootloader is pointed at it - so it is the ability to force a *published*
+ * build and not to run one of somebody's own. See ADR-0006's amendment.
  *
  * BLE is already down when either half starts - the caller does that with
  * cap_ble_shutdown() - because NimBLE and Wi-Fi do not fit in RAM together on
@@ -76,6 +82,17 @@ static esp_netif_t *s_netif;
 static esp_event_handler_instance_t s_wifi_evt;
 static bool s_wifi_inited;
 static bool s_ap_running;
+
+/* What the mode lends this server so the settings page can carry the update
+ * without doing any of it (webdump.h). The mode registers it before
+ * web_serve_start(), so no request can find it half-written; NULL means
+ * nobody is holding the update and the page offers nothing. */
+static const web_update_ops_t *s_update_ops;
+
+void web_update_ops(const web_update_ops_t *ops)
+{
+    s_update_ops = ops;
+}
 
 /* ------------------------------------------------------------------ utils */
 
@@ -153,7 +170,7 @@ static const char k_head_a[] =
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>wildfire ";
 static const char k_head_b[] =
-    "</title><style>"
+    "<style>"
     "body{font-family:system-ui,sans-serif;margin:0;padding:16px;"
     "background:#111;color:#eee}"
     "h1{font-size:20px;margin:0 0 4px}"
@@ -199,16 +216,52 @@ static const char k_nav_settings[] =
 static const char k_nav_captures[] =
     "<p class=\"nav\"><a href=\"/\">&lsaquo; captures</a></p>";
 
-/* The word after "wildfire" is both the tab title and the heading, so it goes
- * out twice; `nav` is the link to the page this one is not. */
-static esp_err_t send_head(httpd_req_t *req, const char *title, const char *nav)
+/*
+ * A zero-length chunk is the *terminating* chunk of a chunked response, so an
+ * empty string handed to httpd_resp_sendstr_chunk() ends the page instead of
+ * adding nothing to it - and the rest of the markup then goes out after the
+ * end of the body, where a browser shows the half of the page it got. Every
+ * dynamic string below goes through here for that reason: the guard belongs
+ * at the one place rather than at each of the callers that might one day have
+ * nothing to say.
+ */
+static esp_err_t send_text(httpd_req_t *req, const char *s)
 {
+    return s[0] != '\0' ? httpd_resp_sendstr_chunk(req, s) : ESP_OK;
+}
+
+/*
+ * The word after "wildfire" is both the tab title and the heading, so it goes
+ * out twice; `nav` is the link to the page this one is not, and NULL for a
+ * page with nowhere to send anybody.
+ *
+ * `refresh_s` puts a meta refresh in the head, and is zero on every page that
+ * has nothing moving in it. It is how the settings page waits for an answer
+ * the worker has not produced yet: no script, no fetch, nothing that needs a
+ * browser newer than whatever is on the rider's phone - the page simply asks
+ * for itself again until the state it is showing stops being "busy". A
+ * refresh and not a long-poll, because a held-open request is one of four
+ * sockets and one httpd task tied up for the length of a TLS handshake, which
+ * is exactly the thing the worker exists to keep off this server.
+ */
+static esp_err_t send_head(httpd_req_t *req, const char *title, const char *nav,
+                           int refresh_s)
+{
+    char      meta[48];
     esp_err_t err;
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     err = httpd_resp_sendstr_chunk(req, k_head_a);
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, title);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, "</title>");
+    }
+    if (err == ESP_OK && refresh_s > 0) {
+        snprintf(meta, sizeof(meta),
+                 "<meta http-equiv=\"refresh\" content=\"%d\">", refresh_s);
+        err = httpd_resp_sendstr_chunk(req, meta);
     }
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, k_head_b);
@@ -219,7 +272,7 @@ static esp_err_t send_head(httpd_req_t *req, const char *title, const char *nav)
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, "</h1>");
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK && nav != NULL) {
         err = httpd_resp_sendstr_chunk(req, nav);
     }
     return err;
@@ -260,7 +313,7 @@ static esp_err_t index_get(httpd_req_t *req)
         snprintf(sub, sizeof(sub), "<p class=\"sub\">%d capture(s)</p>", count);
     }
 
-    err = send_head(req, "captures", k_nav_settings);
+    err = send_head(req, "captures", k_nav_settings, 0);
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, sub);
     }
@@ -423,6 +476,19 @@ static esp_err_t rm_post(httpd_req_t *req)
  * spent guarding a URL this firmware has no way to construct.
  */
 #define WEB_URL_ESC_MAX (2 * WFOTA_URL_MAX + 1)
+/*
+ * An escaped field of the update status - the version, or the detail line -
+ * at the true worst case of every character becoming "&quot;". Both fields
+ * are tens of bytes, so the honest worst case costs a quarter of a kilobyte
+ * and is worth having: unlike the manifest URL, `text` really can be a string
+ * this firmware took off the network.
+ */
+#define WEB_UPD_ESC_MAX (6 * 40 + 1)
+/* How long the settings page waits before asking for itself again while a
+ * check is running. Two seconds is under the time the fetch takes and over
+ * the time the page takes to build, so the rider sees one or two reloads and
+ * then the answer. */
+#define WEB_UPD_REFRESH_S 2
 /* A decoded field. Comfortably longer than either the SSID or the passphrase
  * wifi_store will take, so that something one character too long comes back as
  * a length wifi_store_add() complains about rather than as a form the server
@@ -440,10 +506,16 @@ static const struct {
     { "full",    "The list is full. Forget one to make room." },
     { "missing", "That network was not stored; it may already be gone." },
     { "form",    "That form could not be read." },
-    { "chan",    "Update channel saved. The next update will read it." },
+    { "chan",    "Update channel saved. Check for updates and it is the one "
+                 "that gets read." },
     { "badchan", "This firmware has no channel by that name. The channel "
                  "is unchanged." },
     { "flash",   "Writing to flash failed. The list is unchanged." },
+    { "busy",    "The Monitor is still working on the last request. Give it "
+                 "a moment and ask again." },
+    { "noup",    "This link has nothing upstream of it, so there is no "
+                 "manifest to read." },
+    { "nooffer", "Nothing is on offer to install. Check for updates first." },
 };
 
 static const char k_add_form[] =
@@ -460,20 +532,26 @@ static const char k_list_full[] =
     "<p class=\"e\">The list is full. Forget one to add another.</p>";
 
 static const char k_settings_note[] =
-    /* The manifest is read on the way into the mode, before this page
-     * exists to be opened, so a channel saved here cannot be the one that
-     * was just read. There is deliberately no "check now" button - the
-     * install has to be confirmed on the device (ADR-0006), so a button
-     * here could only start something the rider would then have to walk
-     * back to the bike to answer. Saying so is the only way a rider learns
-     * that saving a channel and walking away changed nothing yet. */
-    "<p class=\"e\">A channel is read when this mode starts and looks for an "
-    "update, which has already happened by the time this page is open. Save "
-    "one here and it is read the next time the mode is entered.</p>"
+    /* This used to say the opposite, and it was true when it said it: the
+     * mode checked on its way in, before the page existed to be opened, and
+     * there was deliberately no button here because the install was confirmed
+     * by a press on the Monitor. Both halves of that have gone. The check is
+     * on demand, so the channel is read when the button below is pressed and
+     * not when the mode started, which is what makes saving one take effect
+     * at once; and the install is confirmed here, because a rider who has
+     * just picked a channel on a phone should not have to walk back to the
+     * bike to answer a question the phone asked. What that costs is in
+     * ADR-0006's amendment, and the second paragraph says the short version:
+     * reaching this page is now the whole of the authority to install a
+     * published release. */
+    "<p class=\"e\">The channel is read at the moment the check runs, so one "
+    "saved here takes effect on the next press and not on the next entry into "
+    "this mode.</p>"
     "<p class=\"e\">A passphrase is stored unencrypted and is never shown "
     "back, only counted - long enough to spot a typo by. Anyone who can reach "
-    "this page can change this list: the access point's shared key, or the "
-    "rider's own network, is the whole of what stands in front of it.</p>";
+    "this page can change this list, and can install a published release over "
+    "the running firmware: the access point's shared key, or the rider's own "
+    "network, is the whole of what stands in front of it.</p>";
 
 /* The banner above the list, or NULL for no banner. What arrives on the query
  * string is only ever looked up in the table, so nothing a client sends can
@@ -647,15 +725,190 @@ static bool read_body(httpd_req_t *req, char *buf, size_t cap)
 
 /* 303 so the reload after a POST is a plain GET, as on the listing page. The
  * Location string is referenced and not copied, so it has to outlive the
- * send - which it does, being this function's own buffer. */
+ * send - which it does, being this function's own buffer. A NULL code is a
+ * POST whose answer is the page's own state rather than a banner: the check
+ * button is that, because what it did is written in the update card and
+ * saying it twice would only be a sentence the next reload has to clear. */
 static esp_err_t redirect_settings(httpd_req_t *req, const char *code)
 {
     char loc[40];
 
-    snprintf(loc, sizeof(loc), "/settings?m=%s", code);
+    if (code != NULL) {
+        snprintf(loc, sizeof(loc), "/settings?m=%s", code);
+    } else {
+        snprintf(loc, sizeof(loc), "/settings");
+    }
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", loc);
     return httpd_resp_send(req, "", 0);
+}
+
+/*
+ * The update card: what the last request answered, and the buttons that ask
+ * the next one. It sits under the channel form because that is the order the
+ * two are used in - pick the stream, then ask it what it has - and because
+ * the channel is read at the moment the check runs, so the pair on this page
+ * is one operation rather than two separated by a reboot.
+ *
+ * Neither button does any of the work. Both post to a route that hands the
+ * mode a request and answers at once, so the answer arrives on a later load
+ * of this page; while there is a request in hand the head carries a meta
+ * refresh and this page fetches itself until the state settles.
+ *
+ * otaup_running() is the whole of "is there a link that can reach GitHub":
+ * the mode is a station or it is its own access point, never both, and an
+ * access point has no route anywhere. On the fallback the card says that
+ * instead of offering a button that could only fail.
+ *
+ * Everything printed out of the status is escaped. `text` is usually a
+ * version out of a manifest fetched over the network, and while
+ * wfota_tag_ok() refuses every character esc_html() expands, a version that
+ * reached the markup unescaped would be this page's one hole rather than a
+ * theory about one.
+ */
+static esp_err_t send_update_card(httpd_req_t *req, const web_upd_status_t *upd)
+{
+    char      esc[WEB_UPD_ESC_MAX];
+    esp_err_t err;
+
+    err = httpd_resp_sendstr_chunk(req,
+              "<div class=\"c\"><div class=\"n\">update</div>"
+              "<div class=\"m\">");
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (s_update_ops == NULL) {
+        /* The mode registers its worker before it starts this server, so
+         * reaching here means the registration itself failed - out of heap on
+         * the way in. Nothing to press, and the log carries the reason. */
+        return httpd_resp_sendstr_chunk(req,
+                   "Nothing on this Monitor is holding the update, so there "
+                   "is nothing to ask. The log says why.</div></div>");
+    }
+    if (!otaup_running()) {
+        return httpd_resp_sendstr_chunk(req,
+                   "The Monitor is serving this page from its own access "
+                   "point, which has nothing upstream of it, so there is no "
+                   "manifest to read. Add the network you want it to join "
+                   "below: the next entry into Service Mode joins it, and the "
+                   "check appears here.</div></div>");
+    }
+
+    switch (upd->state) {
+    case WEB_UPD_IDLE:
+        err = httpd_resp_sendstr_chunk(req,
+                  "Nothing has been asked yet. The check reads the manifest "
+                  "for the channel above, over this link, and takes a few "
+                  "seconds.");
+        break;
+
+    case WEB_UPD_BUSY:
+        err = httpd_resp_sendstr_chunk(req,
+                  "Reading the manifest. This page asks for itself again "
+                  "until there is an answer.");
+        break;
+
+    case WEB_UPD_CURRENT:
+        esc_html(upd->text, esc, sizeof(esc));
+        err = httpd_resp_sendstr_chunk(req, "Up to date: ");
+        if (err == ESP_OK) {
+            err = send_text(req, esc);
+        }
+        if (err == ESP_OK) {
+            err = httpd_resp_sendstr_chunk(req,
+                      " is both what is running and what is published.");
+        }
+        break;
+
+    case WEB_UPD_OFFER:
+        esc_html(upd->text, esc, sizeof(esc));
+        err = send_text(req, esc);
+        if (err == ESP_OK) {
+            /* Named and not judged, the same way the panel used to name it:
+             * versions are compared for inequality, so the tag on offer can
+             * be older than the one running and installing it is the same
+             * operation either way (ADR-0006). */
+            err = httpd_resp_sendstr_chunk(req,
+                      " is on offer. Versions are compared for inequality "
+                      "and never for order, so this may be older than what is "
+                      "running; installing it is the same operation either "
+                      "way.");
+        }
+        break;
+
+    case WEB_UPD_INSTALLING:
+        esc_html(upd->text, esc, sizeof(esc));
+        err = httpd_resp_sendstr_chunk(req, "Installing ");
+        if (err == ESP_OK) {
+            err = send_text(req, esc);
+        }
+        if (err == ESP_OK) {
+            err = httpd_resp_sendstr_chunk(req,
+                      ". The Monitor's screen carries the percentage. This "
+                      "server is down for the transfer and comes back only if "
+                      "the install fails; one that succeeds reboots into the "
+                      "new firmware.");
+        }
+        break;
+
+    case WEB_UPD_FAILED:
+        esc_html(upd->text, esc, sizeof(esc));
+        err = httpd_resp_sendstr_chunk(req, "That did not finish: ");
+        if (err == ESP_OK) {
+            err = send_text(req, esc);
+        }
+        if (err == ESP_OK && upd->detail[0] != '\0') {
+            esc_html(upd->detail, esc, sizeof(esc));
+            err = httpd_resp_sendstr_chunk(req, " - ");
+            if (err == ESP_OK) {
+                err = send_text(req, esc);
+            }
+        }
+        if (err == ESP_OK) {
+            /* True of a cut download as much as of a refused manifest: the
+             * boot partition is switched last and only after the length and
+             * the SHA-256 agree, so a failure anywhere before that leaves
+             * otadata pointing at the running app. */
+            err = httpd_resp_sendstr_chunk(req,
+                      ". Nothing was installed and the running firmware is "
+                      "untouched.");
+        }
+        break;
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, "</div>");
+    }
+
+    /* Withheld only while the worker has a request in hand, so a second press
+     * cannot arrive at a refusal this page would then have to explain. In
+     * every settled state it stays, because "ask again" is what a rider does
+     * after saving a channel. */
+    if (err == ESP_OK && upd->state != WEB_UPD_BUSY &&
+        upd->state != WEB_UPD_INSTALLING) {
+        err = httpd_resp_sendstr_chunk(req,
+                  "<form method=\"post\" action=\"/ota/check\">"
+                  "<button class=\"ok\" type=\"submit\">check for updates"
+                  "</button></form>");
+    }
+    if (err == ESP_OK && upd->state == WEB_UPD_OFFER) {
+        /* Red, like the other two buttons on this server that cannot be
+         * undone from a phone: this is the press that points the bootloader
+         * at another image. */
+        esc_html(upd->text, esc, sizeof(esc));
+        err = httpd_resp_sendstr_chunk(req,
+                  "<form method=\"post\" action=\"/ota/install\">"
+                  "<button type=\"submit\">install ");
+        if (err == ESP_OK) {
+            err = send_text(req, esc);
+        }
+        if (err == ESP_OK) {
+            err = httpd_resp_sendstr_chunk(req, "</button></form>");
+        }
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, "</div>");
+    }
+    return err;
 }
 
 static esp_err_t settings_get(httpd_req_t *req)
@@ -664,11 +917,23 @@ static esp_err_t settings_get(httpd_req_t *req)
     char        esc[WEB_ESC_MAX], sub[112], key[48], row[768];
     char        chan[WFOTA_CHANNEL_MAX + 1];
     char        url[WFOTA_URL_MAX + 1], urlesc[WEB_URL_ESC_MAX];
+    web_upd_status_t upd = {.state = WEB_UPD_IDLE, .text = "", .detail = ""};
     const char *cur = WFOTA_CHANNEL_STABLE;
     const char *cname, *urltext;
     const char *msg = msg_for(req);
     esp_err_t   err;
+    int         refresh = 0;
     int         n;
+
+    /* Read before a byte of the page goes out, because it decides what goes
+     * in the head: a check that is still running wants the meta refresh, and
+     * every other state wants the page to sit still. */
+    if (s_update_ops != NULL) {
+        s_update_ops->status(&upd);
+    }
+    if (upd.state == WEB_UPD_BUSY) {
+        refresh = WEB_UPD_REFRESH_S;
+    }
 
     /* Deliberately not gated on store_ready(): the network list has nothing to
      * do with the capture store, and a board whose store will not mount is
@@ -700,7 +965,7 @@ static esp_err_t settings_get(httpd_req_t *req)
         urltext = "an address this build could not assemble";
     }
 
-    err = send_head(req, "settings", k_nav_captures);
+    err = send_head(req, "settings", k_nav_captures, refresh);
     if (err == ESP_OK) {
         snprintf(sub, sizeof(sub),
                  "<p class=\"sub\">%d of %d network(s) the Monitor may "
@@ -738,7 +1003,7 @@ static esp_err_t settings_get(httpd_req_t *req)
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req,
             "<button class=\"ok\" type=\"submit\">use this channel</button>"
-            "<div class=\"u\">the next update reads ");
+            "<div class=\"u\">a check reads ");
     }
     /* Its own chunk: escaped, the URL is longer than `row` and every other
      * buffer in this function, and snprintf would answer that by silently
@@ -748,6 +1013,9 @@ static esp_err_t settings_get(httpd_req_t *req)
     }
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, "</div></form>");
+    }
+    if (err == ESP_OK) {
+        err = send_update_card(req, &upd);
     }
 
     if (err == ESP_OK && n == 0) {
@@ -886,6 +1154,86 @@ static esp_err_t ota_channel_post(httpd_req_t *req)
     return redirect_settings(req, "chan");
 }
 
+/*
+ * Asks the mode to read the manifest, and answers before it has. Everything
+ * this handler must not do is in webdump.h: the fetch is TLS on an 8 KB
+ * handler stack, and a handler that blocked for it would hold one of four
+ * sockets and the single httpd task for the length of a handshake.
+ *
+ * The channel is not read here either. It is read inside the check, which is
+ * the whole reason the check is on demand: a channel saved on this page a
+ * moment ago is the one the press below resolves.
+ */
+static esp_err_t ota_check_post(httpd_req_t *req)
+{
+    const web_update_ops_t *ops = s_update_ops;
+
+    if (ops == NULL || !otaup_running()) {
+        /* The card does not draw the button in either case, so this is a POST
+         * that did not come from a page this server served. It is refused in
+         * words rather than ignored: the other reader of these routes is
+         * whoever is debugging them with curl. */
+        return redirect_settings(req, "noup");
+    }
+    if (!ops->check()) {
+        return redirect_settings(req, "busy");
+    }
+    ESP_LOGI(TAG, "update check asked for from the settings page");
+    /* No banner: the update card is where the answer goes, and a sentence
+     * saying a check started would only be one the next reload has to clear. */
+    return redirect_settings(req, NULL);
+}
+
+/*
+ * Installs what the last check put on offer. This one answers in full rather
+ * than redirecting, because the reload a 303 asks for would arrive at a
+ * server that is no longer there: the mode stops the httpd for the length of
+ * the transfer, to leave TLS, the image buffer and the OTA write the heap
+ * they need. So the rider gets a page that says where to look instead of a
+ * dead socket.
+ *
+ * The request is handed over before the page is written, and the mode waits a
+ * beat before taking the server down - httpd_stop() cannot run until this
+ * handler returns, since it is the httpd task that is inside it, and the beat
+ * covers the last of the response leaving the socket after that.
+ */
+static esp_err_t ota_install_post(httpd_req_t *req)
+{
+    const web_update_ops_t *ops = s_update_ops;
+    esp_err_t               err;
+
+    if (ops == NULL || !otaup_running()) {
+        return redirect_settings(req, "noup");
+    }
+    if (!ops->install()) {
+        /* Either the worker is busy or no check has put anything on offer.
+         * Both are the page being out of date rather than a fault, and both
+         * are answered by loading it again. */
+        return redirect_settings(req, "nooffer");
+    }
+    ESP_LOGW(TAG, "install asked for from the settings page");
+
+    /* No nav link: the only page it could point at stops answering a moment
+     * from now, and a link that leads to a timeout is worse than none. */
+    err = send_head(req, "installing", NULL, 0);
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req,
+                  "<p class=\"msg\">The image is coming down. The Monitor's "
+                  "screen carries the percentage - watch that, not this page: "
+                  "this server stops for the transfer and comes back only if "
+                  "the install fails. A Monitor that finished reboots into "
+                  "the new firmware, which then has sixty seconds to prove it "
+                  "boots before the bootloader takes it back.</p>");
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, k_page_tail);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, NULL);   /* terminating chunk */
+    }
+    return err == ESP_OK ? ESP_OK : ESP_FAIL;
+}
+
 static const httpd_uri_t k_uri_index = {
     .uri = "/", .method = HTTP_GET, .handler = index_get, .user_ctx = NULL,
 };
@@ -909,6 +1257,14 @@ static const httpd_uri_t k_uri_wifi_del = {
 };
 static const httpd_uri_t k_uri_ota_channel = {
     .uri = "/ota/channel", .method = HTTP_POST, .handler = ota_channel_post,
+    .user_ctx = NULL,
+};
+static const httpd_uri_t k_uri_ota_check = {
+    .uri = "/ota/check", .method = HTTP_POST, .handler = ota_check_post,
+    .user_ctx = NULL,
+};
+static const httpd_uri_t k_uri_ota_install = {
+    .uri = "/ota/install", .method = HTTP_POST, .handler = ota_install_post,
     .user_ctx = NULL,
 };
 
@@ -1110,9 +1466,10 @@ esp_err_t web_serve_start(void)
     hcfg.stack_size = 8192;          /* fread + the HTML formatting live here */
     hcfg.lru_purge_enable = true;    /* a phone that walks off must not wedge it */
     hcfg.max_open_sockets = 4;
-    /* Seven routes today against a default of eight, which the channel form
-     * was the seventh of. Said out loud so that the eighth is a number to
-     * change here rather than a mode that will not start. */
+    /* Nine routes today against a default of eight, which the check and the
+     * install are the eighth and ninth of. Said out loud so that the tenth is
+     * a number to change here rather than a mode that will not start: a route
+     * that will not register takes the whole server down with it below. */
     hcfg.max_uri_handlers = 10;
     /* the file and delete routes are registered as wildcard patterns */
     hcfg.uri_match_fn = httpd_uri_match_wildcard;
@@ -1140,6 +1497,12 @@ esp_err_t web_serve_start(void)
     }
     if (err == ESP_OK) {
         err = httpd_register_uri_handler(s_server, &k_uri_ota_channel);
+    }
+    if (err == ESP_OK) {
+        err = httpd_register_uri_handler(s_server, &k_uri_ota_check);
+    }
+    if (err == ESP_OK) {
+        err = httpd_register_uri_handler(s_server, &k_uri_ota_install);
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "routes failed: %s", esp_err_to_name(err));
