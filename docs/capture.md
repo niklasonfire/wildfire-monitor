@@ -115,7 +115,7 @@ cap status | scan | idle | rec | stop | mark [text]
 caps                 # list the Captures on flash
 capdump <seq>        # print one over the console
 caprm <seq>|all      # delete
-wifi on              # the Wi-Fi mode, for pulling files off without a cable
+wifi on              # Service Mode, for pulling files off without a cable
 ```
 
 `cap rec` starts recording and `cap stop` ends it; `cap mark` drops a Marker at

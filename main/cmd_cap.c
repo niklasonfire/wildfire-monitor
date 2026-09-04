@@ -28,7 +28,7 @@
 #include "esp_console.h"
 #include "esp_err.h"
 
-/* Entering the Wi-Fi mode takes BLE down, chooses a link and puts the address
+/* Entering Service Mode takes BLE down, chooses a link and puts the address
  * on the LCD; main.c owns that sequence because the buttons trigger it too. */
 bool app_service_up(void);
 void app_service_stop(void);
@@ -227,7 +227,7 @@ static int cmd_capdump(int argc, char **argv)
 
 /*
  * Two jobs under one name, because to a rider they are one thing: the radio.
- * `wifi on|off` is the Wi-Fi mode - the board joins the strongest network it
+ * `wifi on|off` is Service Mode - the board joins the strongest network it
  * knows and serves its pages over that, or puts up its own access point and
  * serves them over that instead (#41). `wifi add|list|del` is the list it
  * joins from, up to four networks (ADR-0006), so that a second phone is not a
@@ -327,7 +327,7 @@ static int cmd_wifi(int argc, char **argv)
     }
     if (strcmp(argv[1], "on") == 0) {
         if (!app_service_up()) {
-            printf("WIFI error=cannot start the wifi mode\n");
+            printf("WIFI error=cannot enter service mode\n");
             return 1;
         }
     } else if (strcmp(argv[1], "off") == 0) {
@@ -417,7 +417,7 @@ void cmd_cap_register(void)
          .help = "Print a capture over the console: capdump <seq> [max_records]",
          .func = cmd_capdump},
         {.command = "wifi",
-         .help = "The wifi mode and the networks it may join: "
+         .help = "Service mode and the networks it may join: "
                  "wifi on|off|list|add <ssid> [passphrase]|del <ssid>",
          .func = cmd_wifi},
         {.command = "time",

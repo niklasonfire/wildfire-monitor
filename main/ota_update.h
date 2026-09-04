@@ -41,7 +41,12 @@
  * one "it did not work". */
 typedef enum {
     OTAUP_OK = 0,
-    OTAUP_ERR_STATE,      /* a link is already up, or none is and one is needed */
+    /* The link is not in the state the call needs: otaup_join() wants no link
+     * and found one, otaup_manifest_check() wants one and found none. One
+     * code because it is one fault - somebody asked the radio for a thing it
+     * is not currently in a position to do - and the caller always knows
+     * which of the two it asked for. */
+    OTAUP_ERR_STATE,
     OTAUP_ERR_WIFI,       /* the radio would not start */
     OTAUP_ERR_NO_NETS,    /* nothing has ever been added with `wifi add` */
     OTAUP_ERR_NO_SCAN,    /* the scan saw no access point at all */

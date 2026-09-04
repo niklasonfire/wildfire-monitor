@@ -1718,7 +1718,7 @@ static void do_ble_shutdown(void)
     }
     scan_end();
     /* The last chance: after this the links are gone and nothing else will
-     * update the estimator before the reboot the Wi-Fi mode ends in. */
+     * update the estimator before the reboot Service Mode ends in. */
     est_persist();
     s_ble_down = true;
     set_state(CAP_IDLE);
@@ -1746,7 +1746,7 @@ static void do_ble_shutdown(void)
         ESP_LOGW(TAG, "nimble_port_deinit: %s", esp_err_to_name(err));
     }
     /* Best effort as well: returns the controller and host BSS/data to the
-     * heap, which is the whole point - the Wi-Fi mode needs that RAM. It
+     * heap, which is the whole point - Service Mode needs that RAM. It
      * is irreversible, hence "reboot to capture again". */
     err = esp_bt_mem_release(ESP_BT_MODE_BTDM);
     if (err != ESP_OK) {

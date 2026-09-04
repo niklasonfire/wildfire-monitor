@@ -1,6 +1,6 @@
 /*
- * webdump - the HTTP server behind the Monitor's one Wi-Fi mode, and the
- * access point that mode falls back to.
+ * webdump - the HTTP server behind Service Mode, and the access point that
+ * mode falls back to.
  *
  * The console runs at 115200 baud, which is about four minutes per megabyte;
  * a ride is several megabytes. So instead of shipping the capture out over the

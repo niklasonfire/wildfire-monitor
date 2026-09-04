@@ -10,9 +10,9 @@
  * on this bike a rider can type.
  *
  * This file is two halves that used to be one function, and separating them
- * is the whole of what let the two Wi-Fi modes become one (#41): the pages are
- * now served over a hotspot the Monitor joined just as readily as over an
- * access point of its own.
+ * is the whole of what let the two old Wi-Fi modes become Service Mode (#41):
+ * the pages are now served over a hotspot the Monitor joined just as readily
+ * as over an access point of its own.
  *
  *   web_ap_start()    owns a link: the SoftAP, its netif and its DHCP server.
  *   web_serve_start() owns the httpd and its handlers, and knows nothing

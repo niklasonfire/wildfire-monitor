@@ -8,8 +8,8 @@
  * serves writes through wifi_store_add() and wifi_store_del() and holds
  * nothing of its own, so it and the console agree by construction.
  *
- * That page is now the way in that always exists (#41). The Monitor has one
- * Wi-Fi mode, it serves the page over the access point it falls back to just
+ * That page is now the way in that always exists (#41). Service Mode serves
+ * the page over the access point it falls back to just
  * as readily as over a network it joined, and so a list that has gone
  * wrong - a rotated key, an SSID typed with a capital in the wrong place - is
  * edited from the failure it caused rather than over the cable ADR-0006

@@ -140,10 +140,10 @@ static int cmd_info(int argc, char **argv)
     return 0;
 }
 
-/* The one Wi-Fi mode, and the update that runs over it. Declared up here
+/* Service Mode, and the update that runs over it. Declared up here
  * because the console reaches both without passing the menu, and main.c owns
  * the sequence either way - taking BLE down is a one-way door wherever the
- * request came from. See "the Wi-Fi mode" below. `install_now` is what
+ * request came from. See "Service Mode" below. `install_now` is what
  * replaces the button press the console cannot give. */
 bool        app_service_up(void);
 static bool app_service_update(bool install_now);
@@ -168,7 +168,7 @@ static bool app_service_update(bool install_now);
  * is the bench surface, and it is the only way back that still works if a
  * debug image boots healthy and serves a broken page.
  *
- * `ota check` and `ota install` bring the Wi-Fi mode up if it is not already
+ * `ota check` and `ota install` bring Service Mode up if it is not already
  * and then ask the manifest over it, so they still mean what they always did
  * even though there is now one mode rather than two (#41). Both refuse when
  * the mode fell back to the access point: there is no upstream behind it, and
@@ -272,7 +272,7 @@ static void heartbeat_task(void *arg)
 }
 
 
-/* ---- the Wi-Fi mode -----------------------------------------------------
+/* ---- Service Mode -------------------------------------------------------
  *
  * There is one, and entering it is a one-way door. Wi-Fi and NimBLE do not fit
  * in this chip's RAM together, so BLE goes down for good and the way back to
@@ -286,12 +286,12 @@ static void heartbeat_task(void *arg)
  * hotspot, read the manifest and served nothing. A rider had to know which of
  * the two held the settings page, and a rider whose hotspot key had been
  * rotated had to reboot into the other mode to repair it. So they are one, and
- * the link is chosen rather than picked off a menu (#41):
- *
- *   nothing stored     -> the access point, without scanning first, because
- *                         that answer does not depend on what is in range
- *   something stored   -> scan, and join the strongest one known
- *   any join failure   -> the access point
+ * the link is chosen rather than picked off a menu (#41). Knowing a network,
+ * the Monitor scans and joins the strongest of the ones it knows; knowing
+ * none, it goes to the access point without scanning at all, because that
+ * answer does not depend on what is in range and a fresh Monitor should not
+ * wait to be told what it already knows; and failing to join for any reason
+ * whatever, it goes to the access point too.
  *
  * The server runs over whichever of the two came up, and that is the point.
  * A rotated key, or an SSID typed with a capital in the wrong place, must not
@@ -337,9 +337,19 @@ static bool s_ble_spent;
  * of those has to be able to put the address back afterwards.
  *
  * Lines and not a role and an address, because the two links do not want the
- * same facts in the same order. Joined to a hotspot: which network, the
- * address, how strong the signal is. Being one: the SSID and the key, which
- * have to be read first, and then the address.
+ * same facts in the same order, or even the same three facts. Joined to a
+ * hotspot: which network, the address, and how strong the signal is. Being
+ * one: the SSID and the key, which have to be read before anything else can
+ * happen, and then the address - which leaves the access point no third line
+ * for a link state, and rightly so. The state worth knowing there is whether
+ * a phone has joined, and a rider who cannot read the key has no way to make
+ * one; `wifi` on the console counts them for whoever is debugging it.
+ *
+ * They are written once, when the mode comes up, and not repainted after. A
+ * station link that drops later leaves a dead address on the panel, which is
+ * a known cost: watching the link would mean a task, and the rider is
+ * standing in front of a Monitor whose page has stopped answering, which
+ * says the same thing.
  *
  * Sized for the longest thing that can land in one and not for the panel: an
  * SSID is 32 octets and its NUL, and "http://" with a dotted quad after it is
@@ -399,7 +409,7 @@ static bool service_enter(bool force_ap)
     if (web_running()) {
         return true;
     }
-    if (capture_busy("the wifi mode")) {
+    if (capture_busy("service mode")) {
         return false;
     }
 
@@ -470,7 +480,7 @@ static bool service_enter(bool force_ap)
     }
 
     service_screen();
-    ESP_LOGI(TAG, "wifi mode up as %s: %s / %s / %s",
+    ESP_LOGI(TAG, "service mode up as %s: %s / %s / %s",
              otaup_running() ? "a station" : "an access point",
              s_service_line[0], s_service_line[1], s_service_line[2]);
     return true;
@@ -508,6 +518,11 @@ bool app_service_up(void)
 static const char *update_fail_line(otaup_err_t err)
 {
     switch (err) {
+    /* The only way OTAUP_ERR_STATE reaches a panel is the manifest check
+     * asked over an access point, so "no upstream" is what it means here.
+     * otaup_join()'s other reading of the same code - a link already up -
+     * never gets this far, because service_enter() takes that path as a
+     * fallback and logs it. */
     case OTAUP_ERR_STATE:    return "no upstream";
     case OTAUP_ERR_WIFI:     return "radio failed";
     case OTAUP_ERR_NO_NETS:  return "no networks";
@@ -574,10 +589,30 @@ static bool app_update_install(const wfota_manifest_t *m)
     otain_result_t res;
 
     ui_message("INSTALL", "0%", NULL, NULL, NULL);
+    /* The server comes down for the length of the transfer and goes back up
+     * if the transfer did not end in a reboot. Two reasons, and the first is
+     * the one that matters: TLS, the image buffer and the OTA write already
+     * spend most of the heap that is left with Wi-Fi up, and the httpd's
+     * 8 KB task plus four sockets was never part of that budget - under the
+     * two old modes the two could not be up at once and nobody had to think
+     * about it. The second is the radio: a phone pulling a four-megabyte
+     * Capture through the same link as the image is a download made slower
+     * for no reason, at the one moment a hotspot too weak to finish costs a
+     * whole attempt. */
+    web_serve_stop();
     otain_err_t err = otaup_install(m, &res, install_stage);
     if (err != OTAIN_OK) {
         ESP_LOGE(TAG, "install %s: %s (%s)", m->version, otain_err_str(err),
                  res.detail[0] ? res.detail : "-");
+        /* Back up over the link the install left alone, so the settings page
+         * is in reach of the rider whose download was cut. Failing that, the
+         * mode is a link with nothing on it and the reboot the panel already
+         * offers is the way out. */
+        esp_err_t werr = web_serve_start();
+        if (werr != ESP_OK) {
+            ESP_LOGE(TAG, "server did not come back: %s",
+                     esp_err_to_name(werr));
+        }
         ui_message("INSTALL", install_fail_line(err),
                    res.detail[0] ? res.detail : NULL, "not installed",
                    "any: BACK");
@@ -631,14 +666,14 @@ static bool app_service_update(bool install_now)
     board_btn_evt_t evt;
 
     if (!web_running() || !otaup_running()) {
-        /* The access point has no route anywhere. Said plainly, because "no
-         * update" and "no way to look for one" are different things to be
-         * standing in front of. */
-        ESP_LOGW(TAG, "no upstream: the Monitor is its own access point");
-        ui_message("UPDATE", update_fail_line(OTAUP_ERR_STATE),
-                   "no network joined", NULL, "any: BACK");
-        (void)board_btn_wait(&evt, MENU_IDLE_MS);
-        service_screen();
+        /* The access point has no route anywhere, so there is nothing to ask.
+         * Only the console gets here - app_service_enter() offers the update
+         * only when there is a link to offer it over - so it is a log line
+         * and not a screen. A message screen here would paint over the
+         * address the rider is reading and then hold the console for ten
+         * seconds waiting for a button nobody is standing next to. */
+        ESP_LOGW(TAG, "no upstream to check: the Monitor is its own "
+                      "access point");
         return false;
     }
 
@@ -703,12 +738,19 @@ static bool app_service_update(bool install_now)
  * somebody's network, the update is offered before the screen settles on the
  * address.
  *
- * B still held when A picked the entry forces the access point. It is less a
- * gesture to learn than a way out of a wait - a rider in a car park who knows
- * there is no hotspot in range would otherwise sit through a scan and a join
- * timeout to be told so - and it costs one GPIO read, which is the only reason
- * it is here. Nothing depends on anybody finding it: the same rider gets the
- * same access point twenty seconds later by doing nothing at all.
+ * B still down when A picked the entry forces the access point. In practice
+ * that is the opening long-press never released: SERVICE is the first entry,
+ * so a rider who holds B and presses A lands on it with the flag set. A
+ * second hold inside the menu is not the same thing and does not do this -
+ * eight hundred milliseconds of B is the gesture that closes the menu, and
+ * that reading has to stay the one it has everywhere else.
+ *
+ * It is less a gesture to learn than a way out of a wait - a rider in a car
+ * park who knows there is no hotspot in range would otherwise sit through a
+ * scan and a join timeout to be told so - and it costs one GPIO read, which
+ * is the only reason it is here. Nothing depends on anybody finding it: the
+ * same rider gets the same access point twenty seconds later by doing nothing
+ * at all.
  */
 static bool app_service_enter(void)
 {
@@ -809,7 +851,7 @@ static bool app_info_enter(void)
 /* ---- the B menu ---------------------------------------------------------
  *
  * Two buttons cannot carry a gesture per screen, so held-B stopped being the
- * readout shortcut and became the way in to a list (ADR-0006). The Wi-Fi mode
+ * readout shortcut and became the way in to a list (ADR-0006). Service Mode
  * costs one keypress more than readout mode used to; that keypress is what
  * buys somewhere to put INFO, and whatever follows it, without inventing a
  * third gesture nobody would remember. The list is shorter than it was - the
@@ -834,7 +876,7 @@ typedef struct {
     bool      (*enter)(void);   /* true once the panel is somebody else's */
     /* A page hands the panel back rather than keeping it, so a false from one
      * means "the rider dismissed it" and the menu returns. The flag is what
-     * keeps that reading off the Wi-Fi mode, which returns false only when it
+     * keeps that reading off Service Mode, which returns false only when it
      * failed - with its own screen up and BLE already spent, so painting the
      * menu over it would hide the only explanation there is. */
     bool        page;
@@ -854,7 +896,7 @@ static const menu_entry_t s_menu[] = {
  *
  * The rows are padded to a common width for the same reason the cursor is two
  * characters wide: fit_scale() in ui.c drops from 3 to 2 above seven
- * characters, so "> INFO" would be drawn half again as large as "> READOUT"
+ * characters, so "> INFO" would be drawn half again as large as "> SERVICE"
  * sitting under it. */
 _Static_assert(MENU_COUNT <= 3, "the message screen has three lines for entries");
 
@@ -910,7 +952,7 @@ static void menu_run(void)
 
         case BOARD_BTN_A_ID:
             if (evt.press == BOARD_PRESS_SHORT) {
-                /* For the Wi-Fi mode the menu is over: it owns the panel
+                /* For Service Mode the menu is over: it owns the panel
                  * from here and never gives it back, and a failure has its own
                  * screen to show. A page that the rider dismissed is the one
                  * case that comes back to the list, so INFO does not cost a
@@ -989,7 +1031,7 @@ static void button_task(void *arg)
         }
 
         if (s_ble_spent && evt.btn == BOARD_BTN_A_ID) {
-            /* The Wi-Fi mode has been through here and failed to come up - the
+            /* Service Mode has been through here and failed to come up - the
              * branch above catches it when it did - so BLE is gone and A has
              * no capture left to start. Rebooting is the only thing that gets
              * one back, and it is what A already means on the mode's own

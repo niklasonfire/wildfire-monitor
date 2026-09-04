@@ -841,6 +841,10 @@ otaup_err_t otaup_manifest_check(otaup_result_t *out, otaup_progress_fn progress
     fill_running(out);
     fill_link(out);
 
+    /* The one line this step has to show, said here rather than from the
+     * task: the fetch is a single blocking call with nothing to report part
+     * way through, so `progress` is carried into the context only because
+     * both jobs share it. */
     say(progress, "reading", out->ip);
     ctx.result   = out;
     ctx.progress = progress;
@@ -1141,7 +1145,7 @@ const char *otaup_err_str(otaup_err_t err)
 {
     switch (err) {
     case OTAUP_OK:            return "ok";
-    case OTAUP_ERR_STATE:     return "no link, or one already up";
+    case OTAUP_ERR_STATE:     return "wrong link state for that";
     case OTAUP_ERR_WIFI:      return "wifi failed";
     case OTAUP_ERR_NO_NETS:   return "no networks stored";
     case OTAUP_ERR_NO_SCAN:   return "no access point in range";

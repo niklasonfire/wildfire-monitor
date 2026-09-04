@@ -148,7 +148,7 @@ static void count_bytes(size_t n)
 /* -------------------------------------------------------------- file names */
 
 /* Returns the sequence number of "cap0001.wfl", or -1 for anything else. The
- * Wi-Fi mode lets the user drop files on the share, so foreign names and
+ * Service Mode lets the user drop files on the share, so foreign names and
  * subdirectories have to be ignored rather than tripping the scan up. */
 static int parse_seq(const char *name)
 {

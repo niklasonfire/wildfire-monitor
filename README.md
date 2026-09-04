@@ -257,10 +257,15 @@ it is wrapped at a `-` rather than clipped, which is what keeps a `-dirty` on
 screen.
 
 The menu will not open while a Capture is recording or connecting, and says so
-on the panel: `SERVICE` needs the radio the Capture is using. Holding B while
-pressing A on `SERVICE` skips the scan and goes straight to the access point,
-which is worth knowing in a car park with no hotspot in range and is not
-otherwise required. See ADR-0006.
+on the panel: `SERVICE` needs the radio the Capture is using.
+
+Hold B to open the menu, keep holding it, and press A: `SERVICE` is already
+the selected entry, and picking it with B still down skips the scan and goes
+straight to the access point. That is worth knowing in a car park with no
+hotspot in range and is not otherwise required - let go of B first and the
+same access point arrives twenty seconds later on its own. Letting go and
+holding B again does not do it: a second hold of eight hundred milliseconds is
+the gesture that closes the menu. See ADR-0006.
 
 ## Firmware slots and rollback
 
@@ -283,7 +288,7 @@ the board before flashing it.** A partition table cannot be replaced over the
 air, so that flash is the cable this whole arrangement exists to be the last
 of.
 
-## The Wi-Fi mode
+## Service Mode
 
 `SERVICE` on the menu is the only Wi-Fi mode there is, and it is a station
 first. It tries to join the strongest of the networks it knows and serves
@@ -346,7 +351,7 @@ never from this repository, which is public:
 
 | Command | Effect |
 | --- | --- |
-| `wifi on` / `wifi off` | Enter the Wi-Fi mode / take it back down |
+| `wifi on` / `wifi off` | Enter Service Mode / take it back down |
 | `wifi add <ssid> [passphrase]` | Remember a network, up to four; quote anything with a space in it |
 | `wifi list` | What is stored, passphrases by length only |
 | `wifi del <ssid>` | Forget one |
