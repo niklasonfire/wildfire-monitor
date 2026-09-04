@@ -570,11 +570,13 @@ bool app_service_up(void)
 static const char *update_fail_line(otaup_err_t err)
 {
     switch (err) {
-    /* The only way OTAUP_ERR_STATE reaches a panel is the manifest check
-     * asked over an access point, so "no upstream" is what it means here.
-     * otaup_join()'s other reading of the same code - a link already up -
-     * never gets this far, because service_enter() takes that path as a
-     * fallback and logs it. */
+    /* Not the access point any more: the page does not draw the button over a
+     * fallback link and the console refuses before it asks, so that case never
+     * reaches this table. What is left is the station link that went away
+     * between the press and the fetch, and "no upstream" is still the true
+     * sentence for it. otaup_join()'s other reading of the same code - a link
+     * already up - never gets this far either, because service_enter() takes
+     * that path as a fallback and logs it. */
     case OTAUP_ERR_STATE:    return "no upstream";
     case OTAUP_ERR_WIFI:     return "radio failed";
     case OTAUP_ERR_NO_NETS:  return "no networks";
@@ -647,7 +649,14 @@ static otain_err_t app_update_install(const wfota_manifest_t *m,
 {
     otain_result_t res;
 
-    ui_message("INSTALL", "0%", NULL, NULL, NULL);
+    /* Said before the stop and not after, because httpd_stop() waits for the
+     * handler that is running to return, and one of those handlers streams a
+     * whole Capture in 4 KB pieces: a phone that started pulling four
+     * megabytes a second before the install was asked for holds this line for
+     * the rest of that download. "0%" with no byte count under it is
+     * indistinguishable from a transfer that has stalled, and this is the one
+     * moment where the thing being waited for is not the transfer at all. */
+    ui_message("INSTALL", "starting", "closing the server", NULL, NULL);
     /* The server comes down for the length of the transfer and goes back up
      * if the transfer did not end in a reboot. Two reasons, and the first is
      * the one that matters: TLS, the image buffer and the OTA write already
@@ -659,6 +668,7 @@ static otain_err_t app_update_install(const wfota_manifest_t *m,
      * for no reason, at the one moment a hotspot too weak to finish costs a
      * whole attempt. */
     web_serve_stop();
+    ui_message("INSTALL", "0%", NULL, NULL, NULL);
     otain_err_t err = otaup_install(m, &res, install_stage);
     *out = res;
     if (err != OTAIN_OK) {
@@ -1347,9 +1357,20 @@ static void button_task(void *arg)
             continue;
         }
 
-        if (web_running()) {
-            /* Nothing to capture any more; the only useful action left is to
-             * get the firmware back into a state that can. */
+        /* "Is the mode up", and the server alone stopped being the answer to
+         * that when the install started taking it down for the length of the
+         * transfer: a minute in which `web_running()` is false while the mode
+         * is very much up, holding the link and painting a percentage. Asked
+         * with the server alone, a long-press of B in that minute would open
+         * the menu straight over the install's screen. Nothing to capture any
+         * more either way; the only useful action left is to get the firmware
+         * back into a state that can. A during an install therefore aborts
+         * it, which is safe by construction - otadata still points at the
+         * running app until the very last step (ADR-0006), so the half-written
+         * slot is dead weight - and is the only way out of a download that has
+         * stopped moving. The INSTALL screen does not advertise it, because it
+         * is an escape and not a choice being offered. */
+        if (web_running() || update_busy()) {
             if (evt.btn == BOARD_BTN_A_ID) {
                 esp_restart();
             }
