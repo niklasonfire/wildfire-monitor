@@ -263,9 +263,61 @@ the refusal survives under `service_enter()`, and the glossary in `CONTEXT.md`
 now carries **Service Mode** where it carried Readout Mode and Update Mode.
 ADR-0008 leans on the old shape in passing - "readout mode and update mode are
 mutually exclusive one-way doors, so a rider..." - and that sentence is now
-history rather than fact. Its conclusion is not affected: a channel is still
-read at the start of a mode and not while one is running, so a channel saved
-on the settings page is still read at the next entry, and there is still no
-"check now" button, because an install has to be confirmed on the device and
-a button on a phone could only start something the rider would have to walk
-back to the bike to answer.
+history rather than fact. Its conclusion outlived it by one change and no
+more. This paragraph used to end "a channel is still read at the start of a
+mode and not while one is running, so a channel saved on the settings page is
+still read at the next entry, and there is still no 'check now' button,
+because an install has to be confirmed on the device"; both halves of that are
+false, and the three paragraphs below say what replaced them. What ADR-0008
+actually leans on is only that a Monitor can always be got back to stable
+without a cable, and that is more true now than it was: the selector and the
+check sit on the same page, and the check reads the channel at the moment it
+runs.
+
+**The update is asked for on the page, and it is still two deliberate
+presses.** Service Mode used to read the manifest on its way in - the link
+came up, the server started, and before the address screen settled the panel
+said either `UP TO DATE` or a tag, with A to accept it and B, or ten seconds
+of nobody answering, to decline. That is gone. The mode is a link and a server
+and nothing else; the first thing the rider reaches is the page; and the
+settings page carries a *check for updates* button and, once a version is on
+offer, an *install* button beside it. "Never silent and never automatic"
+survives intact: nothing is fetched until somebody presses something, nothing
+is written until somebody presses a second time, and a Monitor left alone in
+Service Mode does nothing at all. What moved is the *place* the rider presses.
+
+**It moved because the channel was already there and the check was not.**
+ADR-0008 put the channel selector on the settings page, and the check ran
+before that page existed to be opened - so saving a channel changed nothing
+until the next entry into the mode, which is a reboot, a menu and a scan spent
+to act on a radio button. Reading the manifest on demand makes the channel
+something read at check time, which is the difference between a selector that
+works and a selector with a footnote. The same move is what lets a rider whose
+download was cut try again without walking back to the bike, and it is why the
+two buttons ended up on one card.
+
+**The cost is that a button on a handlebar proved somebody was standing at the
+bike, and a button on a page proves nothing of the sort.** Anyone who can
+reach the settings page can now start an install, and it is worth being exact
+about what that is. The image is not theirs to choose: it is named by a
+manifest fetched over TLS from a public GitHub release of this repository, and
+its length and its SHA-256 are checked against that manifest before the
+bootloader is pointed at it, so an image that does not match never becomes
+bootable. What an intruder on the network gains is therefore the ability to
+make the Monitor run a *published* release - forward, or, because versions are
+compared for inequality, back to an older one - and not the ability to run
+code of their own. That is a nuisance and a downgrade on a device whose worst
+outcome is a firmware that will not boot and is rolled back sixty seconds
+later, and it is a real loss of a check that was free.
+
+**What stands in front of it is the link, and the two links are not the
+same.** On the access point it is the WPA2 key, which is shared and printed on
+the LCD - so the set of people who can do this is everyone in range who has
+ever read that panel, which is small and is not empty. On a joined network
+there is nothing at all: the Monitor is one address on the rider's own
+hotspot, and anyone else on it can reach the page exactly as they can already
+reach the Captures and the network list. That was the bargain before this
+change for everything else the page can do; the install is a new item on that
+list rather than a new list. Nothing here adds an authentication step, because
+a password on a device with two buttons and no keyboard is either printed next
+to the thing it guards or it is the cable this decision exists to avoid.

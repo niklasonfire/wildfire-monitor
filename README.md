@@ -320,12 +320,25 @@ is running.
 
 ### The update
 
-Joined to a network, and only then, the mode reads the manifest of the newest
-release on the way in, so the panel says either `UP TO DATE` or the tag on
-offer. Nothing is installed on the strength of that: `A` accepts the tag and
-`B`, or ten seconds of nobody answering, declines it, and either way the
-screen settles back onto the address. Over the access point there is no
-upstream and no update is offered.
+The update is on the settings page, and the mode does not go looking for one
+on its way in. **Check for updates** reads the manifest of the newest release
+on the channel selected just above it, over the link the mode came up on, and
+prints the answer on the page: up to date, naming the version running, or a
+tag on offer. A version on offer gets a second button beside the first, and
+pressing that installs it. Two presses, and nothing at all if nobody presses -
+see ADR-0006. Over the access point there is no upstream, so the page says why
+instead of offering a button that could only fail.
+
+Because the check runs on demand, the channel is read at the moment it runs:
+pick a channel and press check, and that is the channel that was read. The
+Monitor's screen carries the check while it happens and the percentage while
+an image comes down, but the answer is on the phone that asked for it.
+
+Neither button does the work on the server's own task. The install stops the
+server for the length of the transfer - TLS, the image buffer and the flash
+write want the heap the httpd is holding - so the install page is sent in full
+before that happens, and it says to watch the Monitor's screen rather than the
+browser.
 
 What the download checks, in this order, is what makes the reboot safe:
 
@@ -340,9 +353,10 @@ What the download checks, in this order, is what makes the reboot safe:
 
 A rollback is not silent: the firmware that comes back up says `ROLLED BACK` on
 the panel and `ota` prints which slot was abandoned. A failure is left failed -
-it names which failure it was and hands the panel back, and nothing retries on
-its own - but the link and the pages stay up underneath the message, so a cut
-download leaves the settings page in reach rather than taking it away.
+it names which failure it was, on the panel and on the page, and nothing
+retries on its own - but the link and the server both come back underneath the
+message, so a cut download leaves the settings page in reach and the second
+attempt is a button on the page rather than a walk back to the bike.
 
 ### The networks it may join
 
@@ -359,14 +373,15 @@ never from this repository, which is public:
 | `ota channel [<name>]` | Read the `debug` channel instead of `stable` / bare goes back to `stable` |
 | `ota pin <tag>` / `ota pin` | Read one release instead of the channel's newest / go back to it |
 | `ota check` | Read the manifest, bringing the mode up first if it is not |
-| `ota install` | The same, and install without waiting for the button press - how this is exercised on the bench |
+| `ota install` | The same, and install what the check found - how this is exercised on the bench |
 
-`wifi on` stops at the mode and does not go looking for an update; `ota check`
-is the command that has always meant that and still does. On the panel there
-is one entry and it does both, because a rider has nothing to type. Both `ota`
-subcommands refuse when the mode fell back to the access point: there is no
-upstream behind it, and the honest answer to "check" is that there was nothing
-to ask.
+`wifi on` stops at the mode, and so does `SERVICE` on the menu: neither goes
+looking for an update, because the button that does is on the page. `ota
+check` asks the same question through the same worker the page's button uses,
+so the console and the phone cannot be shown two different manifests and only
+one thing at a time is doing TLS. Both `ota` subcommands refuse when the mode
+fell back to the access point: there is no upstream behind it, and the honest
+answer to "check" is that there was nothing to ask.
 
 ### The settings page
 
@@ -383,10 +398,18 @@ The page picks the update channel too: `stable`, which is the newest published
 release and where a Monitor is unless somebody has said otherwise, or `debug`,
 a build meant for one bike and invisible to every other. It shows the URL the
 choice resolves to, which is what makes *which channel am I on* answerable
-without a cable. The manifest is read on the way into the mode, before the
-page exists to be opened, so a channel saved there is read at the next entry.
+without a cable. The channel is read when the check runs, so one saved here
+takes effect on the next press rather than at the next entry into the mode.
 Nothing that can be stored there, and no rollback, can leave a Monitor unable
 to get back to `stable`: see ADR-0008.
+
+It also carries the update, which means reaching this page is now the whole of
+the authority to install one. That is bounded rather than guarded: the image
+is named by a manifest fetched over TLS from a public GitHub release and
+checked by length and SHA-256 before the bootloader is pointed at it, so what
+somebody else on the network gains is the ability to force a *published*
+build, forward or back, and not to run one of their own. ADR-0006's amendment
+says what that costs and why nothing here asks for a password.
 
 The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
 the right kind of secret to keep on a bike, and it can be rotated on the

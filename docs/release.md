@@ -156,9 +156,11 @@ curl -sL https://github.com/niklasonfire/wildfire_monitor/releases/latest/downlo
 ```
 
 The first names `v0.4.0-debug.1`; the second still names whatever full release
-it named before. On the bike, `ota channel debug` then `ota check`, or the
-channel selector on the settings page and a reboot into `SERVICE`, because the
-manifest is read on the way into the mode and not while one is running.
+it named before. On the bike it is `ota channel debug` then `ota check` on the
+console, or - with no cable at all - the channel selector on the settings page
+and then **check for updates** on the same page. The channel is read at the
+moment the check runs, so the two are one operation and there is no reboot
+between them.
 
 ### Backing one out
 

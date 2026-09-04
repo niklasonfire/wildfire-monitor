@@ -137,3 +137,30 @@ fields and nothing else, still carries no credential, and still installs only
 what a rider chose from the menu. A channel changes which release that one URL
 resolves to; it does not add a second protocol, a second host, or a second
 thing on the bike that can hold a secret.
+
+## Amendment: the channel now takes effect at the moment it is used
+
+**"The channel takes effect at the next update, not at the moment it is set"
+is no longer true, and the consequence it was drawn from is gone.** That
+paragraph rested on two Wi-Fi modes that were mutually exclusive one-way
+doors: the check ran on the way into update mode, the selector lived on a page
+readout mode served, and the two could not be reached from one another. #41
+made them one mode, and the follow-on moved the check onto the same settings
+page as the selector. The manifest URL is resolved inside the check, on the
+task that runs it, so a channel saved by one button and read by the next one
+pressed is the channel that was read. There is no reboot in between and
+nothing for the page or the console to warn about; the note that used to say
+so has been rewritten to say this instead.
+
+**Everything the paragraph was protecting is better off.** The worry was a
+setting that appears to do nothing and therefore gets pressed twice. A
+selector and a check on one card, in that order, is a stronger answer to that
+than a sentence explaining the delay. The rest of this decision is untouched:
+stable is still the absence of a key, a pin still outranks a channel, the
+trial channel is still what a rollback reads, and
+`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK` must still stay off.
+
+**"Installs only what a rider chose from the menu", above, is now "chose on
+the page".** ADR-0006's amendment says what that move costs; nothing about it
+touches the channel, which is still a name looked up in a compiled-in table
+and never a URL that crossed the wire.

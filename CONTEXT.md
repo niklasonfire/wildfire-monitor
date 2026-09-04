@@ -165,8 +165,10 @@ _Avoid_: certainty, status, reliability
 The Monitor stops listening and puts itself where a phone can reach it: it
 joins the strongest network it knows, or, knowing none or reaching none, puts
 up its own access point instead. Either way it serves the Captures and the
-settings page over HTTP; only over a joined network does it also offer an
-update, because only there is there an upstream to fetch one from. Entered
+settings page over HTTP; only over a joined network does that page also offer
+an update, because only there is there an upstream to fetch one from, and both
+the check and the install are asked for on the page rather than on the panel.
+The mode itself looks for nothing on its way in. Entered
 from the menu, refused while a Capture is running, and left by a reboot —
 Bluetooth is down throughout, so there is no other way back to capturing.
 _Avoid_: readout mode, update mode, webdump, AP mode, download mode, OTA mode
