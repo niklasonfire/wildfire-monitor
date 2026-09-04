@@ -902,10 +902,13 @@ static void update_do_install(void)
     upd_clear_busy();
     /* The panel keeps the failure for a beat, because the rider who was
      * watching the percentage is watching the panel. Handing the address back
-     * afterwards is skipped if something else has started meanwhile: that
-     * worker owns the screen now, and this one would only paint over it. */
+     * afterwards is conditional on both of the things that can have changed
+     * in those five seconds: the mode may have been stopped from the console,
+     * and there is no address to put back on a Monitor whose server and link
+     * have gone; or another request may have started, and the screen is that
+     * worker's now. */
     vTaskDelay(pdMS_TO_TICKS(UPDATE_PANEL_MS));
-    if (!update_busy()) {
+    if (web_running() && !update_busy()) {
         service_screen();
     }
 }
@@ -913,14 +916,16 @@ static void update_do_install(void)
 static void update_worker(void *arg)
 {
     if (arg != NULL) {
+        /* Clears the flag itself, part way through, and then sleeps for the
+         * length of the panel's beat - so there is nothing left to clear
+         * here, and clearing anyway would clear a *different* request's flag:
+         * a check accepted during that sleep would be running with the mode
+         * believing nothing was. */
         update_do_install();
     } else {
         update_do_check();
+        upd_clear_busy();
     }
-    /* Idempotent, and the install has usually done it already: it clears the
-     * flag before it hands the panel back, so the page's button works during
-     * that beat. */
-    upd_clear_busy();
     vTaskDelete(NULL);
 }
 
