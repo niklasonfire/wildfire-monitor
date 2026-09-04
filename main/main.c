@@ -372,8 +372,21 @@ static bool s_ble_spent;
 #define SERVICE_LINE_MAX 40
 static char s_service_line[3][SERVICE_LINE_MAX];
 
+/*
+ * Empty lines mean there is no address to put back: app_service_stop() blanks
+ * them on its way out, and a Monitor with no link and no server must not be
+ * shown "SERVICE" over three blanks with a reboot hint under them. It is also
+ * what closes the window the update's worker opens - it wakes five seconds
+ * after an install failed, checks the mode is still up and can lose the CPU
+ * between that check and this call - because the stop blanks the lines before
+ * it clears the screen, so a worker that gets here late finds nothing to
+ * paint and one that gets here early has its screen cleared by the stop.
+ */
 static void service_screen(void)
 {
+    if (s_service_line[0][0] == '\0') {
+        return;
+    }
     ui_message("SERVICE", s_service_line[0], s_service_line[1],
                s_service_line[2], "A: REBOOT");
 }
@@ -685,11 +698,16 @@ static otain_err_t app_update_install(const wfota_manifest_t *m,
             ESP_LOGE(TAG, "server did not come back: %s",
                      esp_err_to_name(werr));
         }
-        /* No button hint on the fourth line, because nothing is waiting for a
-         * press any more: the rider who started this is holding a phone, and
-         * the worker puts the address back on its own after a beat. */
+        /* No button hint while the server is back, because nothing is waiting
+         * for a press: the rider who started this is holding a phone, and the
+         * worker puts the address back on its own after a beat. If the server
+         * did not come back there is no beat and no address - the mode is a
+         * link with nothing on it - so the hint is the only thing left that
+         * works, and it goes on rather than leaving a screen with no way off
+         * it. */
         ui_message("INSTALL", install_fail_line(err),
-                   res.detail[0] ? res.detail : NULL, "not installed", NULL);
+                   res.detail[0] ? res.detail : NULL, "not installed",
+                   werr == ESP_OK ? NULL : "A: REBOOT");
         return err;
     }
 
