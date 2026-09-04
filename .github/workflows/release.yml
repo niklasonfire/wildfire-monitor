@@ -133,3 +133,40 @@ jobs:
               0x10000 wildfire_monitor-${{ github.ref_name }}-app-ota.bin
             ```
             `*-app-ota.bin` is the app-only image to serve for OTA updates.
+
+      - name: Point the debug channel at this release
+        # A dashed tag is invisible to unpinned Monitors, which is what makes it
+        # safe and also what makes it unreachable: GitHub has no "latest
+        # prerelease" download URL. So the debug channel is a fixed release
+        # tagged channel-debug whose only asset is a copy of the manifest
+        # published above. Not a build - that copy still names this tag's own
+        # immutable image asset, so `ota pin <this tag>` keeps working and an old
+        # manifest keeps naming the image it shipped with.
+        #
+        # The same action as the publish step rather than `gh`, because the
+        # runner is docker-in-docker and carries no toolchain of its own: the
+        # build runs inside the image, and nothing in either workflow has ever
+        # needed a CLI on the host. An action that ships its own JavaScript
+        # cannot be the thing that is missing on release day.
+        if: contains(github.ref_name, '-')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: channel-debug
+          name: debug channel
+          # Both flags, for the reason spelled out in the publish step above,
+          # and re-asserted on every debug release rather than only at creation:
+          # a pointer release that ever became "latest" would serve a debug
+          # manifest to every bike on stable.
+          prerelease: true
+          make_latest: false
+          # The asset moving is the entire mechanism - the channel is a URL that
+          # stays still while what it names changes - and this action replaces an
+          # asset of the same name rather than refusing it.
+          files: release/manifest.json
+          body: |
+            A pointer, not a build. `manifest.json` here is a copy of the newest
+            debug release's, so it names that release's own image; this release
+            has no image of its own and is never what `ota pin` should name.
+
+            The Monitor reads it when its channel is set to `debug`. See
+            ADR-0008.

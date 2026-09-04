@@ -31,6 +31,8 @@
 #include <time.h>
 
 #include "capture_store.h"
+#include "ota_update.h"
+#include "wfota.h"
 #include "wifi_store.h"
 
 #include "esp_event.h"
@@ -158,6 +160,15 @@ static const char k_head_b[] =
     "input{display:block;box-sizing:border-box;width:100%;margin:4px 0 0;"
     "background:#1a1a1a;color:#eee;border:1px solid #444;border-radius:6px;"
     "padding:10px;font-size:16px}"
+    /* A radio inherits the text input rule above otherwise, and a
+     * full-width block per choice reads as a list of fields rather than
+     * as one question with alternatives. */
+    "input[type=radio]{display:inline-block;width:auto;margin:0 8px 0 0;"
+    "vertical-align:middle}"
+    "label.r{color:#eee;font-size:17px;margin:0 0 10px}"
+    /* A manifest URL is ~90 characters with nowhere to break, so it is
+     * told to break anywhere rather than push the page sideways. */
+    ".u{color:#aaa;font-size:12px;margin:10px 0 0;word-break:break-all}"
     "button{background:#822;color:#fff;border:0;border-radius:6px;"
     "padding:12px 18px;font-size:15px}"
     /* The two destructive buttons are red; remembering a network is not. */
@@ -385,6 +396,17 @@ static esp_err_t rm_post(httpd_req_t *req)
 #define WEB_FORM_MAX  512
 /* An escaped SSID, worst case every character an "&quot;". */
 #define WEB_ESC_MAX   (6 * WFOTA_SSID_MAX + 1)
+/*
+ * The escaped manifest URL. It needs a buffer of its own because
+ * WFOTA_URL_MAX alone is longer than anything else settings_get() holds.
+ * Nothing wfota_manifest_url() can build actually needs escaping - the
+ * host is a literal and wfota_tag_ok() refuses every character esc_html()
+ * expands - so twice the URL is room for an escape or two that should not
+ * exist, and esc_html() truncates rather than overruns past that. Six
+ * times, the true worst case, would be 1.5 KB of an 8 KB handler stack
+ * spent guarding a URL this firmware has no way to construct.
+ */
+#define WEB_URL_ESC_MAX (2 * WFOTA_URL_MAX + 1)
 /* A decoded field. Comfortably longer than either the SSID or the passphrase
  * wifi_store will take, so that something one character too long comes back as
  * a length wifi_store_add() complains about rather than as a form the server
@@ -402,6 +424,9 @@ static const struct {
     { "full",    "The list is full. Forget one to make room." },
     { "missing", "That network was not stored; it may already be gone." },
     { "form",    "That form could not be read." },
+    { "chan",    "Update channel saved. The next update will read it." },
+    { "badchan", "This firmware has no channel by that name. The channel "
+                 "is unchanged." },
     { "flash",   "Writing to flash failed. The list is unchanged." },
 };
 
@@ -419,6 +444,13 @@ static const char k_list_full[] =
     "<p class=\"e\">The list is full. Forget one to add another.</p>";
 
 static const char k_settings_note[] =
+    /* Readout mode and update mode both take BLE down and neither can
+     * hand over to the other, so there is no "check now" button to offer
+     * here - saying so is the only way a rider learns that saving a
+     * channel and then walking away changed nothing yet. */
+    "<p class=\"e\">A channel is read at the next update, not now: this "
+    "page and update mode cannot run together, so reboot and choose "
+    "UPDATE from the B menu for a change here to be used.</p>"
     "<p class=\"e\">A passphrase is stored unencrypted and is never shown "
     "back, only counted - long enough to spot a typo by. Anyone who can open "
     "this page has the access point's key already and can change this "
@@ -611,6 +643,10 @@ static esp_err_t settings_get(httpd_req_t *req)
 {
     wifi_net_t  nets[WIFI_STORE_MAX];
     char        esc[WEB_ESC_MAX], sub[112], key[48], row[768];
+    char        chan[WFOTA_CHANNEL_MAX + 1];
+    char        url[WFOTA_URL_MAX + 1], urlesc[WEB_URL_ESC_MAX];
+    const char *cur = WFOTA_CHANNEL_STABLE;
+    const char *cname, *urltext;
     const char *msg = msg_for(req);
     esp_err_t   err;
     int         n;
@@ -619,6 +655,31 @@ static esp_err_t settings_get(httpd_req_t *req)
      * do with the capture store, and a board whose store will not mount is
      * exactly one that may need an update installed. */
     n = wifi_store_load(nets, WIFI_STORE_MAX);
+
+    /* The name shown is the table's own entry and not the string that came
+     * back out of flash. otaup_channel_get() already promises a name this
+     * firmware knows; looking it up again means the page does not have to
+     * take that on trust, and there is then no path by which a byte from NVS
+     * reaches the markup. */
+    otaup_channel_get(chan, sizeof(chan));
+    for (int i = 0; (cname = wfota_channel_name(i)) != NULL; i++) {
+        if (strcmp(cname, chan) == 0) {
+            cur = cname;
+            break;
+        }
+    }
+    if (otaup_manifest_url(url, sizeof(url))) {
+        /* Escaped although nothing wfota_manifest_url() can build needs it -
+         * the host is a literal and wfota_tag_ok() gates the tail. The day a
+         * tag reaches that URL from somewhere other than the channel table,
+         * this line should not be the hole it goes through. */
+        esc_html(url, urlesc, sizeof(urlesc));
+        urltext = urlesc;
+    } else {
+        /* A phrase and not an empty string: a blank after "reads" would read
+         * as "there is no update", which is a different and wrong answer. */
+        urltext = "an address this build could not assemble";
+    }
 
     err = send_head(req, "settings", k_nav_captures);
     if (err == ESP_OK) {
@@ -636,6 +697,40 @@ static esp_err_t settings_get(httpd_req_t *req)
             err = httpd_resp_sendstr_chunk(req, "</p>");
         }
     }
+    /* Above the network list because "which stream is this bike on" is the
+     * question a rider opens this page to settle, and the resolved URL under
+     * the buttons is what answers it without a cable. Every name printed
+     * comes out of wfota_channel_name(), so the page offers what this build
+     * actually has rather than a pair somebody wrote down here once. */
+    if (err == ESP_OK) {
+        snprintf(row, sizeof(row),
+                 "<form class=\"c\" method=\"post\" action=\"/ota/channel\">"
+                 "<div class=\"n\">channel: %s</div>", cur);
+        err = httpd_resp_sendstr_chunk(req, row);
+    }
+    for (int i = 0; err == ESP_OK &&
+                    (cname = wfota_channel_name(i)) != NULL; i++) {
+        snprintf(row, sizeof(row),
+                 "<label class=\"r\"><input type=\"radio\" name=\"chan\" "
+                 "value=\"%s\"%s>%s</label>",
+                 cname, strcmp(cname, chan) == 0 ? " checked" : "", cname);
+        err = httpd_resp_sendstr_chunk(req, row);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req,
+            "<button class=\"ok\" type=\"submit\">use this channel</button>"
+            "<div class=\"u\">the next update reads ");
+    }
+    /* Its own chunk: escaped, the URL is longer than `row` and every other
+     * buffer in this function, and snprintf would answer that by silently
+     * cutting it in half. */
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, urltext);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, "</div></form>");
+    }
+
     if (err == ESP_OK && n == 0) {
         err = httpd_resp_sendstr_chunk(req,
             "<p class=\"e\">No networks stored. Update mode has nothing to "
@@ -736,6 +831,40 @@ static esp_err_t wifi_del_post(httpd_req_t *req)
     return redirect_settings(req, "gone");
 }
 
+/*
+ * Chooses the release stream the next check will read. What crosses the wire
+ * is a channel *name* and never a URL: otaup_channel_set() looks it up in the
+ * compiled-in table, so the worst a client on this AP can do here is name a
+ * channel that does not exist and be told so - it cannot point the Monitor at
+ * an address of its own. The name is not echoed back either; "badchan" is a
+ * code the page turns into a fixed sentence, like every other answer here.
+ */
+static esp_err_t ota_channel_post(httpd_req_t *req)
+{
+    char      body[WEB_FORM_MAX];
+    /* WEB_FIELD_MAX rather than the channel's own length, for the reason the
+     * wifi form uses it: a name one character too long should come back as a
+     * channel nobody has, not as a form the server could not read. */
+    char      chan[WEB_FIELD_MAX];
+    esp_err_t err;
+
+    if (!read_body(req, body, sizeof(body)) ||
+        !form_field(body, "chan", chan, sizeof(chan))) {
+        return redirect_settings(req, "form");
+    }
+
+    err = otaup_channel_set(chan);
+    if (err != ESP_OK) {
+        /* The refused name is not logged: it is client text, and the only
+         * thing worth knowing here is that one was refused. */
+        ESP_LOGW(TAG, "set channel: %s", esp_err_to_name(err));
+        return redirect_settings(req,
+                   err == ESP_ERR_INVALID_ARG ? "badchan" : "flash");
+    }
+    ESP_LOGI(TAG, "update channel set from the settings page");
+    return redirect_settings(req, "chan");
+}
+
 static const httpd_uri_t k_uri_index = {
     .uri = "/", .method = HTTP_GET, .handler = index_get, .user_ctx = NULL,
 };
@@ -755,6 +884,10 @@ static const httpd_uri_t k_uri_wifi_add = {
 };
 static const httpd_uri_t k_uri_wifi_del = {
     .uri = "/wifi/del", .method = HTTP_POST, .handler = wifi_del_post,
+    .user_ctx = NULL,
+};
+static const httpd_uri_t k_uri_ota_channel = {
+    .uri = "/ota/channel", .method = HTTP_POST, .handler = ota_channel_post,
     .user_ctx = NULL,
 };
 
@@ -913,6 +1046,10 @@ esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap
     hcfg.stack_size = 8192;          /* fread + the HTML formatting live here */
     hcfg.lru_purge_enable = true;    /* a phone that walks off must not wedge it */
     hcfg.max_open_sockets = 4;
+    /* Seven routes today against a default of eight, which the channel form
+     * was the seventh of. Said out loud so that the eighth is a number to
+     * change here rather than a readout mode that will not start. */
+    hcfg.max_uri_handlers = 10;
     /* the file and delete routes are registered as wildcard patterns */
     hcfg.uri_match_fn = httpd_uri_match_wildcard;
     err = httpd_start(&s_server, &hcfg);
@@ -935,6 +1072,9 @@ esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap
     }
     if (err == ESP_OK) {
         err = httpd_register_uri_handler(s_server, &k_uri_wifi_del);
+    }
+    if (err == ESP_OK) {
+        err = httpd_register_uri_handler(s_server, &k_uri_ota_channel);
     }
     if (err != ESP_OK) {
         goto fail;

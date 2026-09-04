@@ -144,5 +144,41 @@ const char *otain_err_str(otain_err_t err);
 esp_err_t otaup_pin_set(const char *tag);   /* NULL or "" clears it */
 /* False when nothing is pinned, and `out` is then an empty string. */
 bool      otaup_pin_get(char *out, size_t cap);
-/* The URL the next check will read, pin included. For `ota` on the console. */
+/* The URL the next check will read, channel and pin included. For `ota` on
+ * the console, and for the settings page, where it is the thing that makes
+ * "which stream is this Monitor on" answerable without a cable. */
 bool      otaup_manifest_url(char *out, size_t cap);
+
+/* ---- the channel --------------------------------------------------------
+ *
+ * Which stream of releases the Monitor follows, stored in the same namespace
+ * as the pin and under the same rule: stable is the *absence* of the key, not
+ * a value that spells it. That is what makes an erased NVS, an entry that
+ * will not read back and a firmware built before channels existed all land on
+ * the one stream every Monitor can always reach. A pin still outranks it,
+ * because a pin is the deliberate one-off.
+ */
+/* NULL, "" or "stable" clears it. ESP_ERR_INVALID_ARG for a name that is not
+ * in this build's table, so a channel with no URL behind it can never be
+ * stored. */
+esp_err_t otaup_channel_set(const char *name);
+/* Always writes a usable name: "stable" when nothing is stored, when the
+ * stored value will not read back, and when it is not one this firmware
+ * knows. `cap` wants to be WFOTA_CHANNEL_MAX + 1. */
+void      otaup_channel_get(char *out, size_t cap);
+
+/* ---- the trial ----------------------------------------------------------
+ *
+ * The channel an image was installed from, written the moment the bootloader
+ * is pointed at it and outstanding until that image earns its place. It is
+ * how a boot after a rollback knows the failed update came from somewhere
+ * other than stable, and it is erased either way - by ota_health.c when the
+ * image is confirmed, and by the revert itself when it is not - so the
+ * revert happens once and a rider who picks a channel again afterwards keeps
+ * it.
+ */
+/* False when no install is outstanding, and `out` is then an empty string. */
+bool otaup_trial_get(char *out, size_t cap);
+/* Ends the trial. Idempotent, and a failure to write is only logged: an
+ * uncleared trial costs one needless revert to stable and nothing else. */
+void otaup_trial_clear(void);

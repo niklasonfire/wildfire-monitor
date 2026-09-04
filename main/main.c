@@ -159,12 +159,26 @@ static bool app_update_run(bool install_now);
  * suspect release is backed out without publishing anything - and `ota
  * install` is then what puts it on, which is the same operation as going
  * forward.
+ *
+ * `ota channel <name>` moves the Monitor onto another stream of releases and
+ * `ota channel` with no argument puts it back on stable. The rider-facing way
+ * to do this is the settings page, which needs nothing but a phone; this one
+ * is the bench surface, and it is the only way back that still works if a
+ * debug image boots healthy and serves a broken page.
  */
 static int cmd_ota(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "pin") == 0) {
         const char *tag = (argc >= 3) ? argv[2] : NULL;
         esp_err_t   err = otaup_pin_set(tag);
+
+        if (err != ESP_OK) {
+            printf("OTA error=%s\n", esp_err_to_name(err));
+            return 1;
+        }
+    } else if (argc >= 2 && strcmp(argv[1], "channel") == 0) {
+        const char *name = (argc >= 3) ? argv[2] : NULL;
+        esp_err_t   err  = otaup_channel_set(name);
 
         if (err != ESP_OK) {
             printf("OTA error=%s\n", esp_err_to_name(err));
@@ -187,13 +201,16 @@ static int cmd_ota(int argc, char **argv)
         }
         return 0;
     } else if (argc >= 2) {
-        printf("usage: ota [pin [<tag>]|check|install]\n");
+        printf("usage: ota [pin [<tag>]|channel [<name>]|check|install]\n");
         return 1;
     }
 
     uint32_t gates = ota_health_gates();
+    char     chan[WFOTA_CHANNEL_MAX + 1] = "";
     char     pin[40] = "";
     char     url[256] = "";
+
+    otaup_channel_get(chan, sizeof(chan));
 
     printf("running    %s\n", ota_running_label());
     printf("version    %s\n", esp_app_get_description()->version);
@@ -207,6 +224,7 @@ static int cmd_ota(int argc, char **argv)
     printf("confirmed  %s\n", ota_health_confirmed() ? "yes" : "no");
     printf("rollback   %s\n", ota_health_rolled_back()
            ? ota_rollback_label() : "no");
+    printf("channel    %s\n", chan);
     printf("pin        %s\n", otaup_pin_get(pin, sizeof(pin)) ? pin : "(latest)");
     printf("manifest   %s\n", otaup_manifest_url(url, sizeof(url)) ? url : "-");
     return 0;
@@ -223,7 +241,7 @@ static void register_commands(void)
         {.command = "sleep", .help = "Wait, so a script can let the board work: sleep <secs>", .func = cmd_sleep},
         {.command = "ota",
          .help = "Slot, rollback health, and update mode: "
-                 "ota [pin [<tag>]|check|install]",
+                 "ota [pin [<tag>]|channel [<name>]|check|install]",
          .func = cmd_ota},
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -555,6 +573,7 @@ static bool app_info_enter(void)
     size_t      cut = len;
     char        v1[INFO_COLS + 1], v2[INFO_COLS + 1];
     char        slot[INFO_COLS + 1];
+    char        chan[WFOTA_CHANNEL_MAX + 1];
 
     if (len > INFO_COLS) {
         cut = INFO_COLS;        /* the fallback: a break mid-token still reads */
@@ -569,7 +588,16 @@ static bool app_info_enter(void)
     }
     snprintf(v1, sizeof(v1), "%.*s", (int)cut, ver);
     snprintf(v2, sizeof(v2), "%s", ver + cut);
-    snprintf(slot, sizeof(slot), "slot %s", ota_running_label());
+    /* The channel rides on the slot line rather than taking one of its own:
+     * a wrapped version can want two of the three, and a Monitor that is not
+     * on stable is exactly the one whose INFO screen has to say so. Stable is
+     * left unsaid, because it is what every other Monitor is. */
+    otaup_channel_get(chan, sizeof(chan));
+    if (strcmp(chan, WFOTA_CHANNEL_STABLE) == 0) {
+        snprintf(slot, sizeof(slot), "slot %s", ota_running_label());
+    } else {
+        snprintf(slot, sizeof(slot), "slot %s  %s", ota_running_label(), chan);
+    }
 
     /* Packed rather than placed: draw_message() holds a line's y position even
      * when it is empty, so a short version that needs no second line must not
@@ -582,7 +610,7 @@ static bool app_info_enter(void)
     }
     line[n] = slot;
     ui_message("INFO", line[0], line[1], line[2], "any: BACK");
-    ESP_LOGI(TAG, "info: %s from %s", ver, ota_running_label());
+    ESP_LOGI(TAG, "info: %s from %s on %s", ver, ota_running_label(), chan);
 
     board_btn_evt_t evt;
     if (!board_btn_wait(&evt, MENU_IDLE_MS)) {
@@ -736,6 +764,12 @@ leave:
  */
 static uint32_t s_markers;
 
+/* Set by app_main() when the boot after a rollback put the channel back to
+ * stable. The panel says so instead of saying the update failed, because
+ * those are two different things for a rider to know and there is one line
+ * to say either of them in. */
+static bool s_chan_reverted;
+
 static void button_task(void *arg)
 {
     (void)arg;
@@ -751,7 +785,8 @@ static void button_task(void *arg)
         ESP_LOGW(TAG, "came up on %s after a rollback from %s",
                  ota_running_label(), ota_rollback_label());
         ui_message("UPDATE", "ROLLED BACK", esp_app_get_description()->version,
-                   "update failed", "any: BACK");
+                   s_chan_reverted ? "back to stable" : "update failed",
+                   "any: BACK");
         (void)board_btn_wait(&first, MENU_IDLE_MS);
         ui_message_clear();
     }
@@ -864,6 +899,29 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
     ota_health_pass(OTA_GATE_NVS);
+
+    /*
+     * A rolled-back image takes its channel down with it, once. The update
+     * that failed is the only evidence there is that this Monitor should not
+     * be on that stream, and the way back has to need nothing from the rider,
+     * who may be a long way from a cable. Erasing the trial is what makes it
+     * once: a rider who picks the channel again afterwards keeps it, because
+     * there is then nothing outstanding for the next rollback to undo.
+     */
+    char trial[WFOTA_CHANNEL_MAX + 1];
+    if (ota_health_rolled_back() && otaup_trial_get(trial, sizeof(trial))) {
+        esp_err_t rerr = otaup_channel_set(NULL);
+
+        otaup_trial_clear();
+        if (rerr == ESP_OK) {
+            ESP_LOGW(TAG, "the update that rolled back came from the %s "
+                          "channel - back to %s", trial, WFOTA_CHANNEL_STABLE);
+            s_chan_reverted = true;
+        } else {
+            ESP_LOGE(TAG, "could not go back to %s: %s", WFOTA_CHANNEL_STABLE,
+                     esp_err_to_name(rerr));
+        }
+    }
 
     /* The screen comes up first: everything after this can report its own
      * failure to the rider instead of only to a serial log nobody is reading. */

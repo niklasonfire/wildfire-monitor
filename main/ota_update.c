@@ -26,8 +26,10 @@
 
 static const char *TAG = "otaup";
 
-#define OTAUP_NS       "ota"
-#define OTAUP_PIN_KEY  "pin"
+#define OTAUP_NS        "ota"
+#define OTAUP_PIN_KEY   "pin"
+#define OTAUP_CHAN_KEY  "chan"
+#define OTAUP_TRIAL_KEY "trial"
 
 /* More access points than a car park has, and the list is on the stack of the
  * task below; past this the extra ones are the faint ones anyway. */
@@ -150,12 +152,139 @@ esp_err_t otaup_pin_set(const char *tag)
     return err;
 }
 
+/* -------------------------------------------------------------- the channel */
+
+void otaup_channel_get(char *out, size_t cap)
+{
+    nvs_handle_t h;
+    char         name[WFOTA_CHANNEL_MAX + 1];
+
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    /* Written first and left alone by every path out of here, so that there
+     * is no way to leave this function without a channel the caller can use. */
+    snprintf(out, cap, "%s", WFOTA_CHANNEL_STABLE);
+    if (nvs_open(OTAUP_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;                     /* no channel has ever been chosen */
+    }
+    size_t    len = sizeof(name);
+    esp_err_t err = nvs_get_str(h, OTAUP_CHAN_KEY, name, &len);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return;
+    }
+    /* Checked on the way out as well as on the way in, for the same reason as
+     * the pin: this picks the URL the next check reads, and flash is not where
+     * a URL should be trusted from. An empty value is not a name either,
+     * whatever put it there. */
+    if (name[0] == '\0' || wfota_channel_tag(name) == NULL) {
+        ESP_LOGW(TAG, "the stored channel is not one this build has - stable");
+        return;
+    }
+    snprintf(out, cap, "%s", name);
+}
+
+esp_err_t otaup_channel_set(const char *name)
+{
+    nvs_handle_t h;
+    esp_err_t    err;
+    /* stable is not stored as a value: it is what is left when the key is
+     * gone, which is the whole reason a lost or unreadable setting is safe. */
+    bool         clear = (name == NULL || name[0] == '\0' ||
+                          strcmp(name, WFOTA_CHANNEL_STABLE) == 0);
+
+    if (!clear && wfota_channel_tag(name) == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    err = nvs_open(OTAUP_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (clear) {
+        err = nvs_erase_key(h, OTAUP_CHAN_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;           /* already on stable */
+        }
+    } else {
+        err = nvs_set_str(h, OTAUP_CHAN_KEY, name);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+/* ---------------------------------------------------------------- the trial */
+
+bool otaup_trial_get(char *out, size_t cap)
+{
+    nvs_handle_t h;
+
+    if (out == NULL || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (nvs_open(OTAUP_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;               /* nothing has ever been installed */
+    }
+    size_t    len = cap;
+    esp_err_t err = nvs_get_str(h, OTAUP_TRIAL_KEY, out, &len);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        out[0] = '\0';
+        return false;
+    }
+    return out[0] != '\0';
+}
+
+/* NULL or "" erases, same convention as the pin. Static because the only
+ * thing that writes a trial is the install below, which knows what it wrote
+ * into the slot; everyone else only ever has one to clear. */
+static esp_err_t trial_store(const char *chan)
+{
+    nvs_handle_t h;
+    esp_err_t    err = nvs_open(OTAUP_NS, NVS_READWRITE, &h);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (chan == NULL || chan[0] == '\0') {
+        err = nvs_erase_key(h, OTAUP_TRIAL_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;           /* no install was outstanding */
+        }
+    } else {
+        err = nvs_set_str(h, OTAUP_TRIAL_KEY, chan);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+void otaup_trial_clear(void)
+{
+    esp_err_t err = trial_store(NULL);
+
+    if (err != ESP_OK) {
+        /* Nothing to do about it and nothing that breaks: a trial left behind
+         * costs one needless revert to stable after a rollback that has not
+         * happened yet, which is the harmless direction to fail in. */
+        ESP_LOGW(TAG, "trial channel not cleared: %s", esp_err_to_name(err));
+    }
+}
+
 bool otaup_manifest_url(char *out, size_t cap)
 {
+    char chan[WFOTA_CHANNEL_MAX + 1];
     char pin[WFOTA_VERSION_MAX + 1];
 
+    otaup_channel_get(chan, sizeof(chan));   /* "stable" unless one is set */
     (void)otaup_pin_get(pin, sizeof(pin));   /* empty when nothing is pinned */
-    return wfota_manifest_url(pin, out, cap);
+    return wfota_manifest_url(chan, pin, out, cap);
 }
 
 /* ------------------------------------------------------------------- radio */
@@ -841,9 +970,32 @@ static otain_err_t install(install_ctx_t *ic)
         return OTAIN_ERR_BOOT;
     }
 
-    ESP_LOGW(TAG, "%s installed into %s: the next boot runs it on probation, "
-                  "and rolls back unless it passes the health check",
-             m->version, part->label);
+    /*
+     * Below the irreversible line on purpose: until otadata has taken the new
+     * slot there is no trial to record, and after it there is one whether or
+     * not this write works. So a failure here is logged and nothing more - the
+     * install happened, and returning an error for it would be a lie that
+     * costs the rider a reboot to find out about.
+     */
+    char      chan[WFOTA_CHANNEL_MAX + 1];
+    esp_err_t terr;
+
+    otaup_channel_get(chan, sizeof(chan));
+    /* Only a channel there is something to come back from. Recording stable
+     * too would cost nothing on the flash and a lie on the panel: a stable
+     * update that rolls back would come up saying "back to stable" at a rider
+     * who never left it, when what they need told is that the update failed.
+     * Passing NULL also clears a trial an earlier debug install left behind. */
+    terr = trial_store(strcmp(chan, WFOTA_CHANNEL_STABLE) == 0 ? NULL : chan);
+    if (terr != ESP_OK) {
+        ESP_LOGW(TAG, "trial channel not recorded: %s - a rollback will leave "
+                      "the channel where it is", esp_err_to_name(terr));
+    }
+
+    ESP_LOGW(TAG, "%s installed into %s from the %s channel: the next boot "
+                  "runs it on probation, and rolls back unless it passes the "
+                  "health check",
+             m->version, part->label, chan);
     return OTAIN_OK;
 }
 
