@@ -408,8 +408,11 @@ the authority to install one. That is bounded rather than guarded: the image
 is named by a manifest fetched over TLS from a public GitHub release and
 checked by length and SHA-256 before the bootloader is pointed at it, so what
 somebody else on the network gains is the ability to force a *published*
-build, forward or back, and not to run one of their own. ADR-0006's amendment
-says what that costs and why nothing here asks for a password.
+build, forward or back, and not to run one of their own. Every form on this
+server refuses a submission that came from another origin, so that stays "on
+the network and on this page" rather than becoming "any page the rider's
+phone happens to open". ADR-0006's amendment says what that costs and why
+nothing here asks for a password.
 
 The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
 the right kind of secret to keep on a bike, and it can be rotated on the

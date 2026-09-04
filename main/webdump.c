@@ -35,6 +35,10 @@
  * bootloader is pointed at it - so it is the ability to force a *published*
  * build and not to run one of somebody's own. See ADR-0006's amendment.
  *
+ * "Anyone who can reach these pages" is made true by same_origin() below,
+ * which is what stops the set from quietly being "anyone whose page the
+ * rider's browser loads while the phone is on this network".
+ *
  * BLE is already down when either half starts - the caller does that with
  * cap_ble_shutdown() - because NimBLE and Wi-Fi do not fit in RAM together on
  * this chip. That is also why the handlers keep almost nothing static and
@@ -157,6 +161,60 @@ static esp_err_t send_unavailable(httpd_req_t *req)
     return httpd_resp_sendstr(req, "capture store not mounted\n");
 }
 
+/*
+ * Refuses a POST that a page of this server did not submit.
+ *
+ * Nothing stops a form on somebody else's page posting here. A cross-origin
+ * form submission is not what CORS prevents - the browser sends it and only
+ * withholds the answer - so a phone sitting on the rider's hotspot that opens
+ * any page at all can be made to edit the network list, delete a Capture, or,
+ * since the update moved onto this page, start an install and reboot the
+ * Monitor. That is a wider set of people than "anyone who can reach this
+ * page", which is the set ADR-0006's amendment reasons about, and closing the
+ * difference costs one header.
+ *
+ * Origin against Host and nothing cleverer. A browser sends Origin on every
+ * cross-site form POST; a same-site one either sends an Origin naming this
+ * server or, on something old enough, none at all. So an absent Origin is
+ * allowed - curl has none either, and a bench with a cable is not the thing
+ * being defended against - and a present one has to agree. An Origin too long
+ * for the buffer is refused rather than truncated and compared, because a
+ * prefix that matches is exactly how that would be attacked.
+ */
+static bool same_origin(httpd_req_t *req)
+{
+    char      origin[80], host[64];
+    esp_err_t err;
+
+    err = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+    /* "http://192.168.4.1" against "192.168.4.1". Only http, because that is
+     * the only scheme this server speaks: an https Origin naming our own host
+     * is somebody else's page whatever it says. */
+    if (strncmp(origin, "http://", 7) != 0) {
+        return false;
+    }
+    return strcmp(origin + 7, host) == 0;
+}
+
+/* 403 and not a redirect: whoever sent this is not looking at the answer, and
+ * a redirect would only be a second request from the same place. */
+static esp_err_t refuse_foreign(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "refusing a POST that came from another origin");
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "that form did not come from this Monitor's page");
+    return ESP_FAIL;
+}
+
 /* -------------------------------------------------------------- HTTP: shell */
 
 /*
@@ -247,7 +305,7 @@ static esp_err_t send_text(httpd_req_t *req, const char *s)
 static esp_err_t send_head(httpd_req_t *req, const char *title, const char *nav,
                            int refresh_s)
 {
-    char      meta[48];
+    char      meta[64];
     esp_err_t err;
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -259,8 +317,15 @@ static esp_err_t send_head(httpd_req_t *req, const char *title, const char *nav,
         err = httpd_resp_sendstr_chunk(req, "</title>");
     }
     if (err == ESP_OK && refresh_s > 0) {
+        /* Named, rather than reloading whatever URL this is. The only page
+         * that refreshes is the settings page, and it is often reached with a
+         * `?m=` banner on it - which a bare refresh would keep re-rendering
+         * every two seconds, so a rider who pressed twice would still be
+         * being told the Monitor was busy on the load that finally has the
+         * answer. */
         snprintf(meta, sizeof(meta),
-                 "<meta http-equiv=\"refresh\" content=\"%d\">", refresh_s);
+                 "<meta http-equiv=\"refresh\" content=\"%d; url=/settings\">",
+                 refresh_s);
         err = httpd_resp_sendstr_chunk(req, meta);
     }
     if (err == ESP_OK) {
@@ -422,6 +487,9 @@ static esp_err_t rm_post(httpd_req_t *req)
 {
     int seq = 0;
 
+    if (!same_origin(req)) {
+        return refuse_foreign(req);
+    }
     if (!store_ready()) {
         return send_unavailable(req);
     }
@@ -897,7 +965,18 @@ static esp_err_t send_update_card(httpd_req_t *req, const web_upd_status_t *upd)
         esc_html(upd->text, esc, sizeof(esc));
         err = httpd_resp_sendstr_chunk(req,
                   "<form method=\"post\" action=\"/ota/install\">"
-                  "<button type=\"submit\">install ");
+                  "<input type=\"hidden\" name=\"version\" value=\"");
+        /* The tag goes back with the press, so what is installed is what this
+         * button said and not whatever a check somewhere else has landed
+         * since. Escaped twice over for it: once as text on the button, once
+         * as the value of an attribute. */
+        if (err == ESP_OK) {
+            err = send_text(req, esc);
+        }
+        if (err == ESP_OK) {
+            err = httpd_resp_sendstr_chunk(req,
+                      "\"><button type=\"submit\">install ");
+        }
         if (err == ESP_OK) {
             err = send_text(req, esc);
         }
@@ -1077,6 +1156,9 @@ static esp_err_t wifi_add_post(httpd_req_t *req)
     char      pass[WEB_FIELD_MAX];
     esp_err_t err;
 
+    if (!same_origin(req)) {
+        return refuse_foreign(req);
+    }
     if (!read_body(req, body, sizeof(body)) ||
         !form_field(body, "ssid", ssid, sizeof(ssid))) {
         return redirect_settings(req, "form");
@@ -1105,6 +1187,9 @@ static esp_err_t wifi_del_post(httpd_req_t *req)
     char      ssid[WEB_FIELD_MAX];
     esp_err_t err;
 
+    if (!same_origin(req)) {
+        return refuse_foreign(req);
+    }
     if (!read_body(req, body, sizeof(body)) ||
         !form_field(body, "ssid", ssid, sizeof(ssid))) {
         return redirect_settings(req, "form");
@@ -1137,6 +1222,9 @@ static esp_err_t ota_channel_post(httpd_req_t *req)
     char      chan[WEB_FIELD_MAX];
     esp_err_t err;
 
+    if (!same_origin(req)) {
+        return refuse_foreign(req);
+    }
     if (!read_body(req, body, sizeof(body)) ||
         !form_field(body, "chan", chan, sizeof(chan))) {
         return redirect_settings(req, "form");
@@ -1168,6 +1256,9 @@ static esp_err_t ota_check_post(httpd_req_t *req)
 {
     const web_update_ops_t *ops = s_update_ops;
 
+    if (!same_origin(req)) {
+        return refuse_foreign(req);
+    }
     if (ops == NULL || !otaup_running()) {
         /* The card does not draw the button in either case, so this is a POST
          * that did not come from a page this server served. It is refused in
@@ -1200,21 +1291,46 @@ static esp_err_t ota_check_post(httpd_req_t *req)
 static esp_err_t ota_install_post(httpd_req_t *req)
 {
     const web_update_ops_t *ops = s_update_ops;
+    char                    body[WEB_FORM_MAX];
+    char                    version[WEB_FIELD_MAX];
+    web_upd_status_t        upd;
     esp_err_t               err;
 
+    if (!same_origin(req)) {
+        return refuse_foreign(req);
+    }
     if (ops == NULL || !otaup_running()) {
         return redirect_settings(req, "noup");
     }
-    if (!ops->install()) {
-        /* Either the worker is busy or no check has put anything on offer.
-         * Both are the page being out of date rather than a fault, and both
-         * are answered by loading it again. */
-        return redirect_settings(req, "nooffer");
+    /* The version the button named, posted back with it. What gets installed
+     * has to be what the rider read on the button: a page left open in one
+     * tab while a check ran somewhere else would otherwise install whatever
+     * arrived since, under a label naming the tag it replaced. */
+    if (!read_body(req, body, sizeof(body)) ||
+        !form_field(body, "version", version, sizeof(version))) {
+        return redirect_settings(req, "form");
+    }
+    if (!ops->install(version)) {
+        /* Three ways to get here and they are not one sentence: the worker is
+         * busy, nothing is on offer, or what is on offer is not what this
+         * page was showing. The status tells the first from the rest, and the
+         * rest are the same instruction - load the page again and read what
+         * it says now. */
+        ops->status(&upd);
+        return redirect_settings(req,
+                   upd.state == WEB_UPD_BUSY ||
+                   upd.state == WEB_UPD_INSTALLING ? "busy" : "nooffer");
     }
     ESP_LOGW(TAG, "install asked for from the settings page");
 
-    /* No nav link: the only page it could point at stops answering a moment
-     * from now, and a link that leads to a timeout is worse than none. */
+    /*
+     * No nav link, because the only page it could point at stops answering a
+     * moment from now and a link that leads to a timeout is worse than none -
+     * but there is one at the bottom, under a sentence saying when it will
+     * work. A Monitor that finished is gone before anybody presses it; one
+     * that failed has put the server back, and that link is how the rider
+     * gets to the answer without typing the address again.
+     */
     err = send_head(req, "installing", NULL, 0);
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req,
@@ -1223,7 +1339,12 @@ static esp_err_t ota_install_post(httpd_req_t *req)
                   "this server stops for the transfer and comes back only if "
                   "the install fails. A Monitor that finished reboots into "
                   "the new firmware, which then has sixty seconds to prove it "
-                  "boots before the bootloader takes it back.</p>");
+                  "boots before the bootloader takes it back.</p>"
+                  "<p class=\"nav\"><a href=\"/settings\">settings &rsaquo;"
+                  "</a></p>"
+                  "<p class=\"e\">That link answers again once the transfer "
+                  "has ended one way or the other, which is a minute or so. "
+                  "It is where the reason goes if it ended badly.</p>");
     }
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, k_page_tail);

@@ -534,13 +534,14 @@ static bool service_enter(bool force_ap)
  * for the length of a check because it was the console that asked for it, and
  * now a phone can be installing while the prompt sits there free. Pulling the
  * link out from under a running install would leave a half-written slot and a
- * task fetching from a radio that had gone. */
-void app_service_stop(void)
+ * task fetching from a radio that had gone. False for that refusal, so the
+ * console can say the mode is still up rather than printing that it went. */
+bool app_service_stop(void)
 {
     if (update_busy()) {
         ESP_LOGW(TAG, "refusing to stop service mode while the update is "
                       "working");
-        return;
+        return false;
     }
     web_serve_stop();
     service_link_stop();
@@ -548,6 +549,7 @@ void app_service_stop(void)
         s_service_line[i][0] = '\0';
     }
     ui_message_clear();
+    return true;
 }
 
 /* `wifi on`: the mode, and nothing beyond it. The update is `ota check`,
@@ -753,11 +755,16 @@ static otain_err_t app_update_install(const wfota_manifest_t *m,
  * back finds the address rather than a stale complaint - which the page is
  * still holding anyway. */
 #define UPDATE_PANEL_MS  5000
-/* The console's patience, and only the console's: the page never waits. A
- * check is twenty seconds at worst and an install is a download, so this is a
- * bound on a worker that has stopped answering rather than a timeout anything
- * is expected to reach. */
-#define UPDATE_WAIT_MS   180000
+/* The console's patience, and only the console's: the page never waits. Two
+ * numbers because the two are not the same wait. A check is a scan-free HTTPS
+ * GET with a fifteen-second timeout under it; an install is two megabytes
+ * through a phone hotspot, which at the rate a bad one manages is minutes, and
+ * a single bound generous enough for that would let a wedged check hold the
+ * prompt for ten of them. Both are bounds on a worker that has stopped
+ * answering, not timeouts anything is expected to reach - and reaching one
+ * does not stop the worker, it only stops waiting for it. */
+#define CHECK_WAIT_MS    60000
+#define INSTALL_WAIT_MS  600000
 
 /* All five guarded by the mutex: the worker writes them and the httpd task
  * reads them, and a web_upd_status_t is three fields that have to agree. */
@@ -794,6 +801,13 @@ static void service_update_status(web_upd_status_t *out)
 {
     upd_lock();
     *out = s_upd;
+    upd_unlock();
+}
+
+static void upd_clear_busy(void)
+{
+    upd_lock();
+    s_upd_busy = false;
     upd_unlock();
 }
 
@@ -881,11 +895,19 @@ static void update_do_install(void)
              otain_err_str(ierr));
     update_status_set(WEB_UPD_FAILED, install_fail_line(ierr), res.detail);
     /* app_update_install() has already brought the server back up, so the
-     * page carrying that answer is in reach again. The panel keeps the
-     * failure for a beat first, because the rider who was watching the
-     * percentage is watching the panel. */
+     * page carrying that answer is in reach again - and the button on it is
+     * drawn, so the worker has to stop being busy now and not in five
+     * seconds, or the rider whose download was cut presses "check" and is
+     * told the Monitor is still working on the thing it just gave up on. */
+    upd_clear_busy();
+    /* The panel keeps the failure for a beat, because the rider who was
+     * watching the percentage is watching the panel. Handing the address back
+     * afterwards is skipped if something else has started meanwhile: that
+     * worker owns the screen now, and this one would only paint over it. */
     vTaskDelay(pdMS_TO_TICKS(UPDATE_PANEL_MS));
-    service_screen();
+    if (!update_busy()) {
+        service_screen();
+    }
 }
 
 static void update_worker(void *arg)
@@ -895,9 +917,10 @@ static void update_worker(void *arg)
     } else {
         update_do_check();
     }
-    upd_lock();
-    s_upd_busy = false;
-    upd_unlock();
+    /* Idempotent, and the install has usually done it already: it clears the
+     * flag before it hands the panel back, so the page's button works during
+     * that beat. */
+    upd_clear_busy();
     vTaskDelete(NULL);
 }
 
@@ -910,7 +933,7 @@ static void update_worker(void *arg)
  * page a 303 sends the browser back to is already showing the new state even
  * if the worker has not been scheduled yet.
  */
-static bool update_request(bool install)
+static bool update_request(bool install, const char *version)
 {
     if (s_upd_mtx == NULL) {
         return false;               /* nothing registered; see below */
@@ -918,6 +941,18 @@ static bool update_request(bool install)
     upd_lock();
     if (s_upd_busy || (install && !s_upd_have_offer)) {
         upd_unlock();
+        return false;
+    }
+    /* The caller has to name what it is installing, and be right. The page's
+     * button carries the tag it printed; the console has just read the status
+     * it is acting on. Either way a request that names something other than
+     * what is on offer is a request built from an answer that has since been
+     * replaced, and doing it anyway would install a version nobody read. */
+    if (install && (version == NULL ||
+                    strcmp(version, s_upd_offer.version) != 0)) {
+        upd_unlock();
+        ESP_LOGW(TAG, "refusing an install of a version that is not the one "
+                      "on offer");
         return false;
     }
     s_upd_busy  = true;
@@ -941,12 +976,12 @@ static bool update_request(bool install)
 
 static bool service_update_check(void)
 {
-    return update_request(false);
+    return update_request(false, NULL);
 }
 
-static bool service_update_install(void)
+static bool service_update_install(const char *version)
 {
-    return update_request(true);
+    return update_request(true, version);
 }
 
 static const web_update_ops_t k_update_ops = {
@@ -988,9 +1023,9 @@ static bool update_ops_register(void)
  * - its other caller - never waits for one. Adding a semaphore for the
  * console alone would be a second way for the worker to end and a second
  * thing for it to get wrong on the way out. */
-static bool update_wait(web_upd_status_t *out)
+static bool update_wait(web_upd_status_t *out, int limit_ms)
 {
-    for (int waited = 0; waited < UPDATE_WAIT_MS; waited += 100) {
+    for (int waited = 0; waited < limit_ms; waited += 100) {
         bool busy;
 
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1003,7 +1038,7 @@ static bool update_wait(web_upd_status_t *out)
         }
     }
     ESP_LOGE(TAG, "the update worker has not finished in %d s",
-             UPDATE_WAIT_MS / 1000);
+             limit_ms / 1000);
     return false;
 }
 
@@ -1040,7 +1075,7 @@ static bool app_service_update(bool install_now)
      * that has arrived since the update moved onto the page: the console is
      * free while a phone is installing, where before both were the same
      * thumb. update_request() refuses it rather than queueing a second. */
-    if (!update_request(false) || !update_wait(&st)) {
+    if (!update_request(false, NULL) || !update_wait(&st, CHECK_WAIT_MS)) {
         ESP_LOGW(TAG, "the check was not asked, or did not come back");
         return false;
     }
@@ -1061,7 +1096,11 @@ static bool app_service_update(bool install_now)
     if (!install_now) {
         return true;
     }
-    if (!update_request(true) || !update_wait(&st)) {
+    /* Named from the status this console just read, which is the same rule
+     * the page's button follows: an install that cannot say which version it
+     * means is refused. */
+    if (!update_request(true, st.text) ||
+        !update_wait(&st, INSTALL_WAIT_MS)) {
         ESP_LOGW(TAG, "the install was not asked, or did not come back");
         return false;
     }

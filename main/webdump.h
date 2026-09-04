@@ -32,6 +32,9 @@
  * length and SHA-256 before the bootloader is pointed at it, so what reaching
  * this server buys is forcing a *published* build, forward or back, and not
  * running one of somebody's own. ADR-0006's amendment says what that costs.
+ * Every POST here refuses a cross-origin submission, so "reaching this
+ * server" means what it says rather than "getting the rider's browser to load
+ * a page somewhere else".
  *
  * BLE is already down before either half starts - the mode does that with
  * cap_ble_shutdown() - because NimBLE and Wi-Fi do not fit in RAM together on
@@ -123,10 +126,16 @@ typedef struct {
  * than queueing a second request behind the first - and `install` also
  * refuses when no check has put anything on offer. `status` fills `out` for
  * whatever the last request left behind.
+ *
+ * `install` names the version it means, and is refused if that is not the one
+ * on offer. The button says which tag it will install, and a page left open
+ * in one tab while a check ran in another would otherwise install whatever
+ * arrived since under a button that still names the old one - which is the
+ * one thing this whole arrangement is supposed to be careful about.
  */
 typedef struct {
     bool (*check)(void);
-    bool (*install)(void);
+    bool (*install)(const char *version);
     void (*status)(web_upd_status_t *out);
 } web_update_ops_t;
 

@@ -321,3 +321,16 @@ change for everything else the page can do; the install is a new item on that
 list rather than a new list. Nothing here adds an authentication step, because
 a password on a device with two buttons and no keyboard is either printed next
 to the thing it guards or it is the cable this decision exists to avoid.
+
+**"Anyone who can reach the page" had to be made true, because it was not.**
+A form on any other page can post to this server: a cross-origin form
+submission is sent, and only its answer is withheld. So the set of people who
+could start an install was not the people who can reach the settings page, it
+was everyone whose page the rider's browser happens to load while the phone
+sits on the same network - which is a different and much larger set, and one
+nothing in the paragraphs above was reasoning about. Every POST route now
+refuses a request whose `Origin` names somewhere other than this server. An
+absent `Origin` is allowed, because `curl` on a bench has none and a bench
+with a cable is not the thing being defended against. That is one header and
+no state, and it is the difference between the risk this decision accepts and
+a much bigger one it did not mean to.

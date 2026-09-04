@@ -31,7 +31,7 @@
 /* Entering Service Mode takes BLE down, chooses a link and puts the address
  * on the LCD; main.c owns that sequence because the buttons trigger it too. */
 bool app_service_up(void);
-void app_service_stop(void);
+bool app_service_stop(void);
 
 static void print_status(void)
 {
@@ -331,7 +331,14 @@ static int cmd_wifi(int argc, char **argv)
             return 1;
         }
     } else if (strcmp(argv[1], "off") == 0) {
-        app_service_stop();
+        if (!app_service_stop()) {
+            /* The update has the link and is a minute from a reboot or from
+             * putting the server back. Saying "off" here and then printing
+             * `running=1` two lines further down would be the console
+             * contradicting itself. */
+            printf("WIFI error=busy with an update\n");
+            return 1;
+        }
         /* BLE is gone for good once the mode has run; say so rather than
          * letting the user believe a capture would still work. */
         printf("WIFI off - reboot to capture again\n");
