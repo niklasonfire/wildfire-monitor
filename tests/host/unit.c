@@ -4432,8 +4432,8 @@ static void test_the_advice_retires_when_it_is_taken(void)
  * whether what came back is a manifest at all. See main/wfota/wfota.h.
  *
  * Every manifest a release ever publishes is written by one heredoc in
- * scripts/release.sh, so the interesting cases are all the ones that will
- * never be published: the truncated body a dropped hotspot leaves, the HTML
+ * .github/workflows/release.yml, so the interesting cases are all the ones
+ * that will never be published: the truncated body a dropped hotspot leaves, the HTML
  * GitHub serves for a release that does not exist, a field that is missing or
  * says something the download half could not use. None of those can be
  * produced by cutting a release, and all of them can happen on a bike.
@@ -4443,8 +4443,8 @@ static void test_the_advice_retires_when_it_is_taken(void)
               "download/v0.1.0/wildfire_monitor.bin"
 #define K_SHA "3056b696feaaed678d650caed5877c712817504d819666cb699d77957b039213"
 
-/* Exactly what scripts/release.sh writes, down to the indentation and the
- * trailing newline - the one body that has to parse. */
+/* Exactly what the release workflow's heredoc writes, down to the
+ * indentation and the trailing newline - the one body that has to parse. */
 static const char k_published[] =
     "{\n"
     "  \"version\": \"v0.1.0\",\n"
@@ -4626,22 +4626,116 @@ static void test_the_url_is_latest_until_something_is_pinned(void)
 {
     char url[256];
 
-    CHECK(wfota_manifest_url(NULL, url, sizeof(url)), "no pin was refused");
+    CHECK(wfota_manifest_url(NULL, NULL, url, sizeof(url)),
+          "no pin was refused");
     CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
           "unpinned: got \"%s\"", url);
-    CHECK(wfota_manifest_url("", url, sizeof(url)), "a cleared pin was refused");
+    CHECK(wfota_manifest_url(NULL, "", url, sizeof(url)),
+          "a cleared pin was refused");
     CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
           "cleared pin: got \"%s\"", url);
 
-    CHECK(wfota_manifest_url("v0.1.0", url, sizeof(url)), "a tag was refused");
+    CHECK(wfota_manifest_url(NULL, "v0.1.0", url, sizeof(url)),
+          "a tag was refused");
     CHECK(strcmp(url, WFOTA_RELEASES "/download/v0.1.0/manifest.json") == 0,
           "pinned: got \"%s\"", url);
 
     /* A buffer that cannot hold it leaves nothing half-built behind. */
     char small[16];
-    CHECK(!wfota_manifest_url("v0.1.0", small, sizeof(small)),
+    CHECK(!wfota_manifest_url(NULL, "v0.1.0", small, sizeof(small)),
           "a URL was truncated into a buffer that could not hold it");
     CHECK(small[0] == '\0', "the truncated URL was left in the buffer");
+}
+
+/* A channel is the tail of that same URL and nothing else. Stable is the
+ * `latest` redirect, so it is spelled as the absence of a tag; a named channel
+ * is a release the publish script keeps moving. Nothing stored at all has to
+ * mean stable too, because that is what the flash of a Monitor that has never
+ * been told about channels holds. */
+static void test_a_channel_names_a_pointer_release(void)
+{
+    char url[256];
+
+    CHECK(wfota_manifest_url(WFOTA_CHANNEL_STABLE, NULL, url, sizeof(url)),
+          "the stable channel was refused a URL");
+    CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
+          "stable: got \"%s\"", url);
+
+    CHECK(wfota_manifest_url(NULL, NULL, url, sizeof(url)),
+          "no channel at all was refused a URL");
+    CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
+          "no channel: got \"%s\"", url);
+
+    CHECK(wfota_manifest_url("", NULL, url, sizeof(url)),
+          "an empty channel was refused a URL");
+    CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
+          "empty channel: got \"%s\"", url);
+
+    CHECK(wfota_manifest_url("debug", NULL, url, sizeof(url)),
+          "the debug channel was refused a URL");
+    CHECK(strcmp(url,
+                 WFOTA_RELEASES "/download/channel-debug/manifest.json") == 0,
+          "debug: got \"%s\"", url);
+
+    /* Stable is first in the walk, so a debug image always lists the way back
+     * before it lists anything else. */
+    CHECK(wfota_channel_name(0) != NULL &&
+              strcmp(wfota_channel_name(0), WFOTA_CHANNEL_STABLE) == 0,
+          "the first channel this build knows is not stable");
+    CHECK(strcmp(wfota_channel_tag(WFOTA_CHANNEL_STABLE), "") == 0,
+          "stable names a release tag instead of the latest redirect");
+}
+
+/* The channel is read back out of flash, not typed at a console: a name this
+ * build does not have is a Monitor that would otherwise have nowhere to fetch
+ * from. It resolves to stable - the stream every Monitor can always reach -
+ * rather than failing, which is the difference between a setting that is wrong
+ * and a bike that cannot be updated off the handlebar. */
+static void test_an_unknown_channel_is_stable(void)
+{
+    char        url[256];
+    char        long_name[33];       /* 32 characters, as long as an SSID */
+    const char *unknown[] = {"Debug", "prod", "../x", long_name};
+
+    memset(long_name, 'x', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+
+    for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+        CHECK(wfota_channel_tag(unknown[i]) == NULL,
+              "\"%s\" is a channel this build claims to have", unknown[i]);
+        CHECK(wfota_manifest_url(unknown[i], NULL, url, sizeof(url)),
+              "the unknown channel \"%s\" was refused a URL instead of being "
+              "read as stable", unknown[i]);
+        CHECK(strcmp(url, WFOTA_RELEASES "/latest/download/manifest.json") == 0,
+              "unknown channel \"%s\": got \"%s\"", unknown[i], url);
+    }
+}
+
+/* `ota pin <tag>` is the deliberate one-off: it is how a single suspect
+ * release is looked at without moving the bike off the stream it follows. So
+ * it outranks whatever channel is stored, and clearing it hands the bike back
+ * to that channel rather than to stable. */
+static void test_a_pin_outranks_a_channel(void)
+{
+    char url[256];
+
+    CHECK(wfota_manifest_url("debug", "v0.1.0", url, sizeof(url)),
+          "a pin on top of a channel was refused");
+    CHECK(strcmp(url, WFOTA_RELEASES "/download/v0.1.0/manifest.json") == 0,
+          "pinned on debug: got \"%s\"", url);
+
+    CHECK(wfota_manifest_url("debug", "", url, sizeof(url)),
+          "clearing the pin on a channel was refused");
+    CHECK(strcmp(url,
+                 WFOTA_RELEASES "/download/channel-debug/manifest.json") == 0,
+          "cleared pin on debug: got \"%s\"", url);
+
+    /* A pin was typed, so a bad one is still a refusal - the channel behind it
+     * does not quietly rescue it into fetching something else. */
+    CHECK(!wfota_manifest_url("debug", "v1/../../x", url, sizeof(url)),
+          "a pin with a path in it fell back to the channel instead of being "
+          "refused");
+    CHECK(url[0] == '\0', "the refused pin left a URL behind");
 }
 
 /* The pin comes off a console line, and it is pasted into a URL. Nothing that
@@ -4662,9 +4756,24 @@ static void test_a_tag_that_could_rewrite_the_url_is_refused(void)
     CHECK(!wfota_tag_ok("v0.1.0-with-a-really-long-suffix-0123456789"),
           "a tag longer than a version field");
 
-    CHECK(!wfota_manifest_url("v1/../../x", url, sizeof(url)),
+    CHECK(!wfota_manifest_url(NULL, "v1/../../x", url, sizeof(url)),
           "a tag with a path in it built a URL");
     CHECK(url[0] == '\0', "the refused tag left a URL behind");
+
+    /* The channel table is the other half of that guarantee. Its tags are
+     * fixed strings rather than anything a rider can type, and every one of
+     * them is either the `latest` redirect or a tag that would survive the
+     * check above - which is what keeps a stored channel incapable of building
+     * a URL that names something else. */
+    for (int i = 0; wfota_channel_name(i) != NULL; i++) {
+        const char *name = wfota_channel_name(i);
+        const char *tag  = wfota_channel_tag(name);
+
+        CHECK(tag != NULL, "the channel \"%s\" is listed but has no tag", name);
+        CHECK(tag != NULL && (tag[0] == '\0' || wfota_tag_ok(tag)),
+              "the channel \"%s\" names the tag \"%s\", which could rewrite "
+              "the URL", name, tag != NULL ? tag : "");
+    }
 }
 
 /* ---- picking a network -------------------------------------------------- */
@@ -4777,8 +4886,8 @@ static void test_the_digest_is_the_one_fips_180_4_defines(void)
 }
 
 /* A manifest for a body this test just built. Everything but size and sha256
- * is what release.sh would have written; those two are what the download
- * checks against. */
+ * is what the release workflow would have written; those two are what the
+ * download checks against. */
 static void manifest_for(const void *body, uint32_t len, wfota_manifest_t *m)
 {
     wfota_sha256_t s;
@@ -5083,6 +5192,9 @@ int main(void)
     test_an_oversized_body_is_refused();
     test_the_version_is_compared_for_inequality();
     test_the_url_is_latest_until_something_is_pinned();
+    test_a_channel_names_a_pointer_release();
+    test_an_unknown_channel_is_stable();
+    test_a_pin_outranks_a_channel();
     test_a_tag_that_could_rewrite_the_url_is_refused();
     test_the_strongest_known_network_is_picked();
     test_a_network_we_do_not_know_is_never_joined();

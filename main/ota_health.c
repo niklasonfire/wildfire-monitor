@@ -3,6 +3,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "ota_update.h"
+
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -99,6 +101,10 @@ static void watch_task(void *arg)
                      s_running, esp_err_to_name(err));
             break;
         }
+        /* The image has earned its place, so there is no trial outstanding:
+         * the channel it came from is now simply the channel this Monitor is
+         * on, and a rollback months from now is not this update's fault. */
+        otaup_trial_clear();
         ESP_LOGI(TAG, "%s confirmed after %" PRId64 " s, rollback cancelled",
                  s_running, up_s);
         s_confirmed = true;

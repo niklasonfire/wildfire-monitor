@@ -34,8 +34,8 @@ static const char *scan_string(const char *p, const char *end,
         /* No escapes and no control characters. None of the four fields - a
          * git tag, an https URL, lowercase hex - can hold a character that
          * would have to be escaped, so a backslash here means the body is
-         * not the file scripts/release.sh writes, and guessing at what it is
-         * instead is exactly the work ADR-0006 keeps off the handlebar. */
+         * not the file the release workflow writes, and guessing at what it
+         * is instead is exactly the work ADR-0006 keeps off the handlebar. */
         if (c == '\\' || c < 0x20) {
             return NULL;
         }
@@ -274,23 +274,74 @@ bool wfota_tag_ok(const char *tag)
     return true;
 }
 
-bool wfota_manifest_url(const char *pin, char *out, size_t cap)
+/*
+ * Every build carries the whole table, stable first, so a Monitor running a
+ * debug image always knows the way back. A channel's tag is a fixed string
+ * here rather than anything a rider can type, which is what keeps the URL out
+ * of reach of the setting: the worst a bad stored channel can do is not be
+ * found.
+ */
+static const struct {
+    const char *name;
+    const char *tag;      /* "" is the `latest` redirect */
+} k_channels[] = {
+    { WFOTA_CHANNEL_STABLE, ""              },
+    { "debug",              "channel-debug" },
+};
+
+#define CHANNEL_COUNT ((int)(sizeof(k_channels) / sizeof(k_channels[0])))
+
+const char *wfota_channel_tag(const char *name)
 {
-    int n;
+    if (name == NULL || name[0] == '\0') {
+        return "";                  /* nothing stored is stable */
+    }
+    for (int i = 0; i < CHANNEL_COUNT; i++) {
+        if (strcmp(name, k_channels[i].name) == 0) {
+            return k_channels[i].tag;
+        }
+    }
+    return NULL;
+}
+
+const char *wfota_channel_name(int i)
+{
+    if (i < 0 || i >= CHANNEL_COUNT) {
+        return NULL;
+    }
+    return k_channels[i].name;
+}
+
+bool wfota_manifest_url(const char *channel, const char *pin,
+                        char *out, size_t cap)
+{
+    const char *tag;
+    int         n;
 
     if (out == NULL || cap == 0) {
         return false;
     }
     out[0] = '\0';
 
-    if (pin == NULL || pin[0] == '\0') {
+    if (pin != NULL && pin[0] != '\0') {
+        /* The deliberate one-off outranks the stream. */
+        if (!wfota_tag_ok(pin)) {
+            return false;
+        }
+        tag = pin;
+    } else {
+        tag = wfota_channel_tag(channel);
+        if (tag == NULL) {
+            tag = "";               /* a channel this build does not have */
+        }
+    }
+
+    if (tag[0] == '\0') {
         /* The redirect GitHub keeps pointing at the newest release, which is
          * the whole reason nothing on the device carries a version number. */
         n = snprintf(out, cap, "%s/latest/download/manifest.json", WFOTA_RELEASES);
-    } else if (!wfota_tag_ok(pin)) {
-        return false;
     } else {
-        n = snprintf(out, cap, "%s/download/%s/manifest.json", WFOTA_RELEASES, pin);
+        n = snprintf(out, cap, "%s/download/%s/manifest.json", WFOTA_RELEASES, tag);
     }
     if (n < 0 || (size_t)n >= cap) {
         out[0] = '\0';

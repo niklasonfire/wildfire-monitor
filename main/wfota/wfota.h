@@ -28,10 +28,10 @@
  * limit worth writing down rather than discovering next to a hotspot. */
 #define WFOTA_SSID_MAX    32
 
-/* What the fetch is allowed to bring back. The manifest release.sh writes is
- * about 250 bytes; a kilobyte is room for a fifth field and for the pretty
- * printing, and it is the point at which "this is not our manifest" is a
- * better answer than reading further. */
+/* What the fetch is allowed to bring back. The manifest the release
+ * workflow writes is about 250 bytes; a kilobyte is room for a fifth field
+ * and for the pretty printing, and it is the point at which "this is not
+ * our manifest" is a better answer than reading further. */
 #define WFOTA_BODY_MAX    1024
 
 /* An app slot from partitions.csv. A manifest naming an image that cannot fit
@@ -41,9 +41,18 @@
 
 /* The one URL the Monitor knows, less the tail that says which release. It is
  * a literal rather than something read out of a build variable because the
- * device has no remote to ask; scripts/release.sh derives the same slug from
- * `git remote get-url origin` when it writes the manifest's own url field. */
+ * device has no remote to ask; .github/workflows/release.yml builds the same
+ * slug out of GITHUB_SERVER_URL and GITHUB_REPOSITORY when it writes the
+ * manifest's own url field. */
 #define WFOTA_RELEASES "https://github.com/niklasonfire/wildfire_monitor/releases"
+
+/* A channel is the tail of that URL and nothing more. `stable` is the empty
+ * tag - GitHub's `latest` redirect - so that an absent, unreadable or unknown
+ * setting resolves to stable by construction rather than by a branch somebody
+ * has to remember to write. Longest name in the table, plus room to type a
+ * wrong one and be told so. */
+#define WFOTA_CHANNEL_MAX    15
+#define WFOTA_CHANNEL_STABLE "stable"
 
 typedef struct {
     char     version[WFOTA_VERSION_MAX + 1];
@@ -68,11 +77,12 @@ const char *wfota_err_str(wfota_err_t err);
  *
  * Deliberately not a JSON parser: it accepts a flat object of string and
  * number values and refuses everything else - nesting, arrays, literals,
- * escapes. The manifest is ours, written by scripts/release.sh from a shell
- * heredoc, and what the Monitor does not have to parse on a handlebar it
- * cannot fail to parse there. A key it does not know is skipped rather than
- * refused, so that publishing a fifth field one day does not stop a Monitor
- * running today's firmware from reading the four it does know.
+ * escapes. The manifest is ours, written by .github/workflows/release.yml
+ * from a shell heredoc, and what the Monitor does not have to parse on a
+ * handlebar it cannot fail to parse there. A key it does not know is
+ * skipped rather than refused, so that publishing a fifth field one day
+ * does not stop a Monitor running today's firmware from reading the four
+ * it does know.
  */
 wfota_err_t wfota_manifest_parse(const char *body, size_t len,
                                  wfota_manifest_t *out);
@@ -85,11 +95,36 @@ wfota_err_t wfota_manifest_parse(const char *body, size_t len,
 bool wfota_tag_ok(const char *tag);
 
 /*
- * The manifest URL for the pinned tag, or for `latest` when `pin` is NULL or
- * empty. False when the tag is not one wfota_tag_ok() accepts or the result
- * would not fit, and `out` is then left as an empty string.
+ * The release tag a channel names, or "" for stable, which is the `latest`
+ * redirect. NULL when `name` is not one of the channels this firmware was
+ * built with - which every caller reads as stable, because a channel with no
+ * URL behind it must not be a channel a Monitor can end up on.
  */
-bool wfota_manifest_url(const char *pin, char *out, size_t cap);
+const char *wfota_channel_tag(const char *name);
+
+/*
+ * Walks the channels this firmware knows: 0 is always stable, NULL past the
+ * end. It is a walk rather than a count so that the settings page and the
+ * console list what the build actually has, and not what they remember.
+ */
+const char *wfota_channel_name(int i);
+
+/*
+ * The manifest URL for the pinned tag; failing that for the channel; failing
+ * that for `latest`. A pin outranks a channel because it is the deliberate
+ * one-off - `ota pin <tag>` is how a single suspect release is looked at
+ * without moving the bike off the stream it follows.
+ *
+ * An unknown `channel` is stable rather than a refusal: it is a value read
+ * back out of flash, and the answer to not recognising it is the stream every
+ * Monitor can always reach. A `pin` that wfota_tag_ok() refuses is still a
+ * refusal, because that one was typed.
+ *
+ * False when the pin is unusable or the result would not fit, and `out` is
+ * then left as an empty string.
+ */
+bool wfota_manifest_url(const char *channel, const char *pin,
+                        char *out, size_t cap);
 
 /* One access point the scan saw. */
 typedef struct {
