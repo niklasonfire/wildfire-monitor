@@ -67,11 +67,12 @@ argument one level out: a thing produced by a machine you can inspect, from
 a tree you can name, beats a thing produced somewhere else. The repository
 has no CI, and standing one up would mean pinning an ESP-IDF version in a
 container and keeping it matched to the desktop - a second toolchain to
-disagree with the first. `scripts/release.sh` builds and calls
-`gh release create`, and refuses to publish from a dirty tree or from a
-commit the tag does not sit on. Without those two guards the local build
-ships whatever was in the editor. (There is CI now; the amendment at the
-end of this document says what changed and what did not.)
+disagree with the first. So a release script on the development machine builds
+and calls `gh release create`, and refuses to publish from a dirty tree or
+from a commit the tag does not sit on. Without those two guards the local
+build ships whatever was in the editor. (There is CI now, and that script has
+since been deleted; the amendment at the end of this document says what
+changed and what did not.)
 
 ## Consequences
 
@@ -136,7 +137,7 @@ shows an error and returns to the menu. It does not retry by itself: the
 rider is standing next to the Monitor during an update, and an automatic
 retry would only hide a hotspot that is too weak to finish.
 
-## Amendment: there is CI, and it does not publish
+## Amendment: there is CI, and it publishes
 
 The "no CI" half of the argument above no longer holds, and it is worth
 saying exactly which half.
@@ -154,17 +155,41 @@ the same image `./idf.sh` runs it in, named in the same place. The runner is
 docker-in-docker and carries no toolchain of its own, so there is nothing on
 it that can drift. Two callers, one image; when the image moves, both move.
 
-**The trust boundary has not moved.** CI builds and keeps the artifacts. It
-does not tag, it does not write a manifest, and it does not call
-`gh release create`. Publishing is still `scripts/release.sh` run from the
-development machine, still refusing a dirty tree and a tag that is not on
-`HEAD`, and still the only thing that produces the four fields update mode
-reads. So what a rider's Monitor installs is what this ADR always said it
-was: an image built from a tree you can name, by a machine you can inspect.
+**The trust boundary moved onto the runner, and the guard that matters
+moved with it.** This paragraph used to say CI did not tag, did not write
+a manifest and did not call `gh release create`. Since `9e51bdc` that is
+false: `.github/workflows/release.yml` fires on a pushed `v*` tag, builds
+in the same image, writes the same four fields, and publishes the release
+with `softprops/action-gh-release@v2`. The check this ADR actually leans
+on survived the move - the version is read back out of `esp_app_desc_t`
+and the release refuses to go out unless it is the tag, so the image and
+the manifest still cannot disagree. The two local guards had nothing to
+move to: the workflow builds from a checkout of the tag itself, so there
+is no dirty tree to refuse and no way for `HEAD` to be a different commit.
+They were guards against a desk, and on the runner there is no desk -
+which is why the script they lived in could be deleted without losing
+anything. What did change is *which* machine - a build machine outside
+GitHub rather than the one the firmware is written on. It runs the image
+`./idf.sh` names, so "an image built from a tree you can name, by a
+machine you can inspect" still holds; it is no longer the same machine,
+which is a smaller move than it sounds and is still a move.
+
+**The desktop publisher has been retired, and there is one release and one
+publisher again.** For a while both existed, so a tag could be published
+twice - once by the push and once from the desktop - and both wrote
+`manifest.json` onto the same release, the second writer winning. That
+happened on `v0.3.0`, and because the two did not even attach the same
+image, which bytes landed on a bike was decided by a race: exactly the
+kind of "the release names one thing and holds another" this decision
+exists to prevent. The script is deleted. The argument that put it there -
+a release built from a tree you can name, by a machine you can inspect -
+is now carried by the workflow, which builds a checkout of the tag in the
+image `./idf.sh` names. Publishing is `git tag vX.Y.Z && git push origin
+vX.Y.Z` and nothing else; `docs/release.md` says what happens after that.
 
 What CI buys is the thing local-only building never gave: a pull request
 that will not compile says so before it is merged, rather than at the
 moment somebody wants to cut a release from it. It also does not run the
-host suite - `make test` is still the developer's to run, and
-`scripts/release.sh` still does not run it either. That is a gap worth
-closing and it is not closed here.
+host suite - `make test` is still the developer's to run, and nothing between
+the editor and a published release runs it. That is a gap worth closing and it
+is not closed here.

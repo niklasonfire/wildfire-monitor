@@ -317,8 +317,9 @@ is public:
 | `wifi add <ssid> [passphrase]` | Remember a network, up to four; quote anything with a space in it |
 | `wifi list` | What is stored, passphrases by length only |
 | `wifi del <ssid>` | Forget one |
-| `ota` | Slot, rollback health, the pin, and the URL the next check reads |
-| `ota pin <tag>` / `ota pin` | Read one release instead of `latest` / go back to `latest` |
+| `ota` | Slot, rollback health, the channel, the pin, and the URL the next check reads |
+| `ota channel [<name>]` | Read the `debug` channel instead of `stable` / bare goes back to `stable` |
+| `ota pin <tag>` / `ota pin` | Read one release instead of the channel's newest / go back to it |
 | `ota check` | Run the check from the console, without the menu |
 | `ota install` | Check and install without waiting for the button press - how this is exercised on the bench |
 
@@ -332,6 +333,14 @@ the ability to change the list, not to read it. Readout mode has to be running
 for the page to exist, which means BLE is down and the way back to capturing is
 a reboot: the same price pulling a Capture off the board already costs.
 
+The page picks the update channel too: `stable`, which is the newest published
+release and where a Monitor is unless somebody has said otherwise, or `debug`,
+a build meant for one bike and invisible to every other. It shows the URL the
+choice resolves to, which is what makes *which channel am I on* answerable
+without a cable, and the choice takes effect at the next update - so acting on
+it means rebooting and picking `UPDATE`. Nothing that can be stored there, and
+no rollback, can leave a Monitor unable to get back to `stable`: see ADR-0008.
+
 The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
 the right kind of secret to keep on a bike, and it can be rotated on the
 phone. Trust for the fetch comes from the ESP-IDF certificate bundle and not
@@ -343,19 +352,23 @@ release out. See ADR-0006.
 ## Publishing a release
 
 Update mode reads a manifest published on a GitHub release of this repository,
-and `scripts/release.sh` is what makes one:
+and pushing a version tag is what makes one:
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
-./scripts/release.sh v0.2.0
+make test                          # the host suite, which CI does not run
+git tag v0.2.0                     # on the commit you mean to release
+git push origin v0.2.0             # this is the publish
 ```
 
-It builds in the usual container, writes a four-field manifest - `version`,
-`url`, `size`, `sha256` - and attaches both files to the release, so the
-newest one is always at `releases/latest/download/manifest.json`. It refuses
-to publish from a dirty tree, from a commit the tag does not sit on, or when
-the image's own version is not the tag, because there is no CI between the
-editor and the bike. `--dry-run` stops before publishing. See
+`.github/workflows/release.yml` fires on any `v*` tag. It builds in the same
+`espressif/idf:v6.1` image `./idf.sh` uses, writes a four-field manifest -
+`version`, `url`, `size`, `sha256` - and attaches it to the release beside the
+app image, a merged image, the bootloader and the partition table, so the
+newest manifest is always at `releases/latest/download/manifest.json`. It
+refuses to publish when the version baked into the image is not the tag, which
+is what stops the release naming one build and holding another. A tag with a
+dash in it is a prerelease, invisible to every unpinned Monitor, and moves the
+`debug` channel instead; see ADR-0008. There is no local publish path. See
 `docs/release.md` and ADR-0006.
 
 ## Board pins (M5StickC PLUS2)
