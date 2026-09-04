@@ -241,14 +241,13 @@ A is the capture workflow - scan, start, stop - and short B is a Marker while
 a Capture is recording, and nothing otherwise. It used to toggle the backlight
 and no longer does: an unlit panel was one stray press away, and the same
 press means Marker as soon as a Capture starts. The backlight is `disp on|off`
-on the console. Holding B opens a menu instead of going straight to readout
-mode as it used to: B cycles the entries, A picks one, and holding B again, a
-short press of the power button, or ten seconds of nothing at all closes it.
+on the console. Holding B opens a menu instead of going straight to Wi-Fi as
+it used to: B cycles the entries, A picks one, and holding B again, a short
+press of the power button, or ten seconds of nothing at all closes it.
 
 | Entry | What it does |
 | --- | --- |
-| `READOUT` | Wi-Fi access point, Captures and settings over HTTP, back only by reboot |
-| `UPDATE` | joins a hotspot it knows and installs the published release |
+| `SERVICE` | Wi-Fi: joins a network it knows or puts up its own, serves the Captures, the settings and the update, back only by reboot |
 | `INFO` | the running firmware version and app slot; any key goes back |
 
 `INFO` is the one entry that takes nothing down - no radio, no BLE shutdown,
@@ -258,7 +257,10 @@ it is wrapped at a `-` rather than clipped, which is what keeps a `-dirty` on
 screen.
 
 The menu will not open while a Capture is recording or connecting, and says so
-on the panel: both modes need the radio the Capture is using. See ADR-0006.
+on the panel: `SERVICE` needs the radio the Capture is using. Holding B while
+pressing A on `SERVICE` skips the scan and goes straight to the access point,
+which is worth knowing in a car park with no hotspot in range and is not
+otherwise required. See ADR-0006.
 
 ## Firmware slots and rollback
 
@@ -281,13 +283,44 @@ the board before flashing it.** A partition table cannot be replaced over the
 air, so that flash is the cable this whole arrangement exists to be the last
 of.
 
-## Update mode
+## The Wi-Fi mode
 
-`UPDATE` on the menu joins a hotspot and reads the manifest of the newest
-release, so the panel says either `UP TO DATE` or the tag on offer. Nothing is
-installed on the strength of that: `A` accepts the tag and `B`, or ten seconds
-of nobody answering, declines it. Accepted, the image streams into the spare
-app slot behind a percentage on the panel, and the Monitor reboots into it.
+`SERVICE` on the menu is the only Wi-Fi mode there is, and it is a station
+first. It tries to join the strongest of the networks it knows and serves
+everything over that link; failing to join anything at all - nothing stored,
+nothing in range, nothing known among what was in range, a passphrase the
+access point refused - it puts up its own access point instead and serves the
+same pages over that. The panel says which of the two it landed on, the
+address to type into a phone, and either the access point's password or the
+signal strength of the network it joined.
+
+| Landed on | Panel shows | What is served |
+| --- | --- | --- |
+| a network it knows | the SSID, `http://<address>`, the signal in dBm | Captures, settings, and the update |
+| its own access point | `wildfire-xxxxxx`, `pw wildfire`, `http://192.168.4.1` | Captures and settings |
+
+The fallback is the point of the arrangement, not a nicety. The settings page
+is where the list of networks is edited without a cable, so it has to be
+reachable from the failure that list caused: a hotspot key rotated on the
+phone, or an SSID typed with a capital in the wrong place, would otherwise
+cost the USB lead and an unclipped Monitor. It is also the whole of the
+bootstrap - a Monitor that has never been told a network puts its access point
+up without scanning first, the rider adds their hotspot on the page that is
+already there, and every entry after that joins it.
+
+BLE goes down before the radio comes up, because Wi-Fi and NimBLE do not fit
+in this chip's RAM together, so the way back to capturing is a reboot - which
+is what `A` does from the mode's screen. The mode is refused while a Capture
+is running.
+
+### The update
+
+Joined to a network, and only then, the mode reads the manifest of the newest
+release on the way in, so the panel says either `UP TO DATE` or the tag on
+offer. Nothing is installed on the strength of that: `A` accepts the tag and
+`B`, or ten seconds of nobody answering, declines it, and either way the
+screen settles back onto the address. Over the access point there is no
+upstream and no update is offered.
 
 What the download checks, in this order, is what makes the reboot safe:
 
@@ -298,48 +331,57 @@ What the download checks, in this order, is what makes the reboot safe:
   partition is switched, so an image that does not match never becomes
   bootable;
 * the new image then comes up on probation and has to pass the health check
-  below, or the next reset takes the previous firmware back.
+  above, or the next reset takes the previous firmware back.
 
 A rollback is not silent: the firmware that comes back up says `ROLLED BACK` on
-the panel and `ota` prints which slot was abandoned.
+the panel and `ota` prints which slot was abandoned. A failure is left failed -
+it names which failure it was and hands the panel back, and nothing retries on
+its own - but the link and the pages stay up underneath the message, so a cut
+download leaves the settings page in reach rather than taking it away.
 
-It shares readout mode's shape: Wi-Fi and NimBLE do not fit in this chip's RAM
-together, so BLE goes down when it starts and the way back to capturing is a
-reboot. A failure is left failed - it names which failure it was and hands the
-panel back, and nothing retries on its own.
+### The networks it may join
 
-The networks it may join live in NVS and arrive either from the console or
-from the settings page readout mode serves - never from this repository, which
-is public:
+They live in NVS and arrive either from the console or from the settings page,
+never from this repository, which is public:
 
 | Command | Effect |
 | --- | --- |
+| `wifi on` / `wifi off` | Enter the Wi-Fi mode / take it back down |
 | `wifi add <ssid> [passphrase]` | Remember a network, up to four; quote anything with a space in it |
 | `wifi list` | What is stored, passphrases by length only |
 | `wifi del <ssid>` | Forget one |
 | `ota` | Slot, rollback health, the channel, the pin, and the URL the next check reads |
 | `ota channel [<name>]` | Read the `debug` channel instead of `stable` / bare goes back to `stable` |
 | `ota pin <tag>` / `ota pin` | Read one release instead of the channel's newest / go back to it |
-| `ota check` | Run the check from the console, without the menu |
-| `ota install` | Check and install without waiting for the button press - how this is exercised on the bench |
+| `ota check` | Read the manifest, bringing the mode up first if it is not |
+| `ota install` | The same, and install without waiting for the button press - how this is exercised on the bench |
 
-The same list is on the settings page at `http://192.168.4.1/settings`, linked
-from the capture listing readout mode puts up: it shows what is stored, adds a
-network and forgets one, which is `wifi add|list|del` without a PC. Typing a
-stored network's name again replaces its passphrase, which is the rotation a
-phone hotspot eventually needs. It never shows a passphrase back, only counts
-its characters - so what the access point's shared key buys someone in range is
-the ability to change the list, not to read it. Readout mode has to be running
-for the page to exist, which means BLE is down and the way back to capturing is
-a reboot: the same price pulling a Capture off the board already costs.
+`wifi on` stops at the mode and does not go looking for an update; `ota check`
+is the command that has always meant that and still does. On the panel there
+is one entry and it does both, because a rider has nothing to type. Both `ota`
+subcommands refuse when the mode fell back to the access point: there is no
+upstream behind it, and the honest answer to "check" is that there was nothing
+to ask.
+
+### The settings page
+
+`http://<address>/settings`, linked from the capture listing, is `wifi
+add|list|del` without a PC: it shows what is stored, adds a network and
+forgets one. Typing a stored network's name again replaces its passphrase,
+which is the rotation a phone hotspot eventually needs. It never shows a
+passphrase back, only counts its characters - so what reaching the page buys
+is the ability to change the list, not to read it. Over the access point the
+shared key is the whole of what stands in front of it, and over a joined
+network so is that network.
 
 The page picks the update channel too: `stable`, which is the newest published
 release and where a Monitor is unless somebody has said otherwise, or `debug`,
 a build meant for one bike and invisible to every other. It shows the URL the
 choice resolves to, which is what makes *which channel am I on* answerable
-without a cable, and the choice takes effect at the next update - so acting on
-it means rebooting and picking `UPDATE`. Nothing that can be stored there, and
-no rollback, can leave a Monitor unable to get back to `stable`: see ADR-0008.
+without a cable. The manifest is read on the way into the mode, before the
+page exists to be opened, so a channel saved there is read at the next entry.
+Nothing that can be stored there, and no rollback, can leave a Monitor unable
+to get back to `stable`: see ADR-0008.
 
 The passphrases sit in NVS unencrypted, deliberately: a phone hotspot key is
 the right kind of secret to keep on a bike, and it can be rotated on the
@@ -351,7 +393,7 @@ release out. See ADR-0006.
 
 ## Publishing a release
 
-Update mode reads a manifest published on a GitHub release of this repository,
+The Monitor reads a manifest published on a GitHub release of this repository,
 and pushing a version tag is what makes one:
 
 ```bash

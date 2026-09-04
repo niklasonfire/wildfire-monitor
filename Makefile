@@ -60,7 +60,7 @@ test: test-unit test-replay test-scripts
 
 # The decoding a recorded ride cannot reach: the Odometer wrap, which no
 # fixture we hold crosses, the power block's offsets read out of a frame built
-# byte by byte, and the manifests update mode has to refuse - which no release
+# byte by byte, and the manifests the update has to refuse - which no release
 # will ever publish. See tests/host/unit.c.
 test-unit: $(UNIT)
 	$(UNIT)
@@ -109,7 +109,7 @@ $(BUILD)/wfest.o: $(WFEST)/wfest.c $(WFEST)/wfest.h $(FIT_H) $(GEN_STAMP) \
                   | $(BUILD)
 	$(CC) $(PURE_STD) $(WARN) $(OPT) $(FPDET) $(INC) -c $< -o $@
 
-# The pure half of update mode - the manifest, its URL, and which network to
+# The pure half of the update - the manifest, its URL, and which network to
 # join. Nothing generated goes into it, so unlike the two above it does not
 # wait on the Field Table.
 $(BUILD)/wfota.o: $(WFOTA)/wfota.c $(WFOTA)/wfota.h | $(BUILD)

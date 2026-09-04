@@ -105,6 +105,6 @@ void cap_live_get(wf_ctrl_live_t *out);
 void cap_est_get(wf_est_out_t *out);
 
 /* Stops everything and takes NimBLE and the BT controller down so the Wi-Fi
- * readout mode has the RAM. The only way back to capturing is a reboot. */
+ * mode has the RAM. The only way back to capturing is a reboot. */
 esp_err_t cap_ble_shutdown(void);
 bool      cap_ble_down(void);

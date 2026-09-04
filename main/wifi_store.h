@@ -1,10 +1,19 @@
 /*
- * wifi_store - the networks update mode is allowed to join.
+ * wifi_store - the networks the Monitor is allowed to join.
  *
- * A list from the first commit, and not a single network (ADR-0006). Only the
- * console writes to it today, but a rider with a second phone must not be a
- * data-model change, and a provisioning screen later should find a way in
- * here rather than start a second store.
+ * A list from the first commit, and not a single network (ADR-0006). A rider
+ * with a second phone must not be a data-model change, and this comment used
+ * to say that a provisioning screen would one day have to find a way in here
+ * rather than start a second store. It did: the settings page webdump.c
+ * serves writes through wifi_store_add() and wifi_store_del() and holds
+ * nothing of its own, so it and the console agree by construction.
+ *
+ * That page is now the way in that always exists (#41). The Monitor has one
+ * Wi-Fi mode, it serves the page over the access point it falls back to just
+ * as readily as over a network it joined, and so a list that has gone
+ * wrong - a rotated key, an SSID typed with a capital in the wrong place - is
+ * edited from the failure it caused rather than over the cable ADR-0006
+ * exists to avoid.
  *
  * The passphrases sit in NVS unencrypted, deliberately: encryption on this
  * board would only move the key next to the ciphertext, and what is stored is

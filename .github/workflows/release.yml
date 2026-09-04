@@ -3,7 +3,7 @@ name: release
 #   git tag v1.2.3 && git push origin v1.2.3
 # Builds wildfire_monitor for esp32 inside espressif/idf:v6.1 (same image idf.sh uses),
 # then publishes a GitHub Release with the firmware binaries and the manifest that
-# update mode reads. See docs/release.md and ADR-0006: the Monitor knows exactly one
+# the Monitor reads. See docs/release.md and ADR-0006: the Monitor knows exactly one
 # URL, https://github.com/<owner>/<repo>/releases/latest/download/manifest.json, and a
 # release without that file attached is a release no bike can install.
 on:
@@ -51,7 +51,7 @@ jobs:
           ls -l release
 
       - name: Write the OTA manifest
-        # The four fields update mode parses, and nothing else — main/wfota
+        # The four fields the Monitor parses, and nothing else — main/wfota
         # refuses a body that is not the flat object described in ADR-0006.
         # `url` names this release's own app image rather than `latest`, so an
         # old manifest keeps naming the image it was published with.
@@ -67,7 +67,7 @@ jobs:
           # would refuse is one it can never install: letters, digits, dot, dash
           # and underscore, and short enough for esp_app_desc_t::version.
           case "$VERSION" in
-            *[!A-Za-z0-9._-]*) die "tag '$VERSION' holds a character update mode will not accept" ;;
+            *[!A-Za-z0-9._-]*) die "tag '$VERSION' holds a character the Monitor will not accept" ;;
           esac
           [ "${#VERSION}" -le 31 ] || die "tag '$VERSION' is longer than the 31 characters an image can carry"
 
@@ -75,7 +75,7 @@ jobs:
           # esp_app_desc_t follows the 24-byte image header and the 8-byte
           # segment header, and its version[32] sits 16 bytes into that, so 48.
           # This is what makes the image and the manifest incapable of
-          # disagreeing. Update mode compares the two strings for inequality, so
+          # disagreeing. The Monitor compares the two strings for inequality, so
           # an image calling itself anything else is one the Monitor would
           # install, reboot into, and still see as an update waiting.
           BAKED="$(dd if="$APP" bs=1 skip=48 count=32 2>/dev/null | tr -d '\0')"
@@ -116,7 +116,7 @@ jobs:
             Built in `espressif/idf:v6.1` on the self-hosted runner from tag `${{ github.ref_name }}`.
 
             ### Update over the air
-            `manifest.json` is what update mode fetches; it names the app image
+            `manifest.json` is what the Monitor fetches; it names the app image
             below, its size and its sha256. Nothing has to be downloaded by hand.
 
             ### Flash — single merged image (easiest)

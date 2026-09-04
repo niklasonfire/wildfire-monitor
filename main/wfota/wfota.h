@@ -1,7 +1,7 @@
 /*
- * wfota - the part of update mode that has no radio in it.
+ * wfota - the part of the update that has no radio in it.
  *
- * Update mode is three questions - which network do I join, what is the URL,
+ * The update is three questions - which network do I join, what is the URL,
  * and is what came back a manifest - and none of the three needs Wi-Fi, TLS
  * or a board to answer. They live here so they can be driven off the bike,
  * where a malformed manifest is a string literal instead of a release nobody

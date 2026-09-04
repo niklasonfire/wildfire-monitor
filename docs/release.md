@@ -1,6 +1,6 @@
 # Publishing a release
 
-A release is what update mode installs. It is two files attached to a GitHub
+A release is what the Monitor installs over the air. It is two files attached to a GitHub
 release of this repository: the app image, and a manifest of four fields that
 names it. Pushing a version tag is what produces both, and ADR-0006 explains
 why a release is a public GitHub release at all - its amendment says why the
@@ -49,7 +49,7 @@ version number, and nothing here has to edit a file to publish one.
    driven by `docker run` because the runner is docker-in-docker and carries
    no toolchain of its own. Then `idf.py merge-bin` for the single-file image.
 3. **Collects the assets**: `wildfire_monitor-<tag>-app-ota.bin`, the app-only
-   image update mode installs; `wildfire_monitor-<tag>-merged.bin` for flashing
+   image the Monitor installs; `wildfire_monitor-<tag>-merged.bin` for flashing
    a blank board in one write; `bootloader-<tag>.bin` and
    `partition-table-<tag>.bin` for flashing at the esp32 offsets.
 4. **Writes `manifest.json`**, four fields and no more, from a heredoc - and
@@ -78,7 +78,7 @@ the releases page when one fires:
 | Message | What happened |
 | --- | --- |
 | `release/wildfire_monitor-<tag>-app-ota.bin was not produced by the build` | the build did not leave the app image where the collect step put it |
-| `tag '<tag>' holds a character update mode will not accept` | the tag is outside letters, digits, dot, dash and underscore, so `wfota_tag_ok()` on the device would refuse it |
+| `tag '<tag>' holds a character the Monitor will not accept` | the tag is outside letters, digits, dot, dash and underscore, so `wfota_tag_ok()` on the device would refuse it |
 | `tag '<tag>' is longer than the 31 characters an image can carry` | `esp_app_desc_t::version` is 32 bytes with a terminator |
 | `the image calls itself '<x>', not '<tag>'` | two tags sit on this commit and `git describe` picked the other one |
 
@@ -163,7 +163,7 @@ channel selector on the settings page and a reboot into `UPDATE`.
 
 `latest` falls back when a release is deleted. **The pointer does not.** Delete
 a debug release without moving the pointer and `channel-debug` serves a
-manifest naming an asset that is gone, which update mode reports as a failed
+manifest naming an asset that is gone, which the Monitor reports as a failed
 download and hands the panel back. So move the pointer first, by copying an
 older debug release's manifest onto it:
 

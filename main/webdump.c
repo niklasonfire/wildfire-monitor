@@ -1,23 +1,35 @@
 /*
- * webdump - Wi-Fi readout mode: SoftAP plus a small HTTP file server.
+ * webdump - the HTTP server behind the Monitor's one Wi-Fi mode, and the
+ * access point that mode falls back to.
  *
  * The console runs at 115200 baud, which is about four minutes per megabyte;
  * a ride is several megabytes. So instead of shipping the capture out over the
- * serial link the board becomes an access point and serves the files over
- * HTTP, where the same capture takes seconds. Nothing here is reachable from
- * anywhere but that AP, which is WPA2 protected and lives for one readout
- * session: there is no authentication beyond the pre-shared key.
+ * serial link the board serves the files over HTTP, where the same capture
+ * takes seconds: connect a phone or a laptop, open the page, download.
  *
- * The same server carries the settings page, because a phone already joined to
- * pull a capture off is the one place on this bike a rider can type. What it
- * settles today is the list of networks update mode may join - ADR-0006 asked
- * that a provisioning screen find its way into wifi_store rather than start a
- * second store, and this is that way in. Passphrases go in and are never
- * rendered back out; the page counts their characters the way `wifi list` does
- * on the console. So the pre-shared key above buys whoever is in range the
- * ability to change that list, not to read what is in it.
+ * The same server carries the settings page, because a phone already joined
+ * to pull a capture off is the one place on this bike a rider can type. What
+ * it settles is the list of networks the Monitor may join, and the channel
+ * the next update reads - ADR-0006 asked that a provisioning screen find its
+ * way into wifi_store rather than start a second store, and this is that way
+ * in. Passphrases go in and are never rendered back out; the page counts
+ * their characters the way `wifi list` does on the console.
  *
- * BLE is already down when web_start() runs - the caller does that with
+ * Two halves, and the split is the point (#41). web_ap_start() puts up the
+ * SoftAP - one netif, one DHCP server, one WPA2 key - and web_serve_start()
+ * puts the httpd on top of whatever link is already there. That is what lets
+ * the same handlers answer over a hotspot ota_update.c joined as a station,
+ * so the settings page is reachable from the failure it exists to repair
+ * rather than only from a mode entered instead of that one. Which link the
+ * Monitor is on is main.c's decision; nothing below this line asks.
+ *
+ * On the access point there is no authentication beyond the pre-shared key,
+ * and on a joined network there is none at all - anyone else on the rider's
+ * hotspot can reach these pages. That is the same bargain either way: what is
+ * on offer is a recording of a bike and a list of SSIDs, and the one secret
+ * in reach, a stored passphrase, never leaves the board.
+ *
+ * BLE is already down when either half starts - the caller does that with
  * cap_ble_shutdown() - because NimBLE and Wi-Fi do not fit in RAM together on
  * this chip. That is also why the handlers keep almost nothing static and
  * borrow their buffers from the heap only for the length of a response.
@@ -55,11 +67,15 @@ static const char *TAG = "web";
 /* Length of "cap0001.wfl", the only file name shape the server accepts. */
 #define WEB_NAME_LEN  11
 
+/* The server, and separately the access point it may or may not be sitting
+ * on. Two flags rather than one, because the mode can hold either without the
+ * other: the link comes up first and goes down last, and over a joined
+ * network there is no access point here at all. */
 static httpd_handle_t s_server;
 static esp_netif_t *s_netif;
 static esp_event_handler_instance_t s_wifi_evt;
 static bool s_wifi_inited;
-static bool s_running;
+static bool s_ap_running;
 
 /* ------------------------------------------------------------------ utils */
 
@@ -378,7 +394,7 @@ static esp_err_t rm_post(httpd_req_t *req)
 /* --------------------------------------------------------- HTTP: settings */
 
 /*
- * The settings page edits the list of networks update mode may join. It is a
+ * The settings page edits the list of networks the Monitor may join. It is a
  * front end for wifi_store and keeps no state of its own, which is what makes
  * it agree with the console's `wifi add|list|del` by construction rather than
  * by both being kept up to date.
@@ -444,17 +460,20 @@ static const char k_list_full[] =
     "<p class=\"e\">The list is full. Forget one to add another.</p>";
 
 static const char k_settings_note[] =
-    /* Readout mode and update mode both take BLE down and neither can
-     * hand over to the other, so there is no "check now" button to offer
-     * here - saying so is the only way a rider learns that saving a
-     * channel and then walking away changed nothing yet. */
-    "<p class=\"e\">A channel is read at the next update, not now: this "
-    "page and update mode cannot run together, so reboot and choose "
-    "UPDATE from the B menu for a change here to be used.</p>"
+    /* The manifest is read on the way into the mode, before this page
+     * exists to be opened, so a channel saved here cannot be the one that
+     * was just read. There is deliberately no "check now" button - the
+     * install has to be confirmed on the device (ADR-0006), so a button
+     * here could only start something the rider would then have to walk
+     * back to the bike to answer. Saying so is the only way a rider learns
+     * that saving a channel and walking away changed nothing yet. */
+    "<p class=\"e\">A channel is read when this mode starts and looks for an "
+    "update, which has already happened by the time this page is open. Save "
+    "one here and it is read the next time the mode is entered.</p>"
     "<p class=\"e\">A passphrase is stored unencrypted and is never shown "
-    "back, only counted - long enough to spot a typo by. Anyone who can open "
-    "this page has the access point's key already and can change this "
-    "list.</p>";
+    "back, only counted - long enough to spot a typo by. Anyone who can reach "
+    "this page can change this list: the access point's shared key, or the "
+    "rider's own network, is the whole of what stands in front of it.</p>";
 
 /* The banner above the list, or NULL for no banner. What arrives on the query
  * string is only ever looked up in the table, so nothing a client sends can
@@ -684,7 +703,7 @@ static esp_err_t settings_get(httpd_req_t *req)
     err = send_head(req, "settings", k_nav_captures);
     if (err == ESP_OK) {
         snprintf(sub, sizeof(sub),
-                 "<p class=\"sub\">%d of %d network(s) update mode may "
+                 "<p class=\"sub\">%d of %d network(s) the Monitor may "
                  "join</p>", n, WIFI_STORE_MAX);
         err = httpd_resp_sendstr_chunk(req, sub);
     }
@@ -733,8 +752,10 @@ static esp_err_t settings_get(httpd_req_t *req)
 
     if (err == ESP_OK && n == 0) {
         err = httpd_resp_sendstr_chunk(req,
-            "<p class=\"e\">No networks stored. Update mode has nothing to "
-            "join until one is added below.</p>");
+            "<p class=\"e\">No networks stored, so there is nothing to "
+            "join and the Monitor puts up this access point instead. Add one "
+            "below and it will be joined from the next entry on - which is "
+            "also what makes an update possible.</p>");
     }
 
     for (int i = 0; i < n && err == ESP_OK; i++) {
@@ -891,7 +912,7 @@ static const httpd_uri_t k_uri_ota_channel = {
     .user_ctx = NULL,
 };
 
-/* ------------------------------------------------------------------- wifi */
+/* ------------------------------------------------------- the fallback link */
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -909,7 +930,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 }
 
 /* Wi-Fi keeps its calibration data in NVS. The app has normally initialised it
- * long before readout mode, so "already up" is the expected answer here. */
+ * long before the mode is entered, so "already up" is the expected answer. */
 static esp_err_t nvs_ready(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -925,14 +946,12 @@ static esp_err_t nvs_ready(void)
     return err;
 }
 
-/* Undoes whatever web_start() managed to bring up, in reverse order. Every
- * step is guarded, so this doubles as the failure path and as web_stop(). */
-static void web_teardown(void)
+/* Undoes whatever web_ap_start() managed to bring up, in reverse order. Every
+ * step is guarded, so this doubles as the failure path and as web_ap_stop().
+ * It leaves the server alone: the httpd is not this link's to take down, and
+ * the mode stops it first anyway. */
+static void ap_teardown(void)
 {
-    if (s_server != NULL) {
-        httpd_stop(s_server);
-        s_server = NULL;
-    }
     if (s_wifi_evt != NULL) {
         esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_evt);
         s_wifi_evt = NULL;
@@ -949,12 +968,10 @@ static void web_teardown(void)
         esp_netif_destroy_default_wifi(s_netif);
         s_netif = NULL;
     }
-    s_running = false;
+    s_ap_running = false;
 }
 
-/* -------------------------------------------------------------------- api */
-
-esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap)
+esp_err_t web_ap_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap)
 {
     esp_err_t err = ESP_OK;
     uint8_t mac[6] = {0};
@@ -965,9 +982,8 @@ esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap
     wifi_config_t wcfg = {0};
     esp_netif_ip_info_t ip = {0};
     size_t slen = 0;
-    httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
 
-    if (s_running) {
+    if (s_ap_running) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1020,8 +1036,8 @@ esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap
     wcfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
     wcfg.ap.pmf_cfg.required = false;
 
-    /* Readout mode is transient; there is no reason to write the config to
-     * flash and wear it out. */
+    /* The mode is transient; there is no reason to write the config to flash
+     * and wear it out. */
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK) {
@@ -1043,19 +1059,68 @@ esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap
         ipstr = ipbuf;
     }
 
+    if (out_ssid != NULL && ssid_cap > 0) {
+        snprintf(out_ssid, ssid_cap, "%s", ssid);
+    }
+    if (out_ip != NULL && ip_cap > 0) {
+        snprintf(out_ip, ip_cap, "%s", ipstr);
+    }
+
+    s_ap_running = true;
+    ESP_LOGI(TAG, "AP \"%s\" up on %s, password \"%s\"", ssid, ipstr, WEB_PASSWORD);
+    return ESP_OK;
+
+fail:
+    ESP_LOGE(TAG, "access point failed: %s", esp_err_to_name(err));
+    ap_teardown();
+    if (out_ssid != NULL && ssid_cap > 0) {
+        out_ssid[0] = '\0';
+    }
+    if (out_ip != NULL && ip_cap > 0) {
+        out_ip[0] = '\0';
+    }
+    return err;
+}
+
+void web_ap_stop(void)
+{
+    if (!s_ap_running && !s_wifi_inited && s_netif == NULL) {
+        return;                      /* never started, or stopped twice */
+    }
+    ESP_LOGI(TAG, "taking the access point down");
+    ap_teardown();
+}
+
+bool web_ap_running(void)
+{
+    return s_ap_running;
+}
+
+/* ------------------------------------------------------------- the server */
+
+esp_err_t web_serve_start(void)
+{
+    httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
+    esp_err_t      err;
+
+    if (s_server != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     hcfg.stack_size = 8192;          /* fread + the HTML formatting live here */
     hcfg.lru_purge_enable = true;    /* a phone that walks off must not wedge it */
     hcfg.max_open_sockets = 4;
     /* Seven routes today against a default of eight, which the channel form
      * was the seventh of. Said out loud so that the eighth is a number to
-     * change here rather than a readout mode that will not start. */
+     * change here rather than a mode that will not start. */
     hcfg.max_uri_handlers = 10;
     /* the file and delete routes are registered as wildcard patterns */
     hcfg.uri_match_fn = httpd_uri_match_wildcard;
     err = httpd_start(&s_server, &hcfg);
     if (err != ESP_OK) {
         s_server = NULL;
-        goto fail;
+        ESP_LOGE(TAG, "server failed: %s", esp_err_to_name(err));
+        return err;
     }
     err = httpd_register_uri_handler(s_server, &k_uri_index);
     if (err == ESP_OK) {
@@ -1077,52 +1142,37 @@ esp_err_t web_start(char *out_ssid, size_t ssid_cap, char *out_ip, size_t ip_cap
         err = httpd_register_uri_handler(s_server, &k_uri_ota_channel);
     }
     if (err != ESP_OK) {
-        goto fail;
+        ESP_LOGE(TAG, "routes failed: %s", esp_err_to_name(err));
+        web_serve_stop();
+        return err;
     }
 
-    if (out_ssid != NULL && ssid_cap > 0) {
-        snprintf(out_ssid, ssid_cap, "%s", ssid);
-    }
-    if (out_ip != NULL && ip_cap > 0) {
-        snprintf(out_ip, ip_cap, "%s", ipstr);
-    }
-
-    s_running = true;
-    ESP_LOGI(TAG, "AP \"%s\" up on %s, password \"%s\", %d capture(s)",
-             ssid, ipstr, WEB_PASSWORD, store_ready() ? store_count() : -1);
+    ESP_LOGI(TAG, "server up, %d capture(s)", store_ready() ? store_count() : -1);
     return ESP_OK;
-
-fail:
-    ESP_LOGE(TAG, "start failed: %s", esp_err_to_name(err));
-    web_teardown();
-    if (out_ssid != NULL && ssid_cap > 0) {
-        out_ssid[0] = '\0';
-    }
-    if (out_ip != NULL && ip_cap > 0) {
-        out_ip[0] = '\0';
-    }
-    return err;
 }
 
-void web_stop(void)
+void web_serve_stop(void)
 {
-    if (!s_running && s_server == NULL && !s_wifi_inited && s_netif == NULL) {
+    if (s_server == NULL) {
         return;                      /* never started, or stopped twice */
     }
-    ESP_LOGI(TAG, "stopping readout mode");
-    web_teardown();
+    httpd_stop(s_server);
+    s_server = NULL;
 }
 
 bool web_running(void)
 {
-    return s_running;
+    return s_server != NULL;
 }
 
 int web_clients(void)
 {
     wifi_sta_list_t list = {0};
 
-    if (!s_running) {
+    /* Only the access point has stations of its own. Asked while the Monitor
+     * is somebody else's station, esp_wifi_ap_get_sta_list() would answer for
+     * an interface that is not up, so the question is refused here instead. */
+    if (!s_ap_running) {
         return 0;
     }
     if (esp_wifi_ap_get_sta_list(&list) != ESP_OK) {

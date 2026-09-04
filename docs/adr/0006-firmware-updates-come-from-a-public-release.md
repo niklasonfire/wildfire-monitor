@@ -193,3 +193,79 @@ moment somebody wants to cut a release from it. It also does not run the
 host suite - `make test` is still the developer's to run, and nothing between
 the editor and a published release runs it. That is a gap worth closing and it
 is not closed here.
+
+## Amendment: there is one Wi-Fi mode, and it falls back to the access point
+
+The mode shape above no longer holds, and as with CI it is worth saying
+exactly which half went.
+
+**What went is the sentence at the top of this document.** "The rider opens a
+menu and chooses it, the same way readout mode is chosen today" described two
+modes that a rider had to choose between, and "Long-pressing B now opens a
+menu" was justified by the need for somewhere to put the second of them.
+There is one now. Entering it, the Monitor joins the strongest network it
+knows and serves everything - the Captures, the settings page, the update -
+over that link; failing to join anything, it puts up the same
+`wildfire-xxxxxx` access point readout mode used to put up, serves the same
+pages over that, and simply does not offer an update, because there is
+nothing upstream of an access point to fetch one from. A Monitor that has
+never been told a network takes the second path without scanning first: the
+answer does not depend on what is in range, and a fresh Monitor should not
+have to wait to be told what it already knows.
+
+**Nothing else here moved.** The update still comes from a manifest published
+on a release of this public repository and read over the rider's own hotspot.
+The four fields are still the contract, the versions are still compared for
+inequality, the certificate bundle is still the trust, the rollback is still
+the point, the install is still confirmed on the device and never automatic,
+and the credentials are still a list of up to four networks in NVS with
+nothing in the repository carrying one. The RAM argument is untouched too:
+NimBLE and Wi-Fi still do not fit together on this chip, so BLE still goes
+down on the way in and the way back to capturing is still a reboot. What
+changed is which link the pages are served over, and that a failure to join
+is now a fallback rather than a dead end.
+
+**The fallback is what keeps the cable from coming back, and that is the
+whole reason for it.** The old arrangement had a hole in exactly the place
+this decision was written to close. The list of networks lived in NVS; the
+only ways to edit it were the console, over the USB lead, and a settings page
+served by readout mode. Update mode could not reach that page - the two modes
+were mutually exclusive one-way doors - so a rider whose hotspot key had been
+rotated on the phone, or who had typed an SSID with a capital in the wrong
+place, watched update mode fail and had no way to repair it from the mode it
+failed in. Rebooting into readout mode was the answer as long as the rider
+knew that was the answer. Now the failure lands on the page that fixes it,
+which is the difference between a fault a rider clears in a car park and a
+fault that costs the USB lead and an unclipped Monitor. Serial provisioning
+must never be the only way in, and with a station-only mode it very nearly
+was.
+
+**Bootstrapping stopped needing a mechanism.** "A provisioning screen later
+should add a way in, not a second store" is satisfied twice over: the
+settings page writes through `wifi_store`, and it is now reachable on a
+Monitor that has been flashed and never spoken to. There is no first-run
+special case and no serial step to document - a Monitor with an empty list is
+just the ordinary fallback, and the ordinary fallback serves the page.
+
+**The consequence is that the door is heavier.** Readout mode was cheap: it
+took BLE down and put an access point up, and that was all. The one mode
+attempts a scan and a join first, which is a few seconds when a known hotspot
+is there and twenty-odd when it is not, and only then falls back. A rider who
+wants the Captures and knows there is no hotspot in range pays that wait. B
+held while A picks the entry skips straight to the access point, which costs
+one GPIO read and is worth having, but it is a shortcut and not the design:
+the design is that doing nothing gets the same access point twenty seconds
+later.
+
+**`app_readout_enter()` is gone, and so is the pair of names.** The
+"Consequences" section above names it as the thing update mode refuses like;
+the refusal survives under `service_enter()`, and the glossary in `CONTEXT.md`
+now carries **Service Mode** where it carried Readout Mode and Update Mode.
+ADR-0008 leans on the old shape in passing - "readout mode and update mode are
+mutually exclusive one-way doors, so a rider..." - and that sentence is now
+history rather than fact. Its conclusion is not affected: a channel is still
+read at the start of a mode and not while one is running, so a channel saved
+on the settings page is still read at the next entry, and there is still no
+"check now" button, because an install has to be confirmed on the device and
+a button on a phone could only start something the rider would have to walk
+back to the bike to answer.

@@ -25,7 +25,7 @@
  *     a gap in the BMS stream, the sign convention and the persisted state all
  *     have to be driven with synthesised streams here instead.
  *
- *   - everything update mode does that is not the radio itself. The manifests
+ *   - everything the update does that is not the radio itself. The manifests
  *     that matter are the ones no release will ever publish - truncated,
  *     missing a field, an HTML error page - and so are the downloads: the
  *     body a dropped hotspot cut short, the one with a bit flipped in it, the
@@ -4425,9 +4425,9 @@ static void test_the_advice_retires_when_it_is_taken(void)
           (unsigned)(t - t_taken), (unsigned)WF_EST_ADVICE_DWELL_MS);
 }
 
-/* ----------------------------------------------- update mode, off the bike
+/* ------------------------------------------------- the update, off the bike
  *
- * The three questions update mode asks before any radio is involved: which of
+ * The three questions the update asks before any radio is involved: which of
  * the networks we know is worth joining, what URL the manifest lives at, and
  * whether what came back is a manifest at all. See main/wfota/wfota.h.
  *
@@ -4817,7 +4817,7 @@ static void test_a_network_we_do_not_know_is_never_joined(void)
 
 /* ---- the download ------------------------------------------------------- *
  *
- * The half of update mode that cannot be undone from a handlebar. Every case
+ * The half of the update that cannot be undone from a handlebar. Every case
  * worth asserting is a failure - a hotspot that went away, a body that is not
  * the length it said, a digest that does not match - and none of them can be
  * produced by publishing a release, so they are synthesised here.

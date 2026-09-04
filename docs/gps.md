@@ -144,7 +144,7 @@ analysing before any time is spent analysing it.
 
 Per #9, and none of it changes:
 
-1. Pull the Capture over the Wi-Fi readout. Drop the Track in `tracks/`.
+1. Pull the Capture over Wi-Fi. Drop the Track in `tracks/`.
 2. Run `scripts/gps.py` and read the protocol checklist.
 3. Re-run the offline decoder over the **whole archive**, not just the new
    file. A decode fix found today applies to every ride ever taken (ADR-0001).

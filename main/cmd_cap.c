@@ -28,9 +28,10 @@
 #include "esp_console.h"
 #include "esp_err.h"
 
-/* Entering readout mode takes BLE down and puts the AP details on the LCD;
- * main.c owns that sequence because the buttons trigger it too. */
-bool app_readout_enter(void);
+/* Entering the Wi-Fi mode takes BLE down, chooses a link and puts the address
+ * on the LCD; main.c owns that sequence because the buttons trigger it too. */
+bool app_service_up(void);
+void app_service_stop(void);
 
 static void print_status(void)
 {
@@ -139,8 +140,8 @@ static int cmd_caprm(int argc, char **argv)
 }
 
 /* Serial fallback for pulling a capture off the board. At 115200 baud this
- * runs at roughly 11 KB/s of hex, so a full ride takes minutes - Wi-Fi
- * readout mode exists precisely to avoid it. */
+ * runs at roughly 11 KB/s of hex, so a full ride takes minutes - the Wi-Fi
+ * mode exists precisely to avoid it. */
 static int cmd_capdump(int argc, char **argv)
 {
     if (argc < 2) {
@@ -226,10 +227,16 @@ static int cmd_capdump(int argc, char **argv)
 
 /*
  * Two jobs under one name, because to a rider they are one thing: the radio.
- * `wifi on|off` is readout mode, the access point this board puts up. `wifi
- * add|list|del` is the list of networks update mode is allowed to join - up
- * to four of them (ADR-0006), so that a second phone is not a data-model
- * change and a provisioning screen later has somewhere to write to.
+ * `wifi on|off` is the Wi-Fi mode - the board joins the strongest network it
+ * knows and serves its pages over that, or puts up its own access point and
+ * serves them over that instead (#41). `wifi add|list|del` is the list it
+ * joins from, up to four networks (ADR-0006), so that a second phone is not a
+ * data-model change.
+ *
+ * `wifi on` stops at the mode: it does not go looking for an update, because
+ * `ota check` is the command that has always meant that and still does. On
+ * the console the two are worth keeping apart; on the panel there is one menu
+ * entry and it does both, because a rider has nothing to type.
  *
  * The credentials only ever arrive here, at runtime, over the cable: the
  * repository is public, so nothing in it may carry an SSID or a passphrase.
@@ -242,6 +249,16 @@ static int cmd_capdump(int argc, char **argv)
 static void wifi_usage(void)
 {
     printf("usage: wifi on|off|list|add <ssid> [passphrase]|del <ssid>\n");
+}
+
+/* Which link the mode landed on, and what is on the other end of it. `ap=1`
+ * is the fallback: nothing was stored, or nothing known was in range, or the
+ * join was refused - in which case `clients` is the phones that have joined
+ * us, and on a network we joined there are none to count. */
+static void wifi_print_state(void)
+{
+    printf("WIFI running=%d ap=%d clients=%d\n", web_running(),
+           web_ap_running(), web_clients());
 }
 
 static void wifi_print_list(void)
@@ -309,21 +326,20 @@ static int cmd_wifi(int argc, char **argv)
         return 1;
     }
     if (strcmp(argv[1], "on") == 0) {
-        if (!app_readout_enter()) {
-            printf("WIFI error=cannot enter readout mode\n");
+        if (!app_service_up()) {
+            printf("WIFI error=cannot start the wifi mode\n");
             return 1;
         }
     } else if (strcmp(argv[1], "off") == 0) {
-        web_stop();
-        ui_message_clear();
-        /* BLE is gone for good once readout mode has run; say so rather than
+        app_service_stop();
+        /* BLE is gone for good once the mode has run; say so rather than
          * letting the user believe a capture would still work. */
         printf("WIFI off - reboot to capture again\n");
     } else {
         wifi_usage();
         return 1;
     }
-    printf("WIFI running=%d clients=%d\n", web_running(), web_clients());
+    wifi_print_state();
     return 0;
 }
 
@@ -401,7 +417,7 @@ void cmd_cap_register(void)
          .help = "Print a capture over the console: capdump <seq> [max_records]",
          .func = cmd_capdump},
         {.command = "wifi",
-         .help = "Readout mode and the networks update mode may join: "
+         .help = "The wifi mode and the networks it may join: "
                  "wifi on|off|list|add <ssid> [passphrase]|del <ssid>",
          .func = cmd_wifi},
         {.command = "time",

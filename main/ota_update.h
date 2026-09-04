@@ -1,21 +1,28 @@
 /*
- * ota_update - update mode's radio half: join a hotspot, read the manifest,
- * install the image.
+ * ota_update - the station link, the manifest, and the install.
  *
- * The Monitor stops listening, brings Wi-Fi up as a station, joins the
- * strongest of the networks it knows, fetches the four-field manifest from
- * the repository's newest release over HTTPS, and compares its `version` to
- * the running app's for inequality. If the rider then says so, it streams the
- * image the manifest names into the inactive app slot, checks its length and
- * its SHA-256 against the manifest, and only then points the bootloader at
- * it. Whether it stays pointed there is main/ota_health.c's question.
+ * The Monitor brings Wi-Fi up as a station and joins the strongest of the
+ * networks it knows; over that link it fetches the four-field manifest from
+ * the repository's newest release over HTTPS and compares its `version` to
+ * the running app's for inequality; and if the rider then says so it streams
+ * the image the manifest names into the inactive app slot, checks its length
+ * and its SHA-256 against the manifest, and only then points the bootloader
+ * at it. Whether it stays pointed there is main/ota_health.c's question.
  *
- * The shape is readout mode's (ADR-0006). Wi-Fi and NimBLE do not fit in this
- * chip's RAM together, so the caller takes BLE down first and the only way
- * back to capturing is a reboot. A failure is left failed: it produces a
- * message and a return to the menu, and nothing retries on its own, because
- * the rider is standing next to the Monitor and an automatic retry would only
- * hide a hotspot that is too weak to finish.
+ * Those are three calls and not one, because the Monitor now has one Wi-Fi
+ * mode rather than two (#41) and only the first of the three is what that
+ * mode needs to be up. main.c asks for the link; if it gets one, the server
+ * in webdump.c goes on top of it and the update is on offer, and if it does
+ * not, the same server goes on top of the access point webdump.c puts up
+ * instead. So a failure here is a fallback and not a dead end - which is the
+ * thing that keeps a rotated hotspot key from costing a rider the cable
+ * ADR-0006 exists to avoid.
+ *
+ * Wi-Fi and NimBLE do not fit in this chip's RAM together, so the caller
+ * takes BLE down first and the only way back to capturing is a reboot. A
+ * failure is left failed: it produces a message, and nothing retries on its
+ * own, because the rider is standing next to the Monitor and an automatic
+ * retry would only hide a hotspot that is too weak to finish.
  *
  * Trust is the ESP-IDF certificate bundle and not a pinned certificate:
  * GitHub rotates its certificates, and a pinned one would eventually stop
@@ -34,7 +41,7 @@
  * one "it did not work". */
 typedef enum {
     OTAUP_OK = 0,
-    OTAUP_ERR_STATE,      /* update mode is already up */
+    OTAUP_ERR_STATE,      /* a link is already up, or none is and one is needed */
     OTAUP_ERR_WIFI,       /* the radio would not start */
     OTAUP_ERR_NO_NETS,    /* nothing has ever been added with `wifi add` */
     OTAUP_ERR_NO_SCAN,    /* the scan saw no access point at all */
@@ -64,16 +71,36 @@ typedef struct {
 typedef void (*otaup_progress_fn)(const char *line1, const char *line2);
 
 /*
- * Runs the whole check and blocks until it is over, about ten seconds when
- * everything works. On OTAUP_OK the station is left joined - the address in
- * `out` is live, and #28 will download through it - so the caller must call
- * otaup_stop() when the rider is done with the screen. Every failure has
- * already torn the radio back down.
+ * Scans and joins, and blocks until it is over - a few seconds when
+ * everything works, and up to a scan plus JOIN_TIMEOUT_MS when it does not.
+ * On OTAUP_OK the station is left joined: the address in `out` is live, the
+ * server and the install both run through it, and the caller must call
+ * otaup_stop() when it is finished with the link. Every failure has already
+ * torn the radio back down, so the caller is free to bring an access point up
+ * in its place - which is exactly what it does.
+ *
+ * OTAUP_ERR_NO_NETS comes back before the radio starts at all, because a
+ * store with nothing in it is an answer that does not depend on what is in
+ * range: a fresh Monitor is not made to wait out a scan for it.
  */
-otaup_err_t otaup_check(otaup_result_t *out, otaup_progress_fn progress);
+otaup_err_t otaup_join(otaup_result_t *out, otaup_progress_fn progress);
+
+/*
+ * Reads the manifest over the link otaup_join() left up, and blocks for the
+ * few seconds that takes. OTAUP_ERR_STATE when there is no such link - the
+ * Monitor is its own access point, and there is no upstream to read.
+ *
+ * Alone among the calls here, a failure does *not* take the radio down: the
+ * server is listening on that link, and a hotspot with no route to GitHub is
+ * no reason to take the Capture listing away from the rider in front of it.
+ * The caller is told which failure it was and decides what the panel says.
+ */
+otaup_err_t otaup_manifest_check(otaup_result_t *out, otaup_progress_fn progress);
 
 /* Takes the station back down. Safe to call when nothing came up. */
 void otaup_stop(void);
+/* Whether the station link is up, which is the same question as "is there an
+ * upstream": the mode is a station or it is an access point, never both. */
 bool otaup_running(void);
 
 /* A word for the console and the log, not a sentence for the panel. */
@@ -120,7 +147,9 @@ typedef void (*otain_progress_fn)(int percent, uint32_t got, uint32_t want);
 
 /*
  * Downloads and installs the image `m` names, and blocks for the minute or so
- * that takes. Requires the station otaup_check() left joined.
+ * that takes. Requires the station otaup_join() left joined, and leaves it
+ * joined either way - a cut download is a reason to look at the settings
+ * page, not a reason to lose it.
  *
  * On OTAIN_OK the bootloader has been pointed at the new slot and nothing
  * else has happened: the caller reboots, and the new image comes up on

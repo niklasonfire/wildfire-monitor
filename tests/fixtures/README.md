@@ -72,7 +72,7 @@ Three things it is worth knowing this fixture does **not** hold:
   response cut short by a link going down is one the decoder must refuse. That
   is issue #34, and this file is its evidence.
 - **A pulled `.wfl`, not a rebuilt one.** Unlike cap0007 it came off the board
-  over the Wi-Fi readout rather than down a serial line, so it carries its own
+  over Wi-Fi rather than down a serial line, so it carries its own
   `duration_ms` and needs no `dump2wfl.py` step. There is no
   `captures/cap0002_dump.log`.
 

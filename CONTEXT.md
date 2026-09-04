@@ -161,17 +161,20 @@ _Avoid_: certainty, status, reliability
 
 ### Modes
 
-**Readout Mode**:
-The Monitor stops listening, puts up its own access point, and serves the
-Captures over HTTP so a phone or a laptop can pull them off. It serves the
-settings page too, which is where the networks Update Mode may join are edited
-without a cable. Bluetooth is down throughout, so the only way back to
-capturing is a reboot.
-_Avoid_: download mode, webdump, AP mode, dump mode
+**Service Mode**:
+The Monitor stops listening and puts itself where a phone can reach it: it
+joins the strongest network it knows, or, knowing none or reaching none, puts
+up its own access point instead. Either way it serves the Captures and the
+settings page over HTTP; only over a joined network does it also offer an
+update, because only there is there an upstream to fetch one from. Entered
+from the menu, refused while a Capture is running, and left by a reboot —
+Bluetooth is down throughout, so there is no other way back to capturing.
+_Avoid_: readout mode, update mode, webdump, AP mode, download mode, OTA mode
 
-**Update Mode**:
-The Monitor stops listening, joins a hotspot it knows, and installs a
-published firmware into its spare app slot. Shares Readout Mode's shape — one
-radio at a time, entered from the menu, left by a reboot — and, like it, is
-refused while a Capture is running.
-_Avoid_: OTA mode, upgrade mode, flashing
+**Fallback**:
+Service Mode's access point, and the rule that reaches it: any failure to join
+lands there rather than stopping. It is what keeps a rotated hotspot key from
+costing a cable, because the settings page that repairs the list is served
+from the failure the list caused. A Monitor that has never been told a network
+is the same case and takes the same path, without a scan first.
+_Avoid_: AP mode, soft AP in prose (fine in code), recovery mode

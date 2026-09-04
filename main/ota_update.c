@@ -94,6 +94,12 @@ static bool                         s_wifi_inited;
 static bool                         s_running;
 static char                         s_ip[16];
 static uint8_t                      s_disc_reason;
+/* Which network the link is on, kept here rather than only in the join's
+ * result: the manifest check that follows may be a separate call minutes
+ * later - the console's `ota check` over a link the menu brought up - and its
+ * result has to describe the same link the first one did. */
+static char                         s_ssid[WFOTA_SSID_MAX + 1];
+static int                          s_rssi;
 
 /* ------------------------------------------------------------------ the pin */
 
@@ -310,8 +316,8 @@ static void net_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 }
 
 /* Wi-Fi keeps its calibration data in NVS; the app has normally initialised it
- * long before update mode, so "already up" is the expected answer. Same
- * shape as webdump.c, which is the other mode that owns this radio. */
+ * long before the mode is entered, so "already up" is the expected answer.
+ * Same shape as webdump.c, which owns the other half of this radio. */
 static esp_err_t nvs_ready(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -355,6 +361,8 @@ static void teardown(void)
         s_events = NULL;
     }
     s_ip[0] = '\0';
+    s_ssid[0] = '\0';
+    s_rssi = 0;
     s_running = false;
 }
 
@@ -404,7 +412,7 @@ static esp_err_t wifi_up(void)
         return err;
     }
 
-    /* Update mode is transient and the credentials already live in the `wifi`
+    /* The link is transient and the credentials already live in the `wifi`
      * namespace, so there is nothing to gain from letting the driver write a
      * second copy of them into flash on every join. */
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
@@ -541,7 +549,7 @@ static otaup_err_t fetch_manifest(otaup_result_t *r)
     return res;
 }
 
-/* ----------------------------------------------------------- the whole check */
+/* --------------------------------------------------------------- the link */
 
 static void say(otaup_progress_fn progress, const char *l1, const char *l2)
 {
@@ -591,27 +599,53 @@ static otaup_err_t join(const wifi_net_t *net, otaup_result_t *r)
     return OTAUP_ERR_JOIN;
 }
 
-static otaup_err_t run_check(otaup_result_t *r, otaup_progress_fn progress)
+/* The running app's own version, which every result carries whether or not
+ * anything else in it worked: it is half of the comparison the manifest is
+ * read to make, and it is what the panel falls back to saying. */
+static void fill_running(otaup_result_t *r)
+{
+    const esp_app_desc_t *desc = esp_app_get_description();
+
+    snprintf(r->running, sizeof(r->running), "%s",
+             (desc != NULL) ? desc->version : "");
+}
+
+/* What the link is, for a result that did not bring it up itself. */
+static void fill_link(otaup_result_t *r)
+{
+    snprintf(r->ssid, sizeof(r->ssid), "%s", s_ssid);
+    snprintf(r->ip, sizeof(r->ip), "%s", s_ip);
+    r->rssi = s_rssi;
+}
+
+/*
+ * Scans, picks and joins, and stops there. Everything up to a station with an
+ * address, which is what the mode needs before it can serve anything - the
+ * manifest is a separate question asked over the link this leaves up, because
+ * a Monitor that joined a hotspot with no route to GitHub is still a Monitor
+ * a rider can pull a Capture off (#41).
+ */
+static otaup_err_t run_join(otaup_result_t *r, otaup_progress_fn progress)
 {
     wifi_net_t   nets[WIFI_STORE_MAX];
     const char  *known[WIFI_STORE_MAX];
     wfota_seen_t seen[SCAN_MAX];
 
-    const esp_app_desc_t *desc = esp_app_get_description();
-    snprintf(r->running, sizeof(r->running), "%s",
-             (desc != NULL) ? desc->version : "");
+    fill_running(r);
 
     int n_nets = wifi_store_load(nets, WIFI_STORE_MAX);
     if (n_nets == 0) {
         /* Nothing to scan for. Said before the radio comes up at all, because
-         * the answer does not depend on what is in range. */
+         * the answer does not depend on what is in range - which is what
+         * spares a fresh Monitor a scan on the way to the access point it was
+         * always going to end up on. */
         return OTAUP_ERR_NO_NETS;
     }
     for (int i = 0; i < n_nets; i++) {
         known[i] = nets[i].ssid;
     }
 
-    say(progress, "starting", "wifi");
+    say(progress, "starting", NULL);
     esp_err_t err = wifi_up();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi up: %s", esp_err_to_name(err));
@@ -686,10 +720,10 @@ static otaup_err_t run_check(otaup_result_t *r, otaup_progress_fn progress)
     if (uerr != OTAUP_OK) {
         return uerr;
     }
+    snprintf(s_ssid, sizeof(s_ssid), "%s", r->ssid);
+    s_rssi = r->rssi;
     ESP_LOGI(TAG, "joined \"%s\", address %s", r->ssid, r->ip);
-
-    say(progress, "reading", r->ip);
-    return fetch_manifest(r);
+    return OTAUP_OK;
 }
 
 /* ------------------------------------------------------- on our own task */
@@ -739,20 +773,22 @@ typedef struct {
     otaup_progress_fn progress;
 } check_ctx_t;
 
-static int check_job(void *arg)
+static int join_job(void *arg)
 {
     check_ctx_t *ctx = arg;
-    otaup_err_t  err = run_check(ctx->result, ctx->progress);
+    otaup_err_t  err = run_join(ctx->result, ctx->progress);
 
     if (err != OTAUP_OK) {
         /* Left failed, and left tidy: the radio goes back down so the failure
-         * costs no heap while the rider reads the screen. */
+         * costs no heap while the caller brings the access point up over the
+         * top of it. Nothing here retries, and nothing here falls back - which
+         * of those to do is the mode's call, not the radio's. */
         teardown();
     }
     return (int)err;
 }
 
-otaup_err_t otaup_check(otaup_result_t *out, otaup_progress_fn progress)
+otaup_err_t otaup_join(otaup_result_t *out, otaup_progress_fn progress)
 {
     check_ctx_t ctx;
     int         rc = 0;
@@ -767,8 +803,50 @@ otaup_err_t otaup_check(otaup_result_t *out, otaup_progress_fn progress)
 
     ctx.result   = out;
     ctx.progress = progress;
-    if (!run_on_own_task("otacheck", check_job, &ctx, &rc)) {
+    if (!run_on_own_task("otajoin", join_job, &ctx, &rc)) {
         return OTAUP_ERR_WIFI;
+    }
+    return (otaup_err_t)rc;
+}
+
+/*
+ * The manifest over the link that is already up, and the one thing this file
+ * does that does not tear the radio down when it fails. It cannot: the server
+ * in webdump.c is listening on that link, and a hotspot that will not reach
+ * GitHub is no reason to take the Capture listing away from a rider standing
+ * in front of it. The mode is told, and the mode decides.
+ */
+static int manifest_job(void *arg)
+{
+    check_ctx_t *ctx = arg;
+
+    return (int)fetch_manifest(ctx->result);
+}
+
+otaup_err_t otaup_manifest_check(otaup_result_t *out, otaup_progress_fn progress)
+{
+    check_ctx_t ctx;
+    int         rc = 0;
+
+    if (out == NULL) {
+        return OTAUP_ERR_STATE;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s_running) {
+        /* No upstream. The access point the mode falls back to has no route
+         * anywhere, so there is nothing to ask and no pretending otherwise. */
+        snprintf(out->detail, sizeof(out->detail), "no network joined");
+        return OTAUP_ERR_STATE;
+    }
+    fill_running(out);
+    fill_link(out);
+
+    say(progress, "reading", out->ip);
+    ctx.result   = out;
+    ctx.progress = progress;
+    if (!run_on_own_task("otamanifest", manifest_job, &ctx, &rc)) {
+        snprintf(out->detail, sizeof(out->detail), "no task");
+        return OTAUP_ERR_FETCH;
     }
     return (otaup_err_t)rc;
 }
@@ -829,7 +907,7 @@ static otain_err_t install(install_ctx_t *ic)
     otain_result_t         *r = ic->r;
 
     if (!s_running || m == NULL) {
-        /* otaup_check() leaves the station joined precisely so that this can
+        /* otaup_join() leaves the station joined precisely so that this can
          * run through it; without that link there is nothing to download. */
         return OTAIN_ERR_STATE;
     }
@@ -1014,8 +1092,10 @@ static int install_job(void *arg)
         }
         ESP_LOGE(TAG, "install: %s (%s)", otain_err_str(err),
                  ic->r->detail[0] ? ic->r->detail : "-");
-        /* Left failed and left tidy, exactly as the check is. */
-        teardown();
+        /* The link stays up, deliberately, where it used to come down with
+         * the install (#41): the server is on it, and the rider whose
+         * download was cut is the one most likely to want the settings page
+         * next. Whether the mode keeps the link is the mode's to decide. */
     }
     return (int)err;
 }
@@ -1048,7 +1128,7 @@ void otaup_stop(void)
     if (!s_running && !s_wifi_inited && s_netif == NULL && s_events == NULL) {
         return;                      /* never started, or stopped twice */
     }
-    ESP_LOGI(TAG, "leaving update mode");
+    ESP_LOGI(TAG, "taking the station link down");
     teardown();
 }
 
@@ -1061,7 +1141,7 @@ const char *otaup_err_str(otaup_err_t err)
 {
     switch (err) {
     case OTAUP_OK:            return "ok";
-    case OTAUP_ERR_STATE:     return "already running";
+    case OTAUP_ERR_STATE:     return "no link, or one already up";
     case OTAUP_ERR_WIFI:      return "wifi failed";
     case OTAUP_ERR_NO_NETS:   return "no networks stored";
     case OTAUP_ERR_NO_SCAN:   return "no access point in range";
