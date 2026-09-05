@@ -83,8 +83,14 @@ def main():
             text, _ = read_until_prompt(ser, args.boot_wait, out)
             sys.stdout.write(text)
 
-        if args.listen > 0:
-            deadline = time.time() + args.listen
+        def stream(secs):
+            """Everything the board says for N seconds, prompt or not.
+
+            A panic prints its backtrace and reboots without ever printing
+            another prompt, so read_until_prompt() cannot catch one; this is
+            the only way a crash that follows a command ends up in the file.
+            """
+            deadline = time.time() + secs
             while time.time() < deadline:
                 chunk = ser.read(ser.in_waiting or 1)
                 if chunk:
@@ -92,6 +98,10 @@ def main():
                     sys.stdout.flush()
                     if out is not None:
                         out.write(chunk)
+
+        # With no commands to send, listening is the whole job.
+        if args.listen > 0 and not args.commands:
+            stream(args.listen)
             return 0
 
         # A newline first: it flushes any half-typed line and gets a prompt
@@ -102,6 +112,17 @@ def main():
         rc = 0
         for raw in args.commands:
             cmd, timeout = split_timeout(raw, args.timeout)
+            # A local wait, not a console command. Arming after `cap scan`
+            # takes a few seconds of radio time, and the board has nothing
+            # that blocks for it; without this the whole sequence has to be
+            # split across invocations, and every invocation is a chance for
+            # the port to reset the board out from under the run.
+            if cmd.startswith("!sleep "):
+                secs = float(cmd.split(None, 1)[1])
+                sys.stdout.write(f"\n=== waiting {secs}s\n")
+                sys.stdout.flush()
+                time.sleep(secs)
+                continue
             sys.stdout.write(f"\n=== $ {cmd}\n")
             sys.stdout.flush()
             if out is not None:
@@ -116,6 +137,10 @@ def main():
                 sys.stdout.write(f"\n!!! timeout after {timeout}s\n")
                 rc = 1
             sys.stdout.flush()
+        # After the last command, because what a command sets in motion can
+        # take longer than the prompt it returned at.
+        if args.listen > 0:
+            stream(args.listen)
         sys.stdout.write("\n")
         return rc
     finally:
