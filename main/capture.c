@@ -138,6 +138,25 @@ static const uint32_t k_backoff_ms[] = { 1000, 2000, 5000 };
  * the wide read from the first request never does. */
 #define CAP_BMS_WIDE_TRIES  5
 
+/* How many unanswered polls it takes before the stall probe asks the link what
+ * it can still do, and how long each of the probe's four GATT operations is
+ * given. Three requests is three seconds of silence at the default period,
+ * which is early enough to catch the peer in the state issue #34 describes and
+ * late enough that a single lost request does not trigger it.
+ *
+ * The per-operation timeout is deliberately far below CAP_GATT_MS: the probe
+ * runs inside the periodic tick, and a peer that has stopped answering must
+ * not be able to hold the reconnect and telemetry work for four times ten
+ * seconds. A probe operation that has not completed in two seconds has already
+ * told us what we came to find out. */
+#define CAP_PROBE_MISS      3
+#define CAP_PROBE_OP_MS     2000
+
+/* The ceiling on the two periods captune accepts. Ten minutes is longer than
+ * any run this is meant to serve and short enough that a mistyped value fails
+ * at the console instead of on the bike. */
+#define CAP_TUNE_MAX_MS     600000
+
 /* A polled link, or all zeroes for one that is only ever pushed to. */
 typedef struct {
     uint8_t  start;           /* protocol variant, the Modbus slave address slot */
@@ -227,13 +246,32 @@ typedef enum {
     MSG_REC_STOP,
     MSG_DISCONNECT,     /* from the GAP callback */
     MSG_DISC_COMPLETE,  /* from the GAP callback */
+    MSG_CONN_UPDATE,      /* from the GAP callback: parameters now in force */
+    MSG_CONN_UPDATE_REQ,  /* from the GAP callback: what the peer asked for */
+    MSG_MTU,              /* from the GAP callback: the ATT MTU event */
     MSG_SHUTDOWN,
 } cap_msg_type_t;
+
+/* The connection parameters a GAP event reports. On an event that reports one
+ * set in force rather than a request, itvl_min and itvl_max are the same
+ * number. Carried through the queue rather than formatted where it is read,
+ * because cap_event() is the capture task's and these arrive on the NimBLE
+ * host task. */
+typedef struct {
+    uint16_t itvl_min;
+    uint16_t itvl_max;
+    uint16_t latency;
+    uint16_t timeout;
+} cap_conn_params_t;
 
 typedef struct {
     uint8_t type;
     uint8_t link;
+    /* The one number the event carries in its own right: the disconnect or
+     * scan reason, the status of a completed parameter update, the agreed MTU
+     * on MSG_MTU. */
     int     reason;
+    cap_conn_params_t params;
 } cap_msg_t;
 
 /* ------------------------------------------------------------------ state */
@@ -272,6 +310,36 @@ typedef struct {
      * notifications. */
     uint16_t   poll_unanswered;
     uint8_t    backoff_idx;
+    /* The per-connection ledger, all of it reset by the subscribe in
+     * link_setup() and read out when the stale watchdog gives up on the link.
+     *
+     * Issue #34 is a question about a connection rather than about a link: the
+     * BMS answers exactly 27 polls and then nothing, and the four candidates
+     * differ in what that connection was still doing at the moment it went
+     * quiet. A link that answered 27 times and then went silent, one whose
+     * requests had stopped leaving, and one that kept delivering bytes that no
+     * longer decoded are three different bugs and look identical in the frame
+     * counters, which are per capture and never reset.
+     *
+     * answers and bytes_rx are written by the NimBLE host task, writes_ok and
+     * writes_err by the capture task, so all of them are guarded by s_mux the
+     * same way the counters beside them already are. */
+    uint32_t   conn_start_ms;    /* uptime the subscribe completed at */
+    uint32_t   answers;          /* frames that decoded since the subscribe */
+    uint32_t   writes_ok;        /* requests the radio accepted */
+    uint32_t   writes_err;       /* requests that never left */
+    uint32_t   bytes_rx;         /* notification bytes since the subscribe */
+    bool       write_err_seen;   /* the first failing write is already recorded */
+    /* The stall probe: whether it has run on this connection, when it finished
+     * and whether an answer arrived afterwards. probe_at_ms is 0 when no probe
+     * is outstanding; the flag and the interval are filled in by the host task
+     * and reported by the capture task, because a decode that arrives right
+     * after a re-subscribe is the single most valuable line this firmware can
+     * produce and it must not be lost to the task boundary. */
+    bool       probed;
+    uint32_t   probe_at_ms;
+    bool       probe_answered;   /* guarded */
+    uint32_t   probe_answer_ms;  /* guarded */
 } cap_link_ctx_t;
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -284,6 +352,21 @@ static wf_ctrl_live_t s_live;             /* guarded by s_mux, see cap_live_get(
  * clock it feeds in. See cap_est_get(). */
 static wf_est_t       s_est;              /* guarded by s_mux */
 
+/* The bench tune. Copied out under s_mux by cap_tune_get() and written under
+ * it by cap_tune_set(), which refuses to run at all unless the capture is
+ * idle - so the capture task, which is the only reader that matters, reads the
+ * fields directly: they cannot change under it while a capture is running.
+ * Every default is the constant the code used before it became a knob. */
+static cap_tune_t s_tune = {
+    .poll_ms    = CAP_BMS_POLL_MS,
+    .poll_regs  = 0,
+    .stale_ms   = CAP_STALE_MS,
+    .miss_probe = CAP_PROBE_MISS,
+    .probe      = true,
+    .mcu_off    = false,
+    .itvl       = 0,
+};
+
 static QueueHandle_t     s_queue;
 static SemaphoreHandle_t s_op_sem;        /* one GATT op in flight, on our task */
 static SemaphoreHandle_t s_down_sem;      /* cap_ble_shutdown() completion */
@@ -291,6 +374,11 @@ static TaskHandle_t      s_task;
 
 static volatile int      s_op_rc;
 static volatile uint16_t s_op_conn_handle;
+/* How many bytes the last GATT read brought back. Only the stall probe reads
+ * an attribute, and the length is half of what its answer is worth: a zero
+ * length read that still succeeded says something different about the peer
+ * than an ATT error does. */
+static volatile uint16_t s_op_att_len;
 static volatile bool     s_inited;
 static volatile bool     s_scanning;      /* our own discovery is running */
 static volatile bool     s_rec_on;        /* notifications go to the store */
@@ -414,6 +502,22 @@ static void post_msg(uint8_t type, uint8_t link, int reason)
     }
 }
 
+/* The same, for the three GAP events that carry connection parameters. They go
+ * through the queue rather than being written where they happen because the
+ * host task's rule in this file is "counters under a spinlock and a post with
+ * a zero timeout", and formatting a 128 byte event line is neither. */
+static void post_params(uint8_t type, uint8_t link, int reason,
+                        const cap_conn_params_t *p)
+{
+    if (s_queue == NULL) {
+        return;
+    }
+    cap_msg_t m = { .type = type, .link = link, .reason = reason, .params = *p };
+    if (xQueueSend(s_queue, &m, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "command queue full, dropped msg=%u", type);
+    }
+}
+
 /* ------------------------------------------------------- controller decode
  *
  * What the bytes mean lives in wfdecode, which is pure C99 and knows nothing
@@ -430,12 +534,16 @@ static void post_msg(uint8_t type, uint8_t link, int reason)
  * Runs off every MCU-link notification independent of s_rec_on - see
  * notify_sink() - so the live screen works whenever the link is up, capture
  * running or not.
+ *
+ * The return value says whether the frame was one of ours, which is what the
+ * per-connection ledger counts: on this link as on the polled one, "answers"
+ * means frames that decoded and not frames that arrived.
  */
-static void controller_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
+static bool controller_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
 {
     wf_ctrl_frame_t frame;
     if (!wf_ctrl_frame_parse(data, len, &frame)) {
-        return;
+        return false;
     }
     portENTER_CRITICAL(&s_mux);
     wf_ctrl_apply(&s_live, &frame);
@@ -450,6 +558,7 @@ static void controller_decode(const uint8_t *data, uint16_t len, uint32_t t_ms)
      * starts. */
     wf_est_feed_ctrl(&s_est, t_ms, frame.type, &s_live);
     portEXIT_CRITICAL(&s_mux);
+    return true;
 }
 
 /* The Anchor. Decoded off every BMS notification whether or not a capture is
@@ -513,10 +622,12 @@ static void notify_sink(int idx, const uint8_t *data, uint16_t len)
      * written: what the rider sees is not conditional on a capture running,
      * and - per ADR-0001 - what it concludes never goes near store_write()
      * below. */
+    bool decoded = false;
     if (idx == CAP_LINK_MCU) {
-        controller_decode(data, len, uptime);
+        decoded = controller_decode(data, len, uptime);
     } else if (idx == CAP_LINK_BMS) {
         if (bms_decode(data, len, uptime)) {
+            decoded = true;
             /* The request this answers got a well-formed response, so the
              * width the poll is asking for is one this peer will serve. */
             portENTER_CRITICAL(&s_mux);
@@ -524,6 +635,27 @@ static void notify_sink(int idx, const uint8_t *data, uint16_t len)
             portEXIT_CRITICAL(&s_mux);
         }
     }
+
+    /* The per-connection ledger. Counted here because this task is the only
+     * one that sees a frame at all, and read out by the stale watchdog, which
+     * is the moment issue #34 needs a number for: how far this connection got
+     * before it stopped. Bytes are counted whether or not they decoded - a
+     * peer that keeps sending rubbish is a different failure from one that
+     * stops sending. */
+    portENTER_CRITICAL(&s_mux);
+    s_link[idx].bytes_rx += len;
+    if (decoded) {
+        s_link[idx].answers++;
+        /* A decode after a stall probe is the answer to the question the probe
+         * was asked. Only the interval is measured here; the capture task puts
+         * it in the file, because that is where cap_event() lives. */
+        if (s_link[idx].probe_at_ms != 0 && !s_link[idx].probe_answered) {
+            s_link[idx].probe_answered = true;
+            s_link[idx].probe_answer_ms =
+                (uint32_t)(uptime - s_link[idx].probe_at_ms);
+        }
+    }
+    portEXIT_CRITICAL(&s_mux);
 
     if (!s_rec_on) {
         portENTER_CRITICAL(&s_mux);
@@ -693,8 +825,107 @@ static int on_link_event(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
-    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
-        return 0;   /* accept whatever the peer prefers */
+    /* The three events that describe the radio underneath the link, all of
+     * them recorded and none of them acted on. Candidate 3 in issue #34 is
+     * that the requests stop reaching the peer because the connection itself
+     * has changed underneath them - a supervision timeout, a connection
+     * interval stretched to make room for the Fardriver's 35.5 Hz stream on
+     * the other link - and a Capture that carries no parameter lines can
+     * neither confirm nor rule that out. A renegotiated MTU would explain the
+     * fragmented answers going missing just as well, so it is written down
+     * too. */
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc desc;
+        cap_conn_params_t p = {0};
+        if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+            p.itvl_min = desc.conn_itvl;
+            p.itvl_max = desc.conn_itvl;
+            p.latency = desc.conn_latency;
+            p.timeout = desc.supervision_timeout;
+        }
+        post_params(MSG_CONN_UPDATE, (uint8_t)idx, event->conn_update.status,
+                    &p);
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ: {
+        const struct ble_gap_upd_params *peer = event->conn_update_req.peer_params;
+        cap_conn_params_t p = {0};
+        if (peer != NULL) {
+            p.itvl_min = peer->itvl_min;
+            p.itvl_max = peer->itvl_max;
+            p.latency = peer->latency;
+            p.timeout = peer->supervision_timeout;
+        }
+        post_params(MSG_CONN_UPDATE_REQ, (uint8_t)idx, (int)event->type, &p);
+        /* Forcing itvl=24 in run 6 still settled on itvl=12 (captures/
+         * stall_run6_dump.log), which sent the search to ble_gap.h instead of
+         * back to this case, because grep -c "conn update req" comes back
+         * zero across all five dumps that came before it. This case used to
+         * fire only on BLE_GAP_EVENT_CONN_UPDATE_REQ, the link-layer
+         * parameter-request procedure - and the Pack never uses that
+         * procedure. It asks over L2CAP, which NimBLE reports as
+         * BLE_GAP_EVENT_L2CAP_UPDATE_REQ and which used to fall straight
+         * through to this handler's default and get accepted with nothing
+         * written down; that is the whole reason a "conn update req" line
+         * never appeared before run 6 and itvl never had anything to bite on.
+         * Every Capture in the tree shows the same request landing here about
+         * 300 ms after connect: itvl=80 (100 ms) down to itvl=12 (15 ms),
+         * latency=0, timeout=400. Accepted unconditionally, that request is
+         * itself untested ground - a connection-event budget and a wall-clock
+         * one both predict the same 27-poll cutoff when every run so far has
+         * run at the interval the peer chose, so nothing in the matrix can
+         * tell them apart yet. itvl is the knob that pulls them apart: held
+         * at the peer's own opening offer of 80, a budget of ~1800 connection
+         * events lands around 180 s while a 27 s wall clock stays 27 s.
+         *
+         * ble_gap.h's doc comment says self_params is a copy of peer_params
+         * on both event types - prefilled, writable, applied on a zero
+         * return. That is wrong for this IDF version on the L2CAP path, and
+         * writing through it on the strength of the comment is what put a
+         * StoreProhibited panic here within a second of the Pack connecting
+         * on the actual hardware (EXCVADDR 0x0, on_link_event at this line,
+         * ble_gap_call_conn_event_cb, ble_gap_rx_l2cap_update_req at
+         * ble_gap.c:3675, ble_l2cap_sig_update_req_rx at
+         * ble_l2cap_sig.c:496). Read out of ble_gap_rx_l2cap_update_req()
+         * itself in the IDF source: it builds the event with peer_params set
+         * and nothing else, so self_params stays NULL from the event's
+         * memset. On that path the callback's return value is the whole
+         * channel - zero accepts the peer's numbers verbatim, non-zero is the
+         * reject reason handed back to the L2CAP signalling layer - there is
+         * no self_params to rewrite and no counter-proposal to make. Only
+         * BLE_GAP_EVENT_CONN_UPDATE_REQ, the link-layer procedure the Pack
+         * has never once used (see the grep above), actually fills
+         * self_params with a real, writable copy of peer_params. So the two
+         * procedures still share this case body for recording the request,
+         * but they part ways on what forcing itvl can mean here: reject on
+         * L2CAP and force the interval separately once the connection admits
+         * it (link_setup(), below), rewrite-and-accept on the link layer.
+         * Rejecting the L2CAP ask on its own would leave the link at
+         * whatever interval link_connect()'s wide 24-80 bounds let the
+         * controller settle on, which is why the force in link_setup() has
+         * to exist at all rather than this alone. */
+        if (s_tune.itvl == 0) {
+            return 0;
+        }
+        if (event->conn_update_req.self_params == NULL) {
+            /* L2CAP path: nothing to write through. BLE_ERR_CONN_PARMS is
+             * the spec's "unacceptable connection parameters" - the accurate
+             * reason to give the peer, not a stand-in for a counter-offer
+             * this procedure has no room for. */
+            return BLE_ERR_CONN_PARMS;
+        }
+        /* Link-layer path only: self_params really is ours to write here,
+         * and a zero return applies it. */
+        event->conn_update_req.self_params->itvl_min = s_tune.itvl;
+        event->conn_update_req.self_params->itvl_max = s_tune.itvl;
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_MTU:
+        post_msg(MSG_MTU, (uint8_t)idx, (int)event->mtu.value);
+        return 0;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING:
         /* Nothing is bonded on purpose; let the peer start over. */
@@ -787,6 +1018,23 @@ static int on_disc_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
+/* Only the stall probe reads an attribute. The length is captured alongside
+ * the status because the two answer different halves of the question: a read
+ * the peer refuses carries an ATT error code and no data, a read it serves
+ * from a stalled UART bridge carries a status of 0 and nothing in it. */
+static int on_read(uint16_t conn_handle, const struct ble_gatt_error *error,
+                   struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)arg;
+    s_op_att_len = (attr != NULL && attr->om != NULL)
+                       ? OS_MBUF_PKTLEN(attr->om)
+                       : 0;
+    s_op_rc = error->status;
+    xSemaphoreGive(s_op_sem);
+    return 0;
+}
+
 static int on_write(uint16_t conn_handle, const struct ble_gatt_error *error,
                     struct ble_gatt_attr *attr, void *arg)
 {
@@ -852,6 +1100,16 @@ static int link_setup(int idx)
         uint16_t fallback = poll_fallback_count(t);
         if (s_link[idx].poll_refused && fallback != 0) {
             want_count = fallback;
+        }
+        /* The bench override, issue #34. Candidate 2 is that our receive path
+         * chokes on the answer once it has to be fragmented, and the only way
+         * to tell that apart from the peer falling silent is to change how many
+         * fragments there are: a run at 20 registers is one notification, a run
+         * at 125 is thirteen. It is applied before the MTU clamp below rather
+         * than instead of it, because a width this connection cannot carry
+         * would come back truncated and measure nothing at all. */
+        if (s_tune.poll_regs != 0) {
+            want_count = s_tune.poll_regs;
         }
         /* Three bytes of the MTU go to the ATT notification header. Both
          * Captures we hold negotiated 512 on this link and the wide answer
@@ -995,6 +1253,21 @@ static int link_setup(int idx)
     s_link[idx].poll_unanswered = 0;
     s_pub.link[idx].subscribed = true;
     s_link[idx].last_rx_ms = uptime;   /* baseline for the stale watchdog */
+    /* The ledger starts here and not at the connection: everything it counts -
+     * answers, requests, bytes - only becomes possible once the CCCD has been
+     * written, and dating it from the connect would fold the two to three
+     * seconds of discovery into the "how long did this connection last"
+     * figure that issue #34 turns on. */
+    s_link[idx].conn_start_ms = uptime;
+    s_link[idx].answers = 0;
+    s_link[idx].writes_ok = 0;
+    s_link[idx].writes_err = 0;
+    s_link[idx].bytes_rx = 0;
+    s_link[idx].write_err_seen = false;
+    s_link[idx].probed = false;
+    s_link[idx].probe_at_ms = 0;
+    s_link[idx].probe_answered = false;
+    s_link[idx].probe_answer_ms = 0;
     portEXIT_CRITICAL(&s_mux);
 
     /* The poll width goes into the Capture, because a Capture that turns out
@@ -1004,6 +1277,48 @@ static int link_setup(int idx)
               t->label, s_link[idx].val_handle, s_disc_cccd,
               s_link[idx].ctrl_handle, ble_att_mtu(conn),
               s_link[idx].poll_count);
+
+    /* And the radio the link is standing on, on its own line so that the
+     * parameter lines a run produces - this one, plus every update the peer
+     * negotiates afterwards - can be read as one sequence. Without the
+     * baseline an update line says what changed but not from what. */
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn, &desc) == 0) {
+        cap_event("%s conn itvl=%u latency=%u timeout=%u", t->label,
+                  desc.conn_itvl, desc.conn_latency, desc.supervision_timeout);
+    }
+
+    /* Rejecting the peer's L2CAP request in on_link_event() only refuses
+     * that one ask; it does not touch whatever interval the link already
+     * settled at, which is anywhere in link_connect()'s wide 24-80 bounds
+     * and not necessarily s_tune.itvl. Forcing it here is what actually gets
+     * the knob's interval onto a link the Pack only ever renegotiates over
+     * L2CAP, where NimBLE leaves no self_params to write through. This runs
+     * on the capture task - link_setup() is only ever called from
+     * link_bring_up(), itself only called out of do_record_start(),
+     * tick_recording() and tick_scanning(), all on cap_task() - and not on
+     * the NimBLE host task the GAP callback above runs on, so calling
+     * ble_gap_update_params() straight from here carries none of the
+     * re-entrant-into-the-host-task risk that would rule it out from inside
+     * on_link_event() itself. Same 600 (6 s) supervision timeout
+     * link_connect() used, so a chatty controller does not trip it; latency
+     * and CE length both 0 to leave everything but the interval alone. The
+     * result is written down with rc, because a Capture whose itvl line
+     * never moves has to be able to tell "the force was never attempted"
+     * apart from "it was attempted and the controller refused it". */
+    if (s_tune.itvl != 0) {
+        struct ble_gap_upd_params up = {
+            .itvl_min = s_tune.itvl,
+            .itvl_max = s_tune.itvl,
+            .latency = 0,
+            .supervision_timeout = 600,
+            .min_ce_len = 0,
+            .max_ce_len = 0,
+        };
+        rc = ble_gap_update_params(conn, &up);
+        cap_event("%s conn update force itvl=%u rc=%d", t->label,
+                  (unsigned)s_tune.itvl, rc);
+    }
     return 0;
 }
 
@@ -1070,6 +1385,30 @@ static void link_poll(int idx)
 
     int rc = ble_gattc_write_no_rsp_flat(conn, s_link[idx].ctrl_handle, frame,
                                          sizeof(frame));
+
+    /* Whether the request actually left is the one thing the Captures in issue
+     * #34 cannot say. It was only ever an ESP_LOGW, and nobody is watching the
+     * console during a ride, so candidate 3 - "our requests stop leaving at
+     * all" - could not be told from the peer going quiet. Now the outcome of
+     * every write is counted for the connection's ledger and the first failure
+     * of each connection is written into the Capture; the rest only bump the
+     * counter, so a write path that has wedged cannot fill the file with one
+     * line per second. */
+    bool     first_err;
+    uint32_t sent;
+    portENTER_CRITICAL(&s_mux);
+    if (rc == 0) {
+        s_link[idx].writes_ok++;
+    } else {
+        s_link[idx].writes_err++;
+    }
+    first_err = (rc != 0) && !s_link[idx].write_err_seen;
+    if (first_err) {
+        s_link[idx].write_err_seen = true;
+    }
+    sent = s_link[idx].writes_ok;
+    portEXIT_CRITICAL(&s_mux);
+
     if (rc != 0) {
         /* Nothing to recover: a lost request costs one sample, and a link that
          * keeps failing stops answering and is rebuilt by the stale watchdog.
@@ -1081,7 +1420,149 @@ static void link_poll(int idx)
             s_link[idx].poll_unanswered--;
         }
         portEXIT_CRITICAL(&s_mux);
+        if (first_err) {
+            cap_event("%s poll write rc=%d after %" PRIu32 " writes", t->label,
+                      rc, sent);
+        }
     }
+}
+
+/* The stall probe: what a link that has stopped answering can still be made to
+ * do.
+ *
+ * Issue #34 leaves four candidates standing for the 27-answer cycle, and the
+ * difference between them is not visible in a stream of unanswered requests -
+ * it is visible in what the peer does when it is asked a different way. So
+ * after miss_probe unanswered polls the link is asked, exactly once per
+ * connection, four questions: the same request written *with* a response, so
+ * that an ATT acknowledgement says whether the connection still carries our
+ * packets at all; a read of the notify characteristic, where an error status
+ * from the peer's own stack is a different animal from silence; and a CCCD
+ * rewritten off and on, which is what puts the subscription back if the peer
+ * has quietly dropped it. If the poll answers again straight after that last
+ * step, the whole fix is a 100 ms re-subscribe rather than the 13 s rebuild
+ * the stale watchdog does today.
+ *
+ * Once per connection, because a probe every three seconds would itself change
+ * the traffic pattern the run is measuring. On the capture task, using the
+ * same s_op_sem that link_setup() blocks on: this file allows one GATT
+ * operation in flight and the probe is not an exception to that. */
+static void link_stall_probe(int idx)
+{
+    const cap_target_t *t = &s_target[idx];
+    uint16_t conn = link_conn_handle(idx);
+    if (conn == BLE_HS_CONN_HANDLE_NONE || s_link[idx].ctrl_handle == 0 ||
+        s_link[idx].cccd_handle == 0) {
+        return;
+    }
+
+    uint16_t count, missed;
+    uint32_t last;
+    portENTER_CRITICAL(&s_mux);
+    count = s_link[idx].poll_count;
+    missed = s_link[idx].poll_unanswered;
+    last = s_link[idx].last_rx_ms;
+    /* Marked as spent before the first operation, not after the last: a probe
+     * that fails half way through has still been run, and retrying it every
+     * tick would bury the evidence under its own lines. */
+    s_link[idx].probed = true;
+    portEXIT_CRITICAL(&s_mux);
+    if (count == 0) {
+        return;
+    }
+
+    uint32_t now = now_ms();
+    cap_event("%s probe start after %u unanswered, silent %" PRIu32 " ms",
+              t->label, (unsigned)missed, (uint32_t)(now - last));
+
+    uint8_t frame[DALY_REQ_LEN];
+    daly_build_request(frame, t->poll.start, DALY_FUNC_READ, t->poll.address,
+                       count);
+    xSemaphoreTake(s_op_sem, 0);
+    int rc = ble_gattc_write_flat(conn, s_link[idx].ctrl_handle, frame,
+                                  sizeof(frame), on_write, NULL);
+    if (rc == 0) {
+        rc = wait_op(CAP_PROBE_OP_MS);
+    }
+    cap_event("%s probe write_rsp rc=%d", t->label, rc);
+
+    s_op_att_len = 0;
+    xSemaphoreTake(s_op_sem, 0);
+    rc = ble_gattc_read(conn, s_link[idx].val_handle, on_read, NULL);
+    if (rc == 0) {
+        rc = wait_op(CAP_PROBE_OP_MS);
+    }
+    cap_event("%s probe read rc=%d len=%u", t->label, rc,
+              (unsigned)s_op_att_len);
+
+    static const uint8_t notify_off[2] = { 0x00, 0x00 };
+    static const uint8_t notify_on[2] = { 0x01, 0x00 };
+    xSemaphoreTake(s_op_sem, 0);
+    rc = ble_gattc_write_flat(conn, s_link[idx].cccd_handle, notify_off,
+                              sizeof(notify_off), on_write, NULL);
+    if (rc == 0) {
+        rc = wait_op(CAP_PROBE_OP_MS);
+    }
+    cap_event("%s probe cccd off rc=%d", t->label, rc);
+
+    xSemaphoreTake(s_op_sem, 0);
+    rc = ble_gattc_write_flat(conn, s_link[idx].cccd_handle, notify_on,
+                              sizeof(notify_on), on_write, NULL);
+    if (rc == 0) {
+        rc = wait_op(CAP_PROBE_OP_MS);
+    }
+    cap_event("%s probe cccd on rc=%d", t->label, rc);
+
+    /* The clock the "answered after probe" line is measured from, started only
+     * once the probe has let go of the link: an answer that arrives while the
+     * CCCD is still being rewritten says nothing about which of the four
+     * questions woke the peer, and the interval that matters is the one from
+     * the last of them. */
+    now = now_ms();
+    portENTER_CRITICAL(&s_mux);
+    s_link[idx].probe_at_ms = (now != 0) ? now : 1;   /* 0 means "no probe" */
+    s_link[idx].probe_answered = false;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+/* Reports what the last probe produced and decides whether the next one is
+ * due. Split from the probe itself because the report has to happen on every
+ * tick - the decode it describes arrives on the other task - while the probe
+ * runs at most once per connection. */
+static void link_probe_tick(int idx)
+{
+    bool     answered;
+    uint32_t after_ms;
+    portENTER_CRITICAL(&s_mux);
+    answered = s_link[idx].probe_answered;
+    after_ms = s_link[idx].probe_answer_ms;
+    if (answered) {
+        s_link[idx].probe_answered = false;
+        s_link[idx].probe_at_ms = 0;   /* one line per probe, not per answer */
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (answered) {
+        cap_event("%s answered %" PRIu32 " ms after probe", s_target[idx].label,
+                  after_ms);
+    }
+
+    /* s_abort is set while a stop or a shutdown is queued, and the probe is
+     * four blocking GATT operations on a link that is about to be dropped -
+     * exactly the wait that flag exists to cut short. */
+    if (!s_tune.probe || s_tune.miss_probe == 0 || s_abort) {
+        return;
+    }
+
+    bool     probed;
+    uint16_t missed;
+    portENTER_CRITICAL(&s_mux);
+    probed = s_link[idx].probed;
+    missed = s_link[idx].poll_unanswered;
+    portEXIT_CRITICAL(&s_mux);
+    if (probed || missed < s_tune.miss_probe) {
+        return;
+    }
+    link_stall_probe(idx);
 }
 
 /* ---------------------------------------------------------------- scanning */
@@ -1469,6 +1950,16 @@ static void do_record_start(void)
         s_link[i].backoff_idx = 0;
         s_link[i].retry_at_ms = now_ms();
         s_link[i].ever_rx = false;
+        /* The single-link control run, issue #34. Both peers share one radio,
+         * and the Fardriver's 35.5 Hz stream is the loudest thing on it: if
+         * the BMS still stops answering after 27 polls with the Controller
+         * link never brought up, contention is not the explanation and three
+         * of the four candidates survive. Not wanted either, so the reconnect
+         * loop leaves it alone for the whole run. */
+        if (i == CAP_LINK_MCU && s_tune.mcu_off) {
+            s_link[i].want = false;
+            continue;
+        }
         /* Sequentially: NimBLE allows only one outstanding connect. The
          * scan was running right up to this point, so both addresses are
          * fresh and no rescan is needed here. */
@@ -1545,6 +2036,15 @@ static void do_record_start(void)
     set_state(CAP_RECORDING);
     cap_event("capture start seq=%" PRIu32 " file=%s unix=%" PRId64 " batt=%d mv",
               seq, name, unix_start, board_battery_mv());
+    /* Immediately after it, because every run in the matrix issue #34 needs
+     * changes what the rest of the file means: the same 27 answers are a
+     * different finding at a 3 s poll than at a 1 s one. A Capture that does
+     * not say which run it is cannot be compared with the next one. */
+    cap_event("tune poll_ms=%" PRIu32 " poll_regs=%u stale_ms=%" PRIu32
+              " miss_probe=%u probe=%d mcu_off=%d itvl=%u",
+              s_tune.poll_ms, (unsigned)s_tune.poll_regs, s_tune.stale_ms,
+              (unsigned)s_tune.miss_probe, (int)s_tune.probe,
+              (int)s_tune.mcu_off, (unsigned)s_tune.itvl);
     for (int i = 0; i < CAP_LINK_COUNT; i++) {
         if (link_connected(i)) {
             cap_event("%s connected addr=%s", s_target[i].label,
@@ -1574,7 +2074,13 @@ static void tick_recording(void)
      * missing frames of the Fardriver's 35.5 Hz stream and ten unanswered
      * requests at the BMS's 1 Hz poll. Both are far past any plausible burst
      * of interference, and neither is long enough for a rebuild to cost more
-     * than a couple of seconds of the capture. */
+     * than a couple of seconds of the capture.
+     *
+     * It is the default of cap_tune_t.stale_ms rather than a constant now.
+     * Issue #34's cycle is ~40.7 s, of which this timeout and the rediscovery
+     * behind it are about thirteen, so a bench run that moves it is what
+     * separates "the peer comes back because we rebuilt the link" from "the
+     * peer would have come back anyway". A ride still runs at ten seconds. */
     for (int i = 0; i < CAP_LINK_COUNT; i++) {
         bool armed, subscribed;
         uint32_t last;
@@ -1587,11 +2093,34 @@ static void tick_recording(void)
         if (!armed || !subscribed || !link_connected(i)) {
             continue;
         }
-        if ((uint32_t)(now - last) < CAP_STALE_MS) {
+        if ((uint32_t)(now - last) < s_tune.stale_ms) {
             continue;
         }
+        /* The ledger, read out while the connection that produced it is still
+         * up. This is the line issue #34 is waiting for: 27 answers in 26 s
+         * against 37 requests that all left says the peer stopped answering,
+         * the same 27 against 37 requests of which 10 failed says our own
+         * write path did, and bytes without answers says the frames are
+         * arriving and no longer decoding. None of those three can be told
+         * apart from the counters the Capture carried before. */
+        uint32_t answers, writes_ok, writes_err, bytes_rx, conn_ms;
+        uint16_t silent;
+        portENTER_CRITICAL(&s_mux);
+        answers = s_link[i].answers;
+        writes_ok = s_link[i].writes_ok;
+        writes_err = s_link[i].writes_err;
+        bytes_rx = s_link[i].bytes_rx;
+        silent = s_link[i].poll_unanswered;
+        conn_ms = (uint32_t)(now - s_link[i].conn_start_ms);
+        portEXIT_CRITICAL(&s_mux);
+
         cap_event("%s stale, no frame for %" PRIu32 " ms, dropping link",
                   s_target[i].label, (uint32_t)(now - last));
+        cap_event("%s link down (stale) after %" PRIu32 " answers in %" PRIu32
+                  " ms, writes=%" PRIu32 " err=%" PRIu32 " silent=%u bytes=%"
+                  PRIu32,
+                  s_target[i].label, answers, conn_ms, writes_ok, writes_err,
+                  (unsigned)silent, bytes_rx);
         link_drop(i);
         s_link[i].retry_at_ms = now;   /* reconnect on the next tick */
     }
@@ -1630,11 +2159,34 @@ static void tick_recording(void)
         }
     }
 
+    /* The stall probe, before the poll rather than after it: a link that is
+     * about to be asked its next question should have been asked the probe's
+     * four first, so that the answer - if one comes - is unambiguously the
+     * probe's. It blocks for up to four short GATT round trips, which is why
+     * the deadline below is taken from a fresh clock. */
+    for (int i = 0; i < CAP_LINK_COUNT; i++) {
+        bool subscribed;
+        portENTER_CRITICAL(&s_mux);
+        subscribed = s_pub.link[i].subscribed;
+        portEXIT_CRITICAL(&s_mux);
+
+        if (!target_polled(i) || !subscribed || !link_connected(i)) {
+            continue;
+        }
+        link_probe_tick(i);
+    }
+
     now = now_ms();
 
     /* Polled links. The Daly never speaks unsolicited, so the frame rate in
      * the capture is exactly this loop's rate; a deadline rather than a tick
-     * counter, because the task also wakes early whenever a command arrives. */
+     * counter, because the task also wakes early whenever a command arrives.
+     *
+     * poll.interval_ms stays the test for whether this link is polled at all -
+     * that is a property of the target and not something a bench run may turn
+     * off - while the period itself comes from the tune, because "does the
+     * peer's 27 answers depend on how fast we ask" is one of the runs issue
+     * #34 needs. */
     for (int i = 0; i < CAP_LINK_COUNT; i++) {
         bool subscribed;
         portENTER_CRITICAL(&s_mux);
@@ -1647,7 +2199,7 @@ static void tick_recording(void)
         if ((int32_t)(now - s_link[i].poll_at_ms) < 0) {
             continue;
         }
-        s_link[i].poll_at_ms = now + s_target[i].poll.interval_ms;
+        s_link[i].poll_at_ms = now + s_tune.poll_ms;
         link_poll(i);
     }
 
@@ -1826,6 +2378,40 @@ static void handle_msg(const cap_msg_t *m)
                 set_state(CAP_IDLE);
             }
         }
+        break;
+
+    case MSG_CONN_UPDATE:
+        if (m->link >= CAP_LINK_COUNT) {
+            break;
+        }
+        cap_event("%s conn update status=%d itvl=%u latency=%u timeout=%u",
+                  s_target[m->link].label, m->reason, m->params.itvl_min,
+                  m->params.latency, m->params.timeout);
+        break;
+
+    case MSG_CONN_UPDATE_REQ:
+        if (m->link >= CAP_LINK_COUNT) {
+            break;
+        }
+        /* What the peer asked for, whether or not the controller grants it -
+         * a peer that keeps asking for a longer interval just before it goes
+         * quiet is a finding in its own right. m->reason carries the GAP
+         * event type rather than a status here: this message now posts from
+         * both BLE_GAP_EVENT_CONN_UPDATE_REQ and BLE_GAP_EVENT_L2CAP_UPDATE_REQ
+         * (see on_link_event), and which of the two link-layer and L2CAP
+         * procedures actually carried the request is worth having on the
+         * record now that it turned out to matter. */
+        cap_event("%s conn update req itvl=%u-%u latency=%u timeout=%u via=%s",
+                  s_target[m->link].label, m->params.itvl_min,
+                  m->params.itvl_max, m->params.latency, m->params.timeout,
+                  m->reason == BLE_GAP_EVENT_L2CAP_UPDATE_REQ ? "l2cap" : "ll");
+        break;
+
+    case MSG_MTU:
+        if (m->link >= CAP_LINK_COUNT) {
+            break;
+        }
+        cap_event("%s mtu event mtu=%d", s_target[m->link].label, m->reason);
         break;
 
     case MSG_SHUTDOWN:
@@ -2123,6 +2709,69 @@ void cap_est_get(wf_est_out_t *out)
     portEXIT_CRITICAL(&s_mux);
 }
 
+
+void cap_tune_get(cap_tune_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mux);
+    memcpy(out, &s_tune, sizeof(*out));
+    portEXIT_CRITICAL(&s_mux);
+}
+
+esp_err_t cap_tune_set(const cap_tune_t *in)
+{
+    if (in == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Only while nothing is being written. The three states that refuse are
+     * the ones the console's other commands already treat as busy, and the
+     * reason is the file: the tune is recorded once, at the start, and a knob
+     * that moved afterwards would make that line a lie about the rest of it. */
+    cap_state_t st = cap_state();
+    if (st == CAP_CONNECTING || st == CAP_RECORDING || st == CAP_STOPPING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* A period below the tick would not be a faster poll, only a poll that
+     * fires on every tick and says so in the file; a stale timeout under a
+     * second would rebuild the link faster than a rebuild takes. Neither is a
+     * run worth taking, so they are refused at the console rather than
+     * silently rounded into something the file cannot explain. */
+    if (in->poll_ms < CAP_TICK_MS || in->poll_ms > CAP_TUNE_MAX_MS ||
+        in->stale_ms < 1000 || in->stale_ms > CAP_TUNE_MAX_MS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* itvl is a raw connection interval in 1.25 ms units, not a millisecond
+     * count like the others, and the spec bounds it rather than this file: 6
+     * is the 7.5 ms floor, 3200 the 4 s ceiling. A forced interval also has to
+     * leave room for the supervision timeout the link is actually running
+     * with, or the link would be declared dead before an event at that
+     * interval could ever arrive; the peer here always asks for timeout=400
+     * (4 s, in the spec's 10 ms units) at latency=0, and the spec's own
+     * timeout > (1 + latency) * itvl_max * 2 works out to itvl under 1600 at
+     * those two numbers, so refusing 1600 and above is enough to keep this
+     * knob from asking for a link that could not stand up, without this file
+     * trying to be a general checker for parameters it does not otherwise
+     * touch. */
+    if (in->itvl != 0 && (in->itvl < 6 || in->itvl > 3200 || in->itvl >= 1600)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cap_tune_t t = *in;
+    /* The width ceiling is the Capture record's, not a preference: 5 + 2 x 125
+     * is exactly the 255 bytes a payload length of uint8_t can describe. */
+    if (t.poll_regs > WF_BMS_MAX_REGS) {
+        t.poll_regs = WF_BMS_MAX_REGS;
+    }
+
+    portENTER_CRITICAL(&s_mux);
+    s_tune = t;
+    portEXIT_CRITICAL(&s_mux);
+    return ESP_OK;
+}
 
 esp_err_t cap_ble_shutdown(void)
 {

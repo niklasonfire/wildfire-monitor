@@ -104,6 +104,45 @@ void cap_live_get(wf_ctrl_live_t *out);
  * arithmetic of their own. */
 void cap_est_get(wf_est_out_t *out);
 
+/* ------------------------------------------------------------------- tuning
+ *
+ * The handful of numbers the link handling is built on, readable and writable
+ * at runtime.
+ *
+ * Issue #34: the BMS answers exactly 27 polls per connection and then goes
+ * silent, on a cycle that repeats every ~40.7 s. Four explanations are still
+ * standing - the peer's answer path wedging, our receive path choking on the
+ * fragmented answers, our requests never leaving the radio at all, or a timer
+ * inside the peer - and the Captures taken so far separate none of them. What
+ * separates them is a matrix of runs that differ in exactly one thing each,
+ * and reflashing between runs would change more than that one thing.
+ *
+ * So these are knobs on the bench rather than constants in the binary, and
+ * every default reproduces today's behaviour exactly: nothing in here changes
+ * what a ride does until somebody at the console asks it to. The effective
+ * tune is written into the Capture when it starts, because a file that does
+ * not say which run it is cannot be compared against another one.
+ */
+typedef struct {
+    uint32_t poll_ms;    /* poll period of a polled link */
+    uint16_t poll_regs;  /* 0 = the link keeps its own width logic, else this */
+    uint32_t stale_ms;   /* silence after which a subscribed link is rebuilt */
+    uint8_t  miss_probe; /* unanswered polls before the stall probe, 0 = never */
+    bool     probe;      /* run the stall probe at all */
+    bool     mcu_off;    /* leave the Controller link down for the whole run */
+    uint16_t itvl;       /* 0 = accept the peer's request, else force this (1.25 ms units) */
+} cap_tune_t;
+
+void cap_tune_get(cap_tune_t *out);
+
+/* Refused with ESP_ERR_INVALID_STATE unless the capture is idle. A knob moved
+ * mid-run would change what the numbers already in the open file mean, and a
+ * Capture that cannot be read back as one experiment is worth less than no
+ * Capture at all. poll_regs is clamped into 1..WF_BMS_MAX_REGS; a period or a
+ * timeout the link handling could not act on is refused with
+ * ESP_ERR_INVALID_ARG rather than quietly rounded. */
+esp_err_t cap_tune_set(const cap_tune_t *in);
+
 /* Stops everything and takes NimBLE and the BT controller down so the Wi-Fi
  * readout mode has the RAM. The only way back to capturing is a reboot. */
 esp_err_t cap_ble_shutdown(void);

@@ -86,6 +86,89 @@ static int cmd_cap(int argc, char **argv)
     return err == ESP_OK ? 0 : 1;
 }
 
+/*
+ * The bench tune, issue #34. The BMS link answers exactly 27 polls and then
+ * goes silent, and the four remaining explanations are separated by a matrix
+ * of runs that differ in one variable each - a slower poll, a narrower answer,
+ * a shorter stale timeout, the Controller link left down. Reflashing between
+ * runs would change more than the one variable, so they are set from here, and
+ * the effective tune goes into the Capture at its start.
+ *
+ * Tagged single lines like everything else in this file, and a bad key or
+ * value is one CAPTUNE err= line rather than a shell return code: the host
+ * scripts read the tag, not the exit status.
+ */
+static void print_tune(void)
+{
+    cap_tune_t t;
+    cap_tune_get(&t);
+    printf("CAPTUNE poll_ms=%" PRIu32 " poll_regs=%u stale_ms=%" PRIu32
+           " miss_probe=%u probe=%d mcu_off=%d itvl=%u\n",
+           t.poll_ms, (unsigned)t.poll_regs, t.stale_ms,
+           (unsigned)t.miss_probe, (int)t.probe, (int)t.mcu_off,
+           (unsigned)t.itvl);
+}
+
+static int cmd_captune(int argc, char **argv)
+{
+    /* Refused as a whole while a capture is running, reads included: what the
+     * file says about the tune is only true because nothing may move it
+     * mid-run, and answering a read here would invite the second command. */
+    cap_state_t st = cap_state();
+    if (st == CAP_CONNECTING || st == CAP_RECORDING || st == CAP_STOPPING) {
+        printf("CAPTUNE busy state=%s\n", cap_state_str(st));
+        return 0;
+    }
+    if (argc == 1) {
+        print_tune();
+        return 0;
+    }
+    if (argc != 3) {
+        printf("CAPTUNE err=usage: captune [<key> <value>]\n");
+        return 0;
+    }
+
+    char *end = NULL;
+    long  v = strtol(argv[2], &end, 0);
+    if (end == argv[2] || *end != '\0' || v < 0 || v > 600000) {
+        printf("CAPTUNE err=bad value %s\n", argv[2]);
+        return 0;
+    }
+
+    cap_tune_t t;
+    cap_tune_get(&t);
+    if (strcmp(argv[1], "poll_ms") == 0) {
+        t.poll_ms = (uint32_t)v;
+    } else if (strcmp(argv[1], "poll_regs") == 0) {
+        t.poll_regs = (uint16_t)(v > 0xffff ? 0xffff : v);
+    } else if (strcmp(argv[1], "stale_ms") == 0) {
+        t.stale_ms = (uint32_t)v;
+    } else if (strcmp(argv[1], "miss_probe") == 0) {
+        t.miss_probe = (uint8_t)(v > 255 ? 255 : v);
+    } else if (strcmp(argv[1], "probe") == 0) {
+        t.probe = (v != 0);
+    } else if (strcmp(argv[1], "mcu_off") == 0) {
+        t.mcu_off = (v != 0);
+    } else if (strcmp(argv[1], "itvl") == 0) {
+        t.itvl = (uint16_t)(v > 0xffff ? 0xffff : v);
+    } else {
+        printf("CAPTUNE err=unknown key %s\n", argv[1]);
+        return 0;
+    }
+
+    esp_err_t err = cap_tune_set(&t);
+    if (err == ESP_ERR_INVALID_STATE) {
+        printf("CAPTUNE busy state=%s\n", cap_state_str(cap_state()));
+        return 0;
+    }
+    if (err != ESP_OK) {
+        printf("CAPTUNE err=%s out of range\n", argv[1]);
+        return 0;
+    }
+    print_tune();
+    return 0;
+}
+
 static void print_entry(const store_entry_t *e)
 {
     char when[24] = "unknown";
@@ -395,6 +478,10 @@ void cmd_cap_register(void)
         {.command = "cap",
          .help = "Standalone capture: cap [status|scan|idle|rec|stop|mark [text]]",
          .func = cmd_cap},
+        {.command = "captune",
+         .help = "Bench tune of the link handling, idle only: captune "
+                 "[poll_ms|poll_regs|stale_ms|miss_probe|probe|mcu_off|itvl <value>]",
+         .func = cmd_captune},
         {.command = "caps", .help = "List the captures on flash", .func = cmd_caps},
         {.command = "caprm", .help = "Delete a capture: caprm <seq>|all", .func = cmd_caprm},
         {.command = "capdump",
